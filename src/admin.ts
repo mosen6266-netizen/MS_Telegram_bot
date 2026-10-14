@@ -4,7 +4,8 @@ import {addSpender} from "./approval";
 import {usageSnapshot} from "./usage";
 import {defaults} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
-import {isAdmin} from "./setup";
+import {isAdmin,configEnv} from "./setup";
+import {removeWatch} from "./core";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
@@ -64,6 +65,10 @@ export async function handleAdmin(req,env,path){
       if(!["active","paused","removed"].includes(d.status))return bad("状态无效");
       if(d.status==="active"&&(await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state!=="active")return bad("Alchemy 未完成订阅，不能标记为监控中",409);
       await env.DB.prepare("UPDATE subscriptions SET status=?,updated_at=? WHERE chat_id=? AND address=?").bind(d.status,now(),chat,a).run();
+      if(d.status==="removed"||d.status==="paused"){
+        const still=(await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(a).first())?.n||0;
+        if(!still)await removeWatch(await configEnv(env),a);
+      }
     }
     await audit(env,"admin","update_subscription",a,{chat});
     return json({ok:true});
