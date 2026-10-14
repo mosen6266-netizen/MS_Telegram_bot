@@ -104,6 +104,20 @@ export async function syncWatch(env,address,remove=false) {
   });
   if(!r.ok)throw Error("Alchemy sync HTTP "+r.status+" "+(await r.text()).slice(0,140));
 }
+export async function removeWatch(env,address){
+  const active=await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(address).first();
+  if(active?.n>0)return false;
+  const rule=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+  if(!rule || rule.state==='removed')return true;
+  try{
+    if(env.ALCHEMY_ACTIVITY_WEBHOOK_ID && env.ALCHEMY_NOTIFY_TOKEN)await syncWatch(env,address,true);
+    await env.DB.prepare("UPDATE wallet_watches SET state='removed',last_error=NULL,updated_at=? WHERE address=?").bind(now(),address).run();
+    return true;
+  }catch(e){
+    await env.DB.prepare("UPDATE wallet_watches SET state='removal_pending',last_error=?,updated_at=? WHERE address=?").bind(String(e).slice(0,300),now(),address).run();
+    return false;
+  }
+}
 export async function ensureWatch(env,address,fromBlock=undefined){
   await env.DB.prepare("INSERT OR IGNORE INTO wallet_watches(address,state) VALUES(?,'pending')").bind(address).run();
   try {
