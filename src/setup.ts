@@ -65,10 +65,23 @@ export async function authRoute(req,env,path){
     if(await adminExists(env))return json({error:"Already initialized"},403);
     const b=await req.json(),code=String(b.setup_code||""),password=String(b.password||"");
     if(await locked(env,"setup"))return json({error:"Too many setup attempts, retry later"},429);
-    if(!env.INIT_SETUP_CODE||!equal(code,env.INIT_SETUP_CODE)){
-      await fail(env,"setup");return json({error:"Invalid one-time setup code"},403);
-    }
     if(password.length<14||password.length>200)return json({error:"Password must be 14-200 characters"},400);
+    if(env.INIT_SETUP_CODE){
+      if(!equal(code,env.INIT_SETUP_CODE)){await fail(env,"setup");return json({error:"Invalid one-time setup code"},403);}
+    }else{
+      // Bootstrap is secured by proof of Cloudflare Worker-edit permission for THIS account.
+      // The token is used once and never stored in the database or Worker.
+      const cfToken=String(b.cloudflare_api_token||"").trim();
+      if(!/^\S{20,300}$/.test(cfToken)){await fail(env,"setup");return json({error:"Enter a Cloudflare API token with Workers Scripts Edit permission for this account"},403);}
+      if(!env.CF_ACCOUNT_ID)return json({error:"Cloudflare account binding unavailable"},503);
+      const master=b64(random(32));
+      const result=await fetch("https://api.cloudflare.com/client/v4/accounts/"+encodeURIComponent(env.CF_ACCOUNT_ID)+"/workers/scripts/ethereum-usdt-monitor/secrets",{
+        method:"PUT",headers:{"authorization":"Bearer "+cfToken,"content-type":"application/json"},
+        body:JSON.stringify({name:"APP_ENCRYPTION_KEY",type:"secret_text",text:master})
+      });
+      const resultData=await result.json();
+      if(!result.ok||!resultData.success){await fail(env,"setup");return json({error:"Cloudflare key provisioning failed. The API token must be authorized to edit the ethereum-usdt-monitor Worker in this Cloudflare account."},403);}
+    }
     const salt=b64(random(24)),hash=await passwordHash(password,salt);
     // Database uniqueness prevents two simultaneous first-run initializations.
     const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,200000)").bind(salt,hash).run();
