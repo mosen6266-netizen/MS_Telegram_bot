@@ -3,7 +3,8 @@ import {send,buttons,esc,short,now,notifyAdmin,increment} from "./core";
 const DEFAULTS={
 new_approval:"🛡️ <b>发现新的 USDT 授权</b>\n备注：{{remark}}\nOwner：<code>{{owner}}</code>\nSpender：<code>{{spender}}</code>\n被授权人备注：{{spender_remark}}\n当前授权：{{amount}}\n资金监控：{{watch_status}}\n交易：<code>{{tx_hash}}</code>",
 approval_change:"🔄 <b>USDT 授权变更</b>\n备注：{{remark}}\n钱包：<code>{{owner}}</code>\n被授权人：<code>{{spender}}</code>\n变化：{{event_type}}\n最新额度：{{amount}}\n交易：<code>{{tx_hash}}</code>",
-transfer:"🔔 <b>Ethereum 资金异动</b>\n备注：{{remark}}\n监控地址：<code>{{address}}</code>\n资产：{{asset}}\n方向：{{direction}}\n金额：{{amount}} {{asset}}\n发送方：<code>{{from_address}}</code>\n接收方：<code>{{to_address}}</code>\n交易：<code>{{tx_hash}}</code>\n区块：{{block_number}}\n状态：首个区块已确认"
+transfer:"🔔 <b>Ethereum 资金异动</b>\n备注：{{remark}}\n监控地址：<code>{{address}}</code>\n资产：{{asset}}\n方向：{{direction}}\n金额：{{amount}} {{asset}}\n发送方：<code>{{from_address}}</code>\n接收方：<code>{{to_address}}</code>\n交易：<code>{{tx_hash}}</code>\n区块：{{block_number}}\n状态：首个区块已确认",
+reorg_correction:"⚠️ <b>区块链重组更正通知</b>\n钱包备注：{{remark}}\n地址：<code>{{address}}</code>\n资产：{{asset}}\n交易：<code>{{tx_hash}}</code>\n原区块：{{block_number}}\n原交易所在区块已离开当前主链，之前的提醒不再代表有效确认。请查看链上最新交易状态。"
 };
 export const defaults=DEFAULTS;
 function render(template,data){
