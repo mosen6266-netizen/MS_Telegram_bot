@@ -103,7 +103,7 @@ async function processApproval(env,rule,log){
       const remark="待备注 · "+short(owner);
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
     }
-    const watched=await ensureWatch(env,owner);
+    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
     if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"new_approval",
