@@ -104,9 +104,12 @@ export async function syncWatch(env,address,remove=false) {
   });
   if(!r.ok)throw Error("Alchemy sync HTTP "+r.status+" "+(await r.text()).slice(0,140));
 }
-export async function ensureWatch(env,address){
+export async function ensureWatch(env,address,fromBlock=undefined){
   await env.DB.prepare("INSERT OR IGNORE INTO wallet_watches(address,state) VALUES(?,'pending')").bind(address).run();
   try {
+    // Start recovery at first relevant authorization block when available.
+    const head=fromBlock===undefined?await blockNumber(env):fromBlock;
+    await env.DB.prepare("INSERT OR IGNORE INTO wallet_checkpoints(address,last_block) VALUES(?,?)").bind(address,Math.max(0,head-1)).run();
     await syncWatch(env,address,false);
     await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=?").bind(now(),now(),address).run();
     return true;
