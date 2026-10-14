@@ -55,6 +55,9 @@ export async function handleTelegram(env,upd){
   const match=m.text.trim().match(/^(?:\/check(?:@\w+)?\s+)?(0x[0-9a-fA-F]{40})$/);
   if(!match)return;
   const owner=addr(match[1]);if(!owner)return;
+  // First *request* wins, not first completed external API lookup.
+  await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,first_user_id,first_user_name,discovery_source) VALUES(?,?,?,'manual')").bind(owner,userId,name).run();
+  await env.DB.prepare("UPDATE wallets SET first_user_id=?,first_user_name=? WHERE address=? AND first_user_id IS NULL").bind(userId,name,owner).run();
   await send(env,chatId,"🔎 已收到地址查询，正在检索历史 USDT 授权并核验当前额度……");
   await env.TASKS.send({kind:"check",owner,chat_id:chatId,user_id:userId,display_name:name});
   await increment(env,"telegram_queries");
