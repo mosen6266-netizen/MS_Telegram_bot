@@ -117,6 +117,11 @@ export async function configEnv(env){
   }
   return e;
 }
+export async function persistSecret(env,keyName,value){
+  if(!SECRET_KEYS.includes(keyName))throw Error("Unsupported secret name");
+  await env.DB.prepare("INSERT INTO setup_secrets(key,encrypted_value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET encrypted_value=excluded.encrypted_value,updated_at=CURRENT_TIMESTAMP")
+    .bind(keyName,await encrypt(env,value)).run();
+}
 async function status(env){
   const configured=new Set(((await env.DB.prepare("SELECT key FROM setup_secrets").all()).results||[]).map(x=>x.key));
   const ready=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
@@ -169,20 +174,10 @@ export async function setupApi(req,env,path){
   if(path==="/api/setup/activate"&&req.method==="POST"){
     const s=await status(env);if(s.needs.length)return json({error:"Missing required configuration: "+s.needs.join(", ")},409);
     const e=await configEnv(env);
-    // Address Activity webhook can be created from the backend if the Notify API key works.
-    if(!e.ALCHEMY_ACTIVITY_WEBHOOK_ID||!e.ALCHEMY_SIGNING_KEY){
-      if(!e.ALCHEMY_NOTIFY_TOKEN)return json({error:"Alchemy Notify token missing"},409);
-      const base=new URL(req.url).origin;
-      const r=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
-        method:"POST",headers:{"content-type":"application/json","X-Alchemy-Token":e.ALCHEMY_NOTIFY_TOKEN},
-        body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"ADDRESS_ACTIVITY",webhook_url:base+"/webhooks/alchemy",name:"Ethereum USDT Monitor",addresses:[]})
-      });
-      const d=await r.json();const wh=d.data||d;
-      if(!r.ok||!wh.id||!wh.signing_key)return json({error:"Alchemy webhook automatic creation failed. Add an Address Activity webhook ID and signing key in settings, then retry. "+String(d.message||r.status).slice(0,130)},422);
-      for(const [k,v] of [["ALCHEMY_ACTIVITY_WEBHOOK_ID",wh.id],["ALCHEMY_SIGNING_KEY",wh.signing_key]]){
-        await env.DB.prepare("INSERT INTO setup_secrets(key,encrypted_value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET encrypted_value=excluded.encrypted_value,updated_at=CURRENT_TIMESTAMP").bind(k,await encrypt(env,v)).run();
-      }
-    }
+    // The Address Activity webhook is created lazily with the FIRST real Owner.
+    // This avoids registering a dummy wallet or relying on empty-address webhook support.
+    if((!e.ALCHEMY_ACTIVITY_WEBHOOK_ID||!e.ALCHEMY_SIGNING_KEY)&&!e.ALCHEMY_NOTIFY_TOKEN)
+      return json({error:"Alchemy Notify token is needed for automatic creation of the first activity webhook"},409);
     // Keep disabled if Telegram webhook registration fails.
     const webhookUrl=new URL(req.url).origin+"/webhooks/telegram";
     try{
