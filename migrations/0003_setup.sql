@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS admin_login (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  salt TEXT NOT NULL, verifier TEXT NOT NULL, iterations INTEGER NOT NULL,
+  initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  token_hash TEXT PRIMARY KEY,
+  expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON admin_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS setup_secrets (
+  key TEXT PRIMARY KEY, encrypted_value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS auth_failures (
+  subject TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, locked_until TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
