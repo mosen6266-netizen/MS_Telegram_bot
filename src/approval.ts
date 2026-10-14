@@ -2,7 +2,7 @@
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,receiptSuccess,now} from "./core";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
-async function ownerSpenders(env,owner){
+export async function ownerSpenders(env,owner){
   if(!env.ETHERSCAN_API_KEY)throw Error("ETHERSCAN_API_KEY required for complete historical spender discovery");
   const found=new Set();
   for(let page=1;page<=10;page++){
@@ -20,6 +20,16 @@ async function ownerSpenders(env,owner){
     if(d.result.length<1000)return [...found];
   }
   throw Error("Historical allowance log scan exceeds configured pagination limit; result incomplete");
+}
+export async function verifyAdminOwner(env,owner,chat_id){
+  const spenders=await ownerSpenders(env,owner);
+  let active=0;
+  for(const spender of spenders)if((await allowance(env,owner,spender))>0n)active++;
+  if(active===0)return {active:false,checked:spenders.length};
+  await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(owner).run();
+  const watched=await ensureWatch(env,owner);
+  if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
+  return {active:watched,allowances:active};
 }
 export async function checkOwner(env, owner, chat_id, user_id, display_name){
   const spenders=await ownerSpenders(env,owner);
@@ -82,7 +92,8 @@ async function processApproval(env,rule,log){
    .bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type).run();
   await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP")
    .bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber))).run();
-  if(amount>0n && !previous){
+  const registered=await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
+  if(amount>0n && (!registered || !previous)){
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
     const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for(const route of routes||[]){
