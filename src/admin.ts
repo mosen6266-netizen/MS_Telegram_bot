@@ -25,6 +25,7 @@ export async function handleAdmin(req,env,path){
       if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("机器人必须先加入这个 Telegram 群组");
       const remark=String(d.remark||"待核验 · "+short(a)).trim().slice(0,80);
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,a,remark).run();
+      await env.TASKS.send({kind:"verify_admin",owner:a,chat_id:chat});
     }
     await audit(env,"admin","create_wallet",a);
     return json({ok:true,monitored:false,note:"地址已存档。必须核实有效 USDT 授权才能启动资金监控。"});
