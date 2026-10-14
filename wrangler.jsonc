@@ -5,7 +5,7 @@
   "workers_dev": true,
   "observability": { "enabled": true },
   "d1_databases": [
-    { "binding": "DB", "database_name": "ethereum_usdt_monitor", "database_id": "REPLACE_WITH_NEW_D1_ID", "migrations_dir": "migrations" }
+    { "binding": "DB", "database_name": "ethereum_usdt_monitor", "database_id": "a207e930-774e-4a3e-9071-ab7ea1a6fc36", "migrations_dir": "migrations" }
   ],
   "queues": {
     "producers": [{ "binding": "TASKS", "queue": "ethereum-usdt-monitor-tasks" }],
