@@ -4,11 +4,12 @@ import {addSpender} from "./approval";
 import {usageSnapshot} from "./usage";
 import {defaults} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
+import {isAdmin} from "./setup";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
 export async function handleAdmin(req,env,path){
-  if(!env.ADMIN_API_TOKEN||req.headers.get("authorization")!=="Bearer "+env.ADMIN_API_TOKEN)return bad("管理员验证失败",401);
+  if(!await isAdmin(req,env))return bad("管理员验证失败或请求来源无效",401);
   const method=req.method;
   if(method==="GET"&&path==="/api/summary"){
     const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')"];
