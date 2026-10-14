@@ -14,6 +14,8 @@
   "triggers": { "crons": ["*/2 * * * *"] },
   "vars": {
     "NETWORK": "ETH_MAINNET",
+    "CF_ACCOUNT_ID": "415c5fcdf1106b794d36f6dd0853e326",
+    "PUBLIC_BASE_URL": "https://ethereum-usdt-monitor.mosen6266-ms007.workers.dev",
     "USAGE_ALERT_PERCENT": "80",
     "USAGE_FORECAST_DAYS": "7",
     "EMAIL_ALERTS": "false"
