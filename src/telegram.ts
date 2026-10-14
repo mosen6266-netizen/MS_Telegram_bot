@@ -1,0 +1,61 @@
+// @ts-nocheck
+import {addr,esc,send,telegram,buttons,now,trunc,increment} from "./core";
+import {checkOwner} from "./approval";
+async function memberAllowed(env,chatId,userId){
+  try{
+    const m=await telegram(env,"getChatMember",{chat_id:chatId,user_id:Number(userId)});
+    return !["left","kicked"].includes(m.status);
+  }catch(e){console.warn("membership verification failed",String(e));return false;}
+}
+export async function handleTelegram(env,upd){
+  if(upd.callback_query){
+    const c=upd.callback_query, data=String(c.data||"");
+    await telegram(env,"answerCallbackQuery",{callback_query_id:c.id});
+    if(!data.startsWith("remark:"))return;
+    const address=addr(data.slice(7)),chat=c.message?.chat;
+    if(!address||!chat||chat.type==="private")return;
+    if(!await memberAllowed(env,chat.id,c.from.id))return;
+    const sub=await env.DB.prepare("SELECT 1 FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(String(chat.id),address).first();
+    if(!sub)return;
+    const prompt=await send(env,chat.id,"✏️ "+esc(c.from.first_name)+"，请<b>回复这条消息</b>输入新的地址备注：\n<code>"+address+"</code>\n限 1–80 个字符，10 分钟内有效。",{force_reply:true,selective:true});
+    await env.DB.prepare("INSERT OR REPLACE INTO remark_sessions(chat_id,user_id,prompt_message_id,address,expires_at) VALUES(?,?,?,?,datetime('now','+10 minutes'))")
+      .bind(String(chat.id),String(c.from.id),prompt.message_id,address).run();
+    return;
+  }
+  const m=upd.message;if(!m||!m.from||!m.chat||!m.text)return;
+  const chatId=String(m.chat.id), userId=String(m.from.id);
+  const name=trunc([m.from.first_name,m.from.last_name].filter(Boolean).join(" "),80)||userId;
+  await env.DB.prepare("INSERT INTO telegram_users(user_id,display_name,username,last_seen_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name,username=excluded.username,last_seen_at=excluded.last_seen_at")
+    .bind(userId,name,m.from.username||null,now()).run();
+  await env.DB.prepare("INSERT INTO telegram_chats(chat_id,title,chat_type) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,chat_type=excluded.chat_type,active=1")
+    .bind(chatId,m.chat.title||"Private",m.chat.type).run();
+  if(m.reply_to_message){
+    const session=await env.DB.prepare("SELECT * FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=? AND expires_at>datetime('now')").bind(chatId,userId,m.reply_to_message.message_id).first();
+    if(session){
+      const remark=trunc(m.text.trim(),80);
+      if(!remark || Array.from(m.text.trim()).length>80 || /[\u0000-\u001f\u007f]/.test(remark)){
+        await send(env,chatId,"⚠️ 备注必须为 1–80 个有效字符，请重新回复。");return;
+      }
+      if(!await memberAllowed(env,m.chat.id,m.from.id))return;
+      const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(chatId,session.address).first();
+      if(!old){await send(env,chatId,"该地址未在当前群启用监控。");return;}
+      const result=await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=? AND remark_version=?")
+        .bind(remark,now(),chatId,session.address,old.remark_version).run();
+      if(!result.meta?.changes){await send(env,chatId,"备注刚被其他成员修改，请重新点击修改按钮。");return;}
+      await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId,session.address,userId,old.remark,remark).run();
+      await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
+      await send(env,chatId,"✅ 地址备注已更新：<b>"+esc(remark)+"</b>\n修改者："+esc(name)+"\n<code>"+session.address+"</code>",buttons(session.address));
+      return;
+    }
+  }
+  if(m.chat.type==="private"){
+    if(/^\/start/.test(m.text))await send(env,chatId,"欢迎使用 Ethereum USDT 授权监控机器人。请将机器人加入群组后发送 Ethereum 地址查询。\n管理员私聊预警需配置本聊天 ID："+chatId);
+    return;
+  }
+  const match=m.text.trim().match(/^(?:\/check(?:@\w+)?\s+)?(0x[0-9a-fA-F]{40})$/);
+  if(!match)return;
+  const owner=addr(match[1]);if(!owner)return;
+  await send(env,chatId,"🔎 已收到地址查询，正在检索历史 USDT 授权并核验当前额度……");
+  await env.TASKS.send({kind:"check",owner,chat_id:chatId,user_id:userId,display_name:name});
+  await increment(env,"telegram_queries");
+}
