@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {addr,json,audit,short,now} from "./core";
+import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
 import {usageSnapshot} from "./usage";
 import {defaults} from "./notifications";
@@ -63,7 +63,11 @@ export async function handleAdmin(req,env,path){
     }
     if(d.status!==undefined){
       if(!["active","paused","removed"].includes(d.status))return bad("状态无效");
-      if(d.status==="active"&&(await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state!=="active")return bad("Alchemy 未完成订阅，不能标记为监控中",409);
+      if(d.status==="active"&&(await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state!=="active"){
+        // Only previously monitored addresses can be resumed without another USDT approval verification.
+        if(!["paused","removed"].includes(old.status))return bad("该地址尚未完成有效 USDT 授权核验",409);
+        if(!await ensureWatch(await configEnv(env),a))return bad("Alchemy 监控订阅仍未完成，请稍后重试",409);
+      }
       await env.DB.prepare("UPDATE subscriptions SET status=?,updated_at=? WHERE chat_id=? AND address=?").bind(d.status,now(),chat,a).run();
       if(d.status==="removed"||d.status==="paused"){
         const still=(await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(a).first())?.n||0;
