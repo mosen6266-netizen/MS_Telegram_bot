@@ -32,6 +32,23 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","create_wallet",a);
     return json({ok:true,monitored:false,note:"地址已存档。必须核实有效 USDT 授权才能启动资金监控。"});
   }
+  if(method==="POST"&&path==="/api/wallets/remove"){
+    const d=await body(req),wallet=addr(d.address);if(!wallet)return bad("无效钱包地址");
+    if(!(await env.DB.prepare("SELECT 1 FROM wallets WHERE address=?").bind(wallet).first()))return bad("地址不存在",404);
+    await env.DB.prepare("INSERT OR IGNORE INTO wallet_exclusions(address) VALUES(?)").bind(wallet).run();
+    await env.DB.prepare("UPDATE subscriptions SET status='removed',updated_at=? WHERE address=?").bind(now(),wallet).run();
+    await env.DB.prepare("UPDATE wallets SET deleted_at=? WHERE address=?").bind(now(),wallet).run();
+    const removed=await removeWatch(await configEnv(env),wallet);
+    await audit(env,"admin","global_remove_wallet",wallet,{alchemy_removed:removed});
+    return json({ok:true,alchemy_removed:removed,archived:true});
+  }
+  if(method==="POST"&&path==="/api/wallets/restore"){
+    const d=await body(req),wallet=addr(d.address);if(!wallet)return bad("无效钱包地址");
+    await env.DB.prepare("DELETE FROM wallet_exclusions WHERE address=?").bind(wallet).run();
+    await env.DB.prepare("UPDATE wallets SET deleted_at=NULL WHERE address=?").bind(wallet).run();
+    await audit(env,"admin","restore_wallet",wallet);
+    return json({ok:true,watch_status:"not_automatically_resumed",note:"已恢复档案。需要重新进行有效 USDT 授权核验并建立群组订阅。"});
+  }
   if(method==="GET"&&path==="/api/spenders")return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
   if(method==="POST"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);if(!a)return bad("Spender 地址无效");
