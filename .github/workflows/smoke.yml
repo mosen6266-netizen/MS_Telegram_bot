@@ -1,0 +1,34 @@
+name: Deployment Smoke Test
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check public Worker health endpoint
+        run: |
+          curl --fail --show-error --silent --retry 3 --retry-delay 3 \
+            'https://ethereum-usdt-monitor.mosen6266-ms007.workers.dev/health' \
+            -o /tmp/health.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/health.json') as f: d=json.load(f)
+          assert d['service']=='ethereum-usdt-monitor', d
+          assert d['database_configured'] is True, d
+          print('worker responds, D1 binding present')
+          PY
+      - name: Check setup initialization status
+        run: |
+          curl --fail --show-error --silent --retry 3 \
+            'https://ethereum-usdt-monitor.mosen6266-ms007.workers.dev/auth/status' \
+            -o /tmp/auth.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/auth.json') as f: d=json.load(f)
+          assert isinstance(d.get('initialized'),bool), d
+          assert isinstance(d.get('authenticated'),bool), d
+          print('setup status endpoint responds')
+          PY
