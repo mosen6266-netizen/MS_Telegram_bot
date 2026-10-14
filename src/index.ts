@@ -1,7 +1,7 @@
 // @ts-nocheck
 import {json,verifyAlchemy,ensureWatch,send,esc} from "./core";
 import {handleTelegram} from "./telegram";
-import {checkOwner,pollSpenders} from "./approval";
+import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {processActivity} from "./transfers";
 import {flushOutbox,recoverStuck} from "./notifications";
 import {runUsageAlerts} from "./usage";
@@ -54,6 +54,7 @@ export default {
       try{
         if(item.kind==="check")await checkOwner(env,item.owner,item.chat_id,item.user_id,item.display_name);
         else if(item.kind==="activity")await processActivity(env,item.payload);
+        else if(item.kind==="verify_admin")await verifyAdminOwner(env,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
         message.ack();
       }catch(e){
