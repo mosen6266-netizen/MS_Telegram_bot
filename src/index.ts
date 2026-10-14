@@ -6,6 +6,7 @@ import {processActivity} from "./transfers";
 import {flushOutbox,recoverStuck} from "./notifications";
 import {runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
+import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 async function cron(env){
   await recoverStuck(env);
   const {results:pending}=await env.DB.prepare("SELECT address FROM wallet_watches WHERE state='pending' LIMIT 15").all();
@@ -21,23 +22,32 @@ export default {
   async fetch(req,env,ctx){
     const url=new URL(req.url),path=url.pathname;
     try{
+      if(path.startsWith("/auth/"))return await authRoute(req,env,path);
+      if(path.startsWith("/api/setup/")){
+        if(!await isAdmin(req,env))return json({error:"Administrator authentication required"},401);
+        return await setupApi(req,env,path);
+      }
+      const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
+      const configured=active?await configEnv(env):env;
       if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",database_configured:!!env.DB});
       if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
       if(path.startsWith("/api/"))return await handleAdmin(req,env,path);
       if(req.method==="POST"&&path==="/webhooks/telegram"){
-        if(!env.TELEGRAM_WEBHOOK_SECRET||req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET)return json({error:"Unauthorized"},401);
+        if(!active)return json({error:"Monitor is not enabled"},503);
+        if(!configured.TELEGRAM_WEBHOOK_SECRET||req.headers.get("x-telegram-bot-api-secret-token")!==configured.TELEGRAM_WEBHOOK_SECRET)return json({error:"Unauthorized"},401);
         const upd=await req.json();
         if(!Number.isSafeInteger(upd.update_id))return json({error:"Invalid update"},400);
         // Mark after successful handling; Telegram retries on transient failure.
         const seen=await env.DB.prepare("SELECT 1 FROM telegram_updates WHERE update_id=?").bind(upd.update_id).first();
         if(seen)return json({ok:true,duplicate:true});
-        await handleTelegram(env,upd);
+        await handleTelegram(configured,upd);
         await env.DB.prepare("INSERT OR IGNORE INTO telegram_updates(update_id) VALUES(?)").bind(upd.update_id).run();
         return json({ok:true});
       }
       if(req.method==="POST"&&path==="/webhooks/alchemy"){
+        if(!active)return json({error:"Monitor is not enabled"},503);
         const raw=await req.text();
-        if(!await verifyAlchemy(env,raw,req.headers.get("x-alchemy-signature")))return json({error:"Invalid webhook signature"},401);
+        if(!await verifyAlchemy(configured,raw,req.headers.get("x-alchemy-signature")))return json({error:"Invalid webhook signature"},401);
         const d=JSON.parse(raw);
         await env.TASKS.send({kind:"activity",payload:d});
         return json({ok:true});
@@ -52,16 +62,19 @@ export default {
     for(const message of batch.messages){
       const item=message.body;
       try{
-        if(item.kind==="check")await checkOwner(env,item.owner,item.chat_id,item.user_id,item.display_name);
-        else if(item.kind==="activity")await processActivity(env,item.payload);
-        else if(item.kind==="verify_admin")await verifyAdminOwner(env,item.owner,item.chat_id);
+        const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
+        if(!active){message.retry({delaySeconds:120});continue;}
+        const configured=await configEnv(env);
+        if(item.kind==="check")await checkOwner(configured,item.owner,item.chat_id,item.user_id,item.display_name);
+        else if(item.kind==="activity")await processActivity(configured,item.payload);
+        else if(item.kind==="verify_admin")await verifyAdminOwner(configured,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
         message.ack();
       }catch(e){
         console.error("Queue job failed",item.kind,String(e));
         if(message.attempts>=5){
           if(item.kind==="check"){
-            try{await send(env,item.chat_id,"⚠️ <b>USDT 授权查询未完成</b>\n请稍后重试。系统未把此地址错误标记为无授权，也未擅自开启监控。");}catch{}
+            try{await send(configured,item.chat_id,"⚠️ <b>USDT 授权查询未完成</b>\n请稍后重试。系统未把此地址错误标记为无授权，也未擅自开启监控。");}catch{}
           }
           message.ack();
         }else message.retry({delaySeconds:Math.min(120,10*Math.pow(2,message.attempts||1))});
@@ -69,6 +82,6 @@ export default {
     }
   },
   async scheduled(event,env,ctx){
-    ctx.waitUntil(cron(env));
+    ctx.waitUntil((async()=>{const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";if(active)await cron(await configEnv(env));})());
   }
 };
