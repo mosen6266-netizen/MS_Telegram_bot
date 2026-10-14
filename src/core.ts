@@ -1,4 +1,5 @@
 // @ts-nocheck
+import {persistSecret} from './setup';
 export const USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7";
 export const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 export const APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
@@ -65,7 +66,38 @@ export async function audit(env,actor,action,target,details={}){
     .bind(String(actor),action,String(target),JSON.stringify(details)).run();
 }
 export async function syncWatch(env,address,remove=false) {
-  if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID || !env.ALCHEMY_NOTIFY_TOKEN) throw Error("Alchemy Address Activity webhook not configured");
+  if(!env.ALCHEMY_NOTIFY_TOKEN) throw Error("Alchemy Notify token is missing");
+  if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID && !remove){
+    // Create a webhook ONLY when a genuine monitored Owner exists.
+    // Hold a short-lived D1 lock to avoid simultaneous duplicate webhook creation.
+    const lock=await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value) VALUES('activity_webhook_lock',?)").bind(now()).run();
+    if(!lock.meta?.changes){
+      const old=await env.DB.prepare("SELECT updated_at FROM runtime_state WHERE key='activity_webhook_lock'").first();
+      if(old&&Date.now()-new Date(old.updated_at+"Z").getTime()>180000){
+        await env.DB.prepare("DELETE FROM runtime_state WHERE key='activity_webhook_lock'").run();
+      }
+      throw Error("Alchemy webhook creation is already running; retry shortly");
+    }
+    try{
+      const r=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
+        method:"POST",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
+        body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"ADDRESS_ACTIVITY",
+          webhook_url:env.PUBLIC_BASE_URL+"/webhooks/alchemy",name:"Ethereum USDT Owner Monitor",addresses:[address]})
+      });
+      const d=await r.json();const created=d.data||d;
+      if(!r.ok || !created.id || !created.signing_key)
+        throw Error("Alchemy webhook creation rejected: "+String(d.message||r.status).slice(0,100));
+      await persistSecret(env,"ALCHEMY_ACTIVITY_WEBHOOK_ID",created.id);
+      await persistSecret(env,"ALCHEMY_SIGNING_KEY",created.signing_key);
+      env.ALCHEMY_ACTIVITY_WEBHOOK_ID=created.id;
+      env.ALCHEMY_SIGNING_KEY=created.signing_key;
+      // The newly created webhook already tracks this first Owner.
+      return;
+    } finally{
+      await env.DB.prepare("DELETE FROM runtime_state WHERE key='activity_webhook_lock'").run();
+    }
+  }
+  if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID)throw Error("Alchemy activity webhook missing");
   const r=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
     method:"PATCH",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
     body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:remove?[]:[address],addresses_to_remove:remove?[address]:[]})
