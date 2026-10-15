@@ -5,7 +5,7 @@ import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history";
 import {processActivity} from "./transfers";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
-import {flushOutbox,recoverStuck} from "./notifications";
+import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
 import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
@@ -85,7 +85,7 @@ export default {
         console.error("Queue job failed",item.kind,String(e));
         if(message.attempts>=5){
           if(item.kind==="check"){
-            try{await send(configured,item.chat_id,"⚠️ <b>USDT 授权查询未完成</b>\n请稍后重试。系统未把此地址错误标记为无授权，也未擅自开启监控。");}catch{}
+            try{await send(configured,item.chat_id,await renderTemplate(configured,"query_failed",item.chat_id,{address:item.owner}));}catch{}
             try{await finishAddressQueryCleanup(configured,item);}
             catch(cleanErr){console.warn("Failed query cleanup deferred",String(cleanErr));}
           }
