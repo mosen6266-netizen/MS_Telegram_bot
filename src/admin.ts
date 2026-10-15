@@ -71,9 +71,9 @@ export async function handleAdmin(req,env,path){
     const job=await env.DB.prepare("SELECT * FROM spender_history_jobs WHERE spender=?").bind(spender).first();
     if(!job)return bad("尚未创建历史授权扫描任务",404);
     const counts=await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender).first();
-    const filter=status==="all"?"":" AND verify_status=?";
+    const filter=status==="all"?"":" AND h.verify_status=?";
     const args=status==="all"?[spender,50,page*50]:[spender,status,50,page*50];
-    const rows=(await env.DB.prepare("SELECT owner,first_seen_block,latest_event_block,latest_tx_hash,last_event_amount_raw,current_allowance_raw,verify_status,verified_at FROM spender_history_addresses WHERE spender=?"+filter+" ORDER BY latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
+    const rows=(await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner WHERE h.spender=?"+filter+" ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
     const total=status==="all"?counts.total:counts[status];
     return json({job,counts,rows,page,total,total_pages:Math.ceil(total/50)});
   }
