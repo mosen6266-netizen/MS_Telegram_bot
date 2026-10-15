@@ -17,7 +17,7 @@ async function getOneDirection(env,address,direction,from,to){
     if(!page||!Array.isArray(page.transfers))throw Error("Alchemy transfer page is invalid");
     const normalized=page.transfers.map(x=>({
       fromAddress:x.from,toAddress:x.to,hash:x.hash,uniqueId:x.uniqueId,
-      blockNum:x.blockNum,value:x.value,category:x.category,
+      blockNum:x.blockNum,value:x.value,category:x.category,typeTraceAddress:x.typeTraceAddress,
       rawContract:{address:x.rawContract?.address,rawValue:x.rawContract?.value}
     }));
     await processActivity(env,{network:"ETH_MAINNET",event:{network:"ETH_MAINNET",activity:normalized}});
@@ -25,19 +25,19 @@ async function getOneDirection(env,address,direction,from,to){
   }while(cursor);
   return transactions;
 }
-export async function scanWalletGaps(env,maxWallets=3){
+export async function scanWalletGaps(env,maxWallets=8){
   const head=await blockNumber(env);
   const {results:wallets}=await env.DB.prepare(
-   "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? ORDER BY c.last_block ASC LIMIT ?"
+   "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? AND (c.last_error IS NULL OR c.checked_at IS NULL OR c.checked_at<datetime('now','-5 minutes')) ORDER BY c.last_block ASC,c.checked_at ASC LIMIT ?"
   ).bind(head,maxWallets).all();
   for(const w of wallets||[]){
-    const from=Math.max(0,w.last_block-5),to=Math.min(head,w.last_block+120);
+    const from=Math.max(0,w.last_block-5),to=Math.min(head,w.last_block+600);
     try {
       await getOneDirection(env,w.address,"out",from,to);
       await getOneDirection(env,w.address,"in",from,to);
       await env.DB.prepare("UPDATE wallet_checkpoints SET last_block=?,checked_at=?,last_error=NULL WHERE address=?").bind(to,now(),w.address).run();
     }catch(e){
-      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=? WHERE address=?").bind(String(e).slice(0,300),w.address).run();
+      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=?,checked_at=? WHERE address=?").bind(String(e).slice(0,300),now(),w.address).run();
       console.error("Wallet recovery failure",w.address,String(e));
     }
   }
