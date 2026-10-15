@@ -18,7 +18,7 @@ async function cron(env){
     if(await ensureWatch(env,p.address))await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
   }
   try{await pollSpenders(env);}catch(e){console.error("Spender scan",String(e))}
-  try{await scanSpenderHistories(env);}catch(e){console.error("Spender history scan",String(e))}
+  try{for(let i=0;i<4;i++){if(!await scanSpenderHistories(env))break;}}catch(e){console.error("Spender history scan",String(e))}
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
   try{await enrollHistoricalOwners(env,8);}catch(e){console.error("Historical monitoring enrollment",String(e))}
   try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
