@@ -35,11 +35,14 @@ export default {
         if(!await isAdmin(req,env))return json({error:"Administrator authentication required"},401);
         return await setupApi(req,env,path);
       }
-      const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
-      const configured=active?await configEnv(env):env;
-      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-auto-cleanup-v1",database_configured:!!env.DB});
+      // Admin UI and admin APIs need their own session check in handleAdmin,
+      // but do not need to decrypt RPC, Alchemy or Telegram secrets on every
+      // navigation, filter or search request. Decrypt only for live webhooks.
+      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-admin-fastpath-v1",database_configured:!!env.DB});
       if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
       if(path.startsWith("/api/"))return await handleAdmin(req,env,path);
+      const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
+      const configured=active?await configEnv(env):env;
       if(req.method==="POST"&&path==="/webhooks/telegram"){
         if(!active)return json({error:"Monitor is not enabled"},503);
         if(!configured.TELEGRAM_WEBHOOK_SECRET||req.headers.get("x-telegram-bot-api-secret-token")!==configured.TELEGRAM_WEBHOOK_SECRET)return json({error:"Unauthorized"},401);
