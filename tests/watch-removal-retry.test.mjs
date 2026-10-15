@@ -16,7 +16,7 @@ test("only aged, unsubscribed removal jobs are retried and cooldown prevents cal
   const DB=await mf.getD1Database("DB");
   await DB.prepare("CREATE TABLE wallet_watches(address TEXT PRIMARY KEY,state TEXT NOT NULL,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,last_error TEXT)").run();
   await DB.prepare("CREATE TABLE subscriptions(chat_id TEXT,address TEXT,status TEXT)").run();
-  await DB.prepare("CREATE TABLE runtime_state(key TEXT PRIMARY KEY,value TEXT)").run();
+  await DB.prepare("CREATE TABLE runtime_state(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP)").run();
   await DB.prepare("INSERT INTO wallet_watches(address,state,updated_at) VALUES(?,'removal_pending',datetime('now','-40 minutes'))").bind(a(1)).run();
   await DB.prepare("INSERT INTO wallet_watches(address,state,updated_at) VALUES(?,'removal_pending',datetime('now','-40 minutes'))").bind(a(2)).run();
   await DB.prepare("INSERT INTO wallet_watches(address,state,updated_at) VALUES(?,'removal_pending',datetime('now','-10 minutes'))").bind(a(3)).run();
@@ -50,7 +50,7 @@ test("failed external deletion stays pending and is not marked removed",async()=
   const DB=await mf.getD1Database("DB");
   await DB.prepare("CREATE TABLE wallet_watches(address TEXT PRIMARY KEY,state TEXT NOT NULL,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,last_error TEXT)").run();
   await DB.prepare("CREATE TABLE subscriptions(chat_id TEXT,address TEXT,status TEXT)").run();
-  await DB.prepare("CREATE TABLE runtime_state(key TEXT PRIMARY KEY,value TEXT)").run();
+  await DB.prepare("CREATE TABLE runtime_state(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP)").run();
   await DB.prepare("INSERT INTO wallet_watches(address,state,updated_at) VALUES(?,'removal_pending',datetime('now','-40 minutes'))").bind(a(3)).run();
   globalThis.fetch=async()=>new Response("too many requests",{status:429});
   const res=await retryPendingWatchRemovals({DB,ALCHEMY_NOTIFY_TOKEN:"test",ALCHEMY_ACTIVITY_WEBHOOK_ID:"wh_1"});
