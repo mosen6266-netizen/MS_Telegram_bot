@@ -271,7 +271,10 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
       const message=String(e).slice(0,250);
       if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
         await env.DB.prepare("UPDATE outbox SET state='failed',last_error=? WHERE id=?").bind(message,row.id).run();
-        await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
+        // Best-effort escalation: a broken administrator DM must not prevent
+        // the remaining users' notifications from being delivered.
+        try{await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));}
+        catch(reportError){console.warn("Failed-notice escalation unavailable",String(reportError));}
       }else{
         const seconds=Math.max(Number(e?.retryAfter)||0,Math.min(3600,30*Math.pow(2,Math.min(row.attempts,7))));
         await env.DB.prepare("UPDATE outbox SET state='pending',last_error=?,due_at=datetime('now',?) WHERE id=?").bind(message,"+"+seconds+" seconds",row.id).run();
