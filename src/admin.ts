@@ -10,7 +10,7 @@ import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlert
 import {flushOutbox} from "./notifications";
 import {defaults,templateCatalog} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
-import {listWalletsPage,listSubscriptionsPage,listAuditPage} from "./admin-listing";
+import {listWalletsPage,listSubscriptionsPage,listAuditPage,listTransfersPage} from "./admin-listing";
 import {isAdmin,configEnv} from "./setup";
 import {removeWatch} from "./core";
 import {withAlchemyMutationLease,AlchemyMutationBusy} from "./alchemy-mutation-lease";
@@ -308,7 +308,12 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","update_template",key,{chat});
     return json({ok:true});
   }
-  if(method==="GET"&&path==="/api/transfers")return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/transfers"){
+    const q=new URL(req.url).searchParams;
+    const result=await listTransfersPage(env.DB,{page:q.get("page"),search:q.get("search"),asset:q.get("asset")||"all"});
+    if(result.error)return bad("交易资产筛选无效",400);
+    return json(result);
+  }
   if(method==="POST"&&path==="/api/outbox/retry"){
     const d=await body(req);
     const result=await requeueFailedOutbox(env.DB,Number(d.id));
