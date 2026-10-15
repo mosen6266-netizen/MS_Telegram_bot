@@ -131,7 +131,9 @@ async function processApproval(env,rule,log){
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
       await sourceInsert(env.DB,chat,owner,"spender",rule.spender).run();
     }
-    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
+    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)),async()=>
+      !!await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1")
+        .bind(rule.spender,rule.generation).first());
     if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"new_approval",
