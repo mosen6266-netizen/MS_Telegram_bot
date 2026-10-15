@@ -65,11 +65,17 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
         const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
         const groups=(await db.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(spender).all()).results||[];
         if(!groups.length)throw Error("Spender 未设置通知群");
+        let hasActiveRoute=false;
         for(const group of groups){
           const chat=String(group.chat_id);
-          if(!(await db.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))continue;
+          const registered=await db.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+          if(!registered?.active || !["group","supergroup"].includes(registered.chat_type))continue;
           await db.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
+          // An explicit manual removal is never silently overridden by scanning.
+          const subscription=await db.prepare("SELECT status FROM subscriptions WHERE chat_id=? AND address=?").bind(chat,owner).first();
+          if(subscription && ["active","pending"].includes(subscription.status))hasActiveRoute=true;
         }
+        if(!hasActiveRoute)throw Error("未找到可用的群组订阅；需要检查群组启用状态或手动恢复已移除的订阅");
         const state=await db.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
         if(state?.state==="active"){
           await db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner,spender).run();
