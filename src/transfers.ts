@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {USDT,USDC,addr,receiptSuccess,increment} from "./core";
+import {USDT,USDC,addr,confirmedReceipt,increment} from "./core";
 const asNum=x => typeof x==="string" && x.startsWith("0x")?Number(BigInt(x)):Number(x||0);
 function identify(a){
   const category=String(a.category||"").toLowerCase();
@@ -32,10 +32,12 @@ export async function processActivity(env,payload){
     if(!from||!to)continue;
     const hash=a.hash||a.transactionHash;
     if(!/^0x[a-fA-F0-9]{64}$/.test(hash||""))continue;
-    const success=await receiptSuccess(env,hash);
-    if(success!==true)continue;
+    const receipt=await confirmedReceipt(env,hash);
+    if(!receipt)continue;
+    const confirmedBlockHash=/^0x[0-9a-fA-F]{64}$/.test(String(receipt.blockHash||""))?
+      receipt.blockHash.toLowerCase():null;
     const baseId="tx:"+hash+":"+(a.uniqueId||a.logIndex||a.category+":"+from+":"+to+":"+a.rawContract?.rawValue);
-    const block=asNum(a.blockNum||a.blockNumber);
+    const block=asNum(a.blockNum||a.blockNumber||receipt.blockNumber);
     const val=displayAmount(a,asset.asset);
     // Self transfers are recorded once, not twice.
     const owners=from===to?[{address:from,direction:"自转"}]:[{address:from,direction:"转出"},{address:to,direction:"转入"}];
@@ -48,7 +50,12 @@ export async function processActivity(env,payload){
       const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
       const statements=[
         env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
-          .bind(eventId,o.address,asset.asset,o.direction,val,from,to,hash,block,a.blockHash||null)
+          .bind(eventId,o.address,asset.asset,o.direction,val,from,to,hash,block,confirmedBlockHash)
+      ,
+        // A replay can heal older rows that predate the verified block hash.
+        // Never replace an already recorded block hash without reorg checks.
+        env.DB.prepare("UPDATE transfer_events SET block_hash=? WHERE event_id=? AND block_hash IS NULL AND block_number=?")
+          .bind(confirmedBlockHash,eventId,block)
       ];
       for(const sub of subs||[]){
         const payload={asset:asset.asset,direction:o.direction,amount:val,from_address:from,to_address:to,tx_hash:hash,block_number:block};
