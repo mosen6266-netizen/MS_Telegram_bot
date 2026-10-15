@@ -68,12 +68,16 @@ export async function authRoute(req,env,path){
     if(password.length<14||password.length>200)return json({error:"Password must be 14-200 characters"},400);
     // A short-lived, single-use code replaces the fragile Cloudflare API self-modification.
     if(!env.APP_ENCRYPTION_KEY)return json({error:"Service encryption secret not configured. Contact the deployment administrator."},503);
-    const digest=await sha256(code);
-    const provisioned=typeof env.INIT_SETUP_CODE==="string"&&env.INIT_SETUP_CODE.length>=24;
+    // Diagnose a misconfigured bootstrap secret without disclosing its value.
+    const rawSetupSecret=typeof env.INIT_SETUP_CODE==="string"?env.INIT_SETUP_CODE:"";
+    if(rawSetupSecret && rawSetupSecret.trim().length<24)
+      return json({error:"Cloudflare 的 INIT_SETUP_CODE 已保存，但长度不足 24 个字符。请在 Worker 生产环境将它更新为至少 24 位的随机码，并在这里输入完全相同的内容。"},409);
+    const digest=await sha256(code.trim());
+    const provisioned=rawSetupSecret.trim().length>=24;
     const invite=provisioned
-      ? equal(digest,await sha256(env.INIT_SETUP_CODE))
+      ? equal(digest,await sha256(rawSetupSecret.trim()))
       : !!(await env.DB.prepare("SELECT 1 FROM setup_invites WHERE code_hash=? AND used_at IS NULL AND expires_at>?").bind(digest,now()).first());
-    if(!invite){await fail(env,"setup");return json({error:"一次性初始化码无效或已经过期。请检查 Cloudflare Worker 中的 INIT_SETUP_CODE Secret。"},403);}
+    if(!invite){await fail(env,"setup");return json({error:provisioned?"初始化码不匹配。请确认与生产环境 INIT_SETUP_CODE 完全一致，注意大小写及中间空格。":"生产环境未检测到有效初始化码，请确认 INIT_SETUP_CODE 已部署。"},403);}
     const salt=b64(random(24)),hash=await passwordHash(password,salt);
     // Database uniqueness prevents two simultaneous first-run initializations.
     const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,200000)").bind(salt,hash).run();
