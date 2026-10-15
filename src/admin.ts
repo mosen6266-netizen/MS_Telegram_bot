@@ -10,6 +10,7 @@ import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlert
 import {flushOutbox} from "./notifications";
 import {defaults,templateCatalog} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
+import {listWalletsPage,listSubscriptionsPage,listAuditPage} from "./admin-listing";
 import {isAdmin,configEnv} from "./setup";
 import {removeWatch} from "./core";
 import {withAlchemyMutationLease,AlchemyMutationBusy} from "./alchemy-mutation-lease";
@@ -67,7 +68,10 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","global_wallet_remark",address,{previous,remark});
     return json({ok:true,remark,note:"此地址备注已同步所有群组、后台列表与后续消息"});
   }
-  if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/wallets"){
+    const q=new URL(req.url).searchParams;
+    return json(await listWalletsPage(env.DB,{page:q.get("page"),search:q.get("search")}));
+  }
   if(method==="POST"&&path==="/api/wallets"){
     const d=await body(req),a=addr(d.address);if(!a)return bad("无效的 Ethereum 地址");
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
@@ -247,7 +251,12 @@ export async function handleAdmin(req,env,path){
     const q=new URL(req.url).searchParams;
     return json(await listLegacySubscriptions(env.DB,{page:q.get("page")||0,search:q.get("search")||""}));
   }
-  if(method==="GET"&&path==="/api/subscriptions")return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/subscriptions"){
+    const q=new URL(req.url).searchParams;
+    const result=await listSubscriptionsPage(env.DB,{page:q.get("page"),search:q.get("search"),status:q.get("status")||"all"});
+    if(result.error)return bad("订阅状态筛选无效",400);
+    return json(result);
+  }
   if(method==="PATCH"&&path==="/api/subscriptions"){
     const d=await body(req),a=addr(d.address),chat=String(d.chat_id||"");if(!a||!/^-?\d+$/.test(chat))return bad("无效订阅地址或群组");
     const old=await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a,chat).first();if(!old)return bad("订阅不存在",404);
@@ -318,7 +327,10 @@ export async function handleAdmin(req,env,path){
     if(result.error)return bad(result.error==="invalid_status"?"通知状态筛选无效":"请输入有效任务编号或 Telegram 群 ID",result.status);
     return json(result);
   }
-  if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/audit"){
+    const q=new URL(req.url).searchParams;
+    return json(await listAuditPage(env.DB,{page:q.get("page"),search:q.get("search")}));
+  }
   if(method==="GET"&&path==="/api/usage"){
     const [settings,platforms]=await Promise.all([usageSettings(env),usageSnapshot(env)]);
     return json({warning_threshold_percent:80,forecast_days:7,telegram_dm:true,email:false,
