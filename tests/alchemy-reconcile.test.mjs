@@ -81,7 +81,7 @@ test("uncertain Alchemy API errors do not switch currently monitored wallets off
   }finally{globalThis.fetch=old;}
 });
 
-test("fully verified but persistently absent Alchemy addresses are queued for retry",async()=>{
+test("Alchemy lag remains an incomplete warning without disabling RPC recovery",async()=>{
   const local=env([wallet(1)]),old=globalThis.fetch;
   globalThis.fetch=async (url,options={})=>String(url).includes("/api/team-webhooks")?meta():options.method==="PATCH"
     ? {ok:true}
@@ -89,8 +89,8 @@ test("fully verified but persistently absent Alchemy addresses are queued for re
   try{
     const result=await reconcileAlchemyAddresses(local);
     assert.equal(result.status,"incomplete");
-    assert.equal(local.DB.addresses[0].state,"pending");
-    assert.equal(local.DB.addresses[0].subscription,"pending");
-    assert.equal(local.DB.addresses[0].enrollment,"retrying");
+    assert.equal(local.DB.addresses[0].state,"active");
+    assert.equal(local.DB.addresses[0].subscription,"active");
+    assert.equal(local.DB.addresses[0].enrollment,"active");
   }finally{globalThis.fetch=old;}
 });
