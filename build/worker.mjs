@@ -1105,6 +1105,9 @@ async function processApproval(env, rule, log) {
   if (ok !== true) return;
   const amount = await allowance(env, owner, rule.spender);
   await recordSpenderLiveApproval(env, rule.spender, log, amount);
+  const manuallyExcluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
+  const walletRecord = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
+  if (manuallyExcluded || walletRecord?.deleted_at) return;
   const previous = await env.DB.prepare("SELECT amount_raw FROM allowances WHERE owner=? AND spender=?").bind(owner, rule.spender).first();
   const before = BigInt(previous?.amount_raw || "0");
   const evId = "approval:" + log.transactionHash + ":" + log.logIndex;
