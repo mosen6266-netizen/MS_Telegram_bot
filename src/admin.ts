@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
+import {startSpenderHistory} from "./spender-history";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
 import {defaults} from "./notifications";
@@ -57,8 +58,32 @@ export async function handleAdmin(req,env,path){
     if(!groups.length)return bad("必须选择至少一个 Telegram 群组");
     for(const chat of groups)if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("未登记的群组："+chat);
     await addSpender(await configEnv(env),a,String(d.remark||"Spender "+short(a)).slice(0,80),groups);
+    await startSpenderHistory(env,a);
     await audit(env,"admin","create_spender",a,{groups});
     return json({ok:true,mode:"new_approvals_only",note:"只监控新授权 Owner 的资金，不自动监控 Spender 自身。"});
+  }
+  if(method==="GET"&&path==="/api/spenders/history"){
+    const q=new URL(req.url).searchParams,spender=addr(q.get("spender"));
+    if(!spender)return bad("请输入有效的 Spender 地址");
+    const page=Math.min(100000,Math.max(0,Number.parseInt(q.get("page")||"0",10)||0));
+    const status=q.get("status")||"all";
+    if(!["all","active","revoked","pending"].includes(status))return bad("授权状态筛选值无效");
+    const job=await env.DB.prepare("SELECT * FROM spender_history_jobs WHERE spender=?").bind(spender).first();
+    if(!job)return bad("尚未创建历史授权扫描任务",404);
+    const counts=await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender).first();
+    const filter=status==="all"?"":" AND verify_status=?";
+    const args=status==="all"?[spender,50,page*50]:[spender,status,50,page*50];
+    const rows=(await env.DB.prepare("SELECT owner,first_seen_block,latest_event_block,latest_tx_hash,last_event_amount_raw,current_allowance_raw,verify_status,verified_at FROM spender_history_addresses WHERE spender=?"+filter+" ORDER BY latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
+    const total=status==="all"?counts.total:counts[status];
+    return json({job,counts,rows,page,total,total_pages:Math.ceil(total/50)});
+  }
+  if(method==="POST"&&path==="/api/spenders/history/refresh"){
+    const d=await body(req),spender=addr(d.spender);
+    if(!spender)return bad("Spender 地址无效");
+    if(!(await env.DB.prepare("SELECT 1 FROM spender_history_jobs WHERE spender=?").bind(spender).first()))return bad("历史扫描任务不存在",404);
+    await env.DB.prepare("UPDATE spender_history_addresses SET verify_status='pending',verified_at=NULL WHERE spender=?").bind(spender).run();
+    await env.DB.prepare("UPDATE spender_history_jobs SET state=CASE WHEN state='retrying' THEN 'scanning' ELSE state END,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(spender).run();
+    return json({ok:true,note:"已安排重新核验当前授权额度，历史扫描从断点继续"});
   }
   if(method==="PATCH"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);if(!a)return bad("无效 Spender");
