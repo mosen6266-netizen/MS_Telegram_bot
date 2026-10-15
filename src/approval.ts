@@ -2,6 +2,7 @@
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
 import {recordSpenderLiveApproval} from "./spender-history";
 import {walletRemark} from "./wallet-remarks";
+import {sourceInsert} from "./subscription-sources";
 import {renderTemplate} from "./notifications";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
@@ -55,6 +56,7 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   const first=await env.DB.prepare("SELECT first_user_name FROM wallets WHERE address=?").bind(owner).first();
   const sharedRemark=await walletRemark(env,owner,first?.first_user_name||display_name);
   await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id),owner,sharedRemark).run();
+  await sourceInsert(env.DB,chat_id,owner,"manual",String(user_id)).run();
   const watched=await ensureWatch(env,owner);
   if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id),owner).run();
   const current=await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id),owner).first();
@@ -70,7 +72,7 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
 }
 export async function addSpender(env,spender,remark,chat_ids){
   const head=await blockNumber(env);
-  await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block) VALUES(?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender,remark,head,head).run();
+  await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block,generation) VALUES(?,?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender,remark,head,head,crypto.randomUUID()).run();
   for(const chat of chat_ids||[])await env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender,String(chat)).run();
 }
 export async function pollSpenders(env){
@@ -78,6 +80,8 @@ export async function pollSpenders(env){
   const {results:rules}=await env.DB.prepare("SELECT * FROM spender_rules WHERE enabled=1 ORDER BY cursor_block ASC LIMIT 40").all();
   for(const rule of rules||[]){
     const from=rule.cursor_block+1;
+    // Captured generation prevents a deleted/recreated address from sharing
+    // an earlier polling cycle's checkpoint.
     const to=Math.min(head,from+499);
     if(from>to)continue;
     try {
@@ -86,7 +90,7 @@ export async function pollSpenders(env){
         if(log.removed)continue;
         await processApproval(env,rule,log);
       }
-      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=?").bind(to,rule.spender).run();
+      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=? AND generation=? AND enabled=1 AND cursor_block=?").bind(to,rule.spender,rule.generation,rule.cursor_block).run();
     }catch(e){console.error("Spender polling failed",rule.spender,String(e));}
   }
 }
@@ -94,7 +98,9 @@ async function processApproval(env,rule,log){
   const owner=fromTopic(log.topics?.[1]);if(!owner)return;
   const ok=await receiptSuccess(env,log.transactionHash);if(ok!==true)return;
   const amount=await allowance(env,owner,rule.spender);
-  await recordSpenderLiveApproval(env,rule.spender,log,amount);
+  const current=await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1").bind(rule.spender,rule.generation).first();
+  if(!current)return; // Rule was removed or replaced during chain RPC.
+  await recordSpenderLiveApproval(env,rule.spender,log,amount,rule.generation);
   // Keep an archival event, but do not restore monitoring for a manually removed wallet.
   const manuallyExcluded=await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
   const walletRecord=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
@@ -103,22 +109,31 @@ async function processApproval(env,rule,log){
   const before=BigInt(previous?.amount_raw||"0");
   const evId="approval:"+log.transactionHash+":"+log.logIndex;
   const type=amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"unchanged";
-  await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)")
-   .bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type).run();
-  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP")
-   .bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber))).run();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) "+
+    "SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1)"
+  ).bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type,rule.spender,rule.generation).run();
+  await env.DB.prepare(
+    "INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) "+
+    "SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1) "+
+    "ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP"
+  ).bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber)),rule.spender,rule.generation).run();
+  if(!await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1").bind(rule.spender,rule.generation).first())return;
   const registered=await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
   if(amount>0n && (!registered || !previous)){
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
-    const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
+    const {results:routes}=await env.DB.prepare("SELECT r.chat_id FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND s.generation=? AND s.enabled=1").bind(rule.spender,rule.generation).all();
     for(const route of routes||[]){
       const chat=String(route.chat_id);
       const exists=await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first();
       if(!exists)continue;
       const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
+      await sourceInsert(env.DB,chat,owner,"spender",rule.spender).run();
     }
-    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
+    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)),async()=>
+      !!await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1")
+        .bind(rule.spender,rule.generation).first());
     if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"new_approval",
@@ -126,7 +141,7 @@ async function processApproval(env,rule,log){
     });
     await increment(env,"discovered_wallets");
   } else if(type!=="unchanged" && previous) {
-    const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
+    const {results:routes}=await env.DB.prepare("SELECT r.chat_id FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND s.generation=? AND s.enabled=1").bind(rule.spender,rule.generation).all();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"approval_change",
       payload:{owner,spender:rule.spender,spender_remark:rule.remark,amount:formatUnits(amount,6)+" USDT",event_type:type,tx_hash:log.transactionHash}

@@ -8,7 +8,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "db": "wrangler d1 migrations apply ethereum_usdt_monitor --remote",
-    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "bundle:verify": "esbuild src/index.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=build/worker.mjs && node scripts/verify-worker-bundle.mjs build/worker.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

@@ -4,16 +4,19 @@ import {handleTelegram} from "./telegram";
 import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history";
 import {enrollHistoricalOwners} from "./spender-enroll";
+import {maybeReconcileAlchemy} from "./alchemy-reconcile";
+import {retryPendingWatchRemovals,selectStandalonePendingWatches} from "./watch-maintenance";
 import {processActivity} from "./transfers";
-import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
+import {scanWalletGaps,reconcileRecentReorgs,backfillMissingTransferBlockHashes} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
 import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 import {finishAddressQueryCleanup,flushMessageCleanup} from "./cleanup";
+import {receiveDeadLetters} from "./queue-dead-letters";
 async function cron(env){
   await recoverStuck(env);
-  const {results:pending}=await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
+  const pending=await selectStandalonePendingWatches(env.DB,8);
   for(const p of pending||[]){
     if(await ensureWatch(env,p.address))await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
   }
@@ -21,8 +24,10 @@ async function cron(env){
   try{for(let i=0;i<4;i++){if(!await scanSpenderHistories(env))break;}}catch(e){console.error("Spender history scan",String(e))}
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
   try{await enrollHistoricalOwners(env,20);}catch(e){console.error("Historical monitoring enrollment",String(e))}
+  try{await retryPendingWatchRemovals(env,{limit:2});}catch(e){console.warn("Alchemy pending removal cleanup",String(e))}
   try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
+  try{await backfillMissingTransferBlockHashes(env,3);}catch(e){console.warn("Transfer block-hash repair deferred",String(e))}
   await flushOutbox(env,40);
   await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
 }
@@ -70,12 +75,20 @@ export default {
     }
   },
   async queue(batch,env,ctx){
+    // Cloudflare's DLQ retains unconsumed messages for only a limited time.
+    // Archive them to D1, ACK only after DB commit, and never replay here.
+    if(String(batch.queue||"").endsWith("-dlq")){
+      await receiveDeadLetters(env,batch);
+      return;
+    }
     for(const message of batch.messages){
       const item=message.body;
+      // Also used in the exhausted-retry error path below.
+      let configured=env;
       try{
         const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
         if(!active){message.retry({delaySeconds:120});continue;}
-        const configured=await configEnv(env);
+        configured=await configEnv(env);
         if(item.kind==="check"){
           await checkOwner(configured,item.owner,item.chat_id,item.user_id,item.display_name);
           // A final query result was delivered; temporary user input and progress are no longer needed.
@@ -94,7 +107,14 @@ export default {
             try{await finishAddressQueryCleanup(configured,item);}
             catch(cleanErr){console.warn("Failed query cleanup deferred",String(cleanErr));}
           }
-          message.ack();
+          // Never ACK a failed chain activity/verification. The dedicated
+          // Cloudflare Queue consumer has max_retries and a dead_letter_queue:
+          // requesting one last retry on the exhausted attempt delegates to
+          // Cloudflare's DLQ instead of silently discarding the original job.
+          // Replaying requires an explicit operator decision and is not done
+          // automatically, particularly for Telegram check replies.
+          console.error("Queue retries exhausted; sending to configured dead-letter queue",item.kind);
+          message.retry({delaySeconds:120});
         }else message.retry({delaySeconds:Math.min(120,10*Math.pow(2,message.attempts||1))});
       }
     }
@@ -105,6 +125,11 @@ export default {
       try{await collectUsage(configured);await runUsageAlerts(configured);await flushOutbox(configured,10,true);}
       catch(e){console.error("Usage maintenance failed",String(e));}
     })());
+    // A separate, rate-limited maintenance branch checks the provider's true
+    // address set daily. It is read-only and must not delay the normal scan,
+    // incoming activity or Telegram notification pipeline.
+    ctx.waitUntil((async()=>{try{await maybeReconcileAlchemy(configured);}
+      catch(e){console.warn("Read-only Alchemy reconciliation maintenance",String(e));}})());
     // Always expire abandoned remark prompts, even when finance monitoring is paused.
     ctx.waitUntil((async()=>{try{await flushMessageCleanup(configured,60);}
       catch(e){console.warn("Telegram message cleanup maintenance",String(e));}})());

@@ -34,7 +34,7 @@ export async function saveUsageSettings(env:Env,d:Settings){
     throw Error("请选择实际 Cloudflare 套餐和账期起始日");
   await env.DB.prepare("INSERT INTO runtime_state(key,value) VALUES('usage_settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(JSON.stringify(d)).run();
 }
-async function storeSample(env:Env,s:Sample){
+function sampleStatements(env:Env,s:Sample){
   const complete=JSON.parse(s.extra_json||"{}").complete!==false;
   const statements=[
     env.DB.prepare("INSERT INTO usage_samples(metric,used,quota,unit,period_start,period_end,observed_at,source,scope,extra_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET used=excluded.used,quota=excluded.quota,unit=excluded.unit,period_start=excluded.period_start,period_end=excluded.period_end,observed_at=excluded.observed_at,source=excluded.source,scope=excluded.scope,extra_json=excluded.extra_json")
@@ -43,7 +43,10 @@ async function storeSample(env:Env,s:Sample){
   // Backfilled history is not new consumption and must never become a forecast baseline.
   if(complete)statements.push(env.DB.prepare("INSERT OR IGNORE INTO usage_observations(metric,observed_at,used,period_start,source) VALUES(?,?,?,?,?)")
     .bind(s.metric,s.observed_at,s.used,s.period_start,s.source));
-  await env.DB.batch(statements);
+  return statements;
+}
+async function storeSample(env:Env,s:Sample){
+  await env.DB.batch(sampleStatements(env,s));
 }
 async function collector(env:Env,provider:string,work:()=>Promise<void>){
   const attempted=ISO();
@@ -102,30 +105,35 @@ async function collectCloudflare(env:Env,settings:Settings){
     {workers_requests:100000,workers_cpu_ms:null,d1_reads:5000000,d1_writes:100000,d1_storage_bytes:5e9,queue_ops:10000}:
     {workers_requests:10000000,workers_cpu_ms:30000000,d1_reads:25000000000,d1_writes:50000000,d1_storage_bytes:5e9,queue_ops:1000000};
   const limits=(await env.DB.prepare("SELECT * FROM usage_limits").all<Limit>()).results;
+  const writes:ReturnType<typeof sampleStatements>=[];
   for(const meter of USAGE_METERS.filter(x=>x.provider==="cloudflare")){
     const key=meter.metric as keyof DayTotals,storage=key==="d1_storage_bytes";
     const used=storage||free?last[key]:required.reduce((sum,day)=>sum+(totals.get(day)?.[key]||0),0);
     const limit=limits.find(x=>x.metric===key&&x.period===(free?"daily":"monthly"));
-    await storeSample(env,{metric:key,used,quota:known&&complete?(limit?.quota??presets[key]):null,unit:meter.unit,
+    writes.push(...sampleStatements(env,{metric:key,used,quota:known&&complete?(limit?.quota??presets[key]):null,unit:meter.unit,
       period_start:storage?monthPeriod(now).start:period.start,period_end:storage?"9999-12-31T00:00:00.000Z":period.end,observed_at:ISO(),source:"official_api",scope:"Cloudflare 整个账号（含其他项目）",
       extra_json:JSON.stringify({plan:settings.cloudflare_plan,complete,missing_days:required.filter(d=>!totals.has(d)),
-        note:!known?"请确认实际套餐后计算额度":!complete?"正在回填账期历史用量":storage?"当天最高存储合计，可能略高于当前值":"平台聚合数据可能有延迟"})});
+        note:!known?"请确认实际套餐后计算额度":!complete?"正在回填账期历史用量":storage?"当天最高存储合计，可能略高于当前值":"平台聚合数据可能有延迟"})}));
   }
+  // Publish all Cloudflare meters together; never expose a partial account snapshot.
+  await env.DB.batch(writes);
 }
 async function collectInternal(env:Env){
   const now=new Date(),daily=dayPeriod(now),monthly=monthPeriod(now);
   const rows=(await env.DB.prepare("SELECT metric,day,value FROM counters WHERE day>=?").bind(monthly.start.slice(0,10)).all<{metric:string;day:string;value:number}>()).results;
   const limits=(await env.DB.prepare("SELECT * FROM usage_limits").all<Limit>()).results;
   const started=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_started_at'").first<{value:string}>())?.value;
+  const writes:ReturnType<typeof sampleStatements>=[];
   for(const meter of USAGE_METERS.filter(x=>x.provider==="internal")){
     const limit=limits.find(x=>x.metric===meter.metric),period=limit?.period==="monthly"?monthly:daily;
-    await storeSample(env,{metric:meter.metric,used:rows.filter(x=>x.metric===meter.metric&&x.day>=period.start.slice(0,10)).reduce((n,x)=>n+x.value,0),
+    writes.push(...sampleStatements(env,{metric:meter.metric,used:rows.filter(x=>x.metric===meter.metric&&x.day>=period.start.slice(0,10)).reduce((n,x)=>n+x.value,0),
       quota:limit?.quota||null,unit:meter.unit,
       period_start:period.start,period_end:period.end,observed_at:ISO(),source:"application_counter",
       scope:"仅本程序，自 "+(started||"本次更新")+" 起统计",
       extra_json:JSON.stringify({rate_limited:rows.find(x=>x.metric==="telegram_rate_limited"&&x.day===daily.start.slice(0,10))?.value||0,
-        note:meter.metric==="telegram_notifications"?"普通消息无固定月额度；显示成功发送量和限流次数":"按发起请求计数，包含失败尝试；不含其他程序使用此 Key 的请求"})});
+        note:meter.metric==="telegram_notifications"?"普通消息无固定月额度；显示成功发送量和限流次数":"按发起请求计数，包含失败尝试；不含其他程序使用此 Key 的请求"})}));
   }
+  await env.DB.batch(writes);
 }
 async function collectGithub(env:Env){
   const cached=await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_checked_at'").first<{value:string}>();
@@ -161,24 +169,44 @@ export async function collectUsage(env:Env,force=false){
   }finally{await env.DB.prepare("DELETE FROM runtime_state WHERE key='usage_collect_lock' AND value=?").bind(lockId).run();}
 }
 export async function usageSnapshot(env:Env):Promise<MeterView[]>{
-  const samples=(await env.DB.prepare("SELECT * FROM usage_samples").all<Sample>()).results;
-  const collectors=(await env.DB.prepare("SELECT * FROM usage_collectors").all<{provider:string;last_error:string|null}>()).results;
+  // Fetch current samples, collector health and GitHub visibility in one D1
+  // roundtrip. A second D1.batch gathers all historical baselines together
+  // (instead of one separate .first() call per meter). Preserve the exact
+  // original 15-minute to 24-hour historical comparison window.
+  const [sampleResult,collectorResult,repoResult]=await env.DB.batch([
+    env.DB.prepare("SELECT * FROM usage_samples"),
+    env.DB.prepare("SELECT * FROM usage_collectors"),
+    env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_visibility'")
+  ]);
+  const samples=(sampleResult.results||[]) as Sample[];
+  const collectors=(collectorResult.results||[]) as {provider:string;last_error:string|null}[];
+  const repo=(repoResult.results?.[0] as {value?:string}|undefined)?.value;
+  const sampleByMetric=new Map(samples.map(s=>[s.metric,s]));
+  const healthByProvider=new Map(collectors.map(c=>[c.provider,c]));
+
+  const historical=samples.length?await env.DB.batch(samples.map(sample=>
+    env.DB.prepare("SELECT * FROM usage_observations WHERE metric=? AND period_start=? AND source=? AND observed_at<=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1")
+      .bind(sample.metric,sample.period_start,sample.source,
+        new Date(Date.parse(sample.observed_at)-15*60000).toISOString(),
+        new Date(Date.parse(sample.observed_at)-86400000).toISOString())
+  )):[];
+  const previousByMetric=new Map<string,UsagePoint|null>(
+    samples.map((sample,i)=>[sample.metric,(historical[i]?.results?.[0] as UsagePoint|undefined)||null])
+  );
   const rows:MeterView[]=[];
   for(const meter of USAGE_METERS){
-    const sample=samples.find(x=>x.metric===meter.metric),health=collectors.find(x=>x.provider===meter.provider);
+    const sample=sampleByMetric.get(meter.metric),health=healthByProvider.get(meter.provider);
     if(!sample){rows.push({...meter,used:null,quota:null,percentage:null,status:"waiting",source:"not_connected",
       note:health?.last_error||"等待首次采集",threshold_alert:false,forecast_alert:false});continue;}
-    const previous=await env.DB.prepare("SELECT * FROM usage_observations WHERE metric=? AND period_start=? AND source=? AND observed_at<=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1")
-      .bind(meter.metric,sample.period_start,sample.source,new Date(Date.parse(sample.observed_at)-15*60000).toISOString(),new Date(Date.parse(sample.observed_at)-86400000).toISOString()).first<UsagePoint>();
-    const assessment=assessUsage(sample,previous,new Date()),extra=JSON.parse(sample.extra_json||"{}");
+    const assessment=assessUsage(sample,previousByMetric.get(meter.metric)||null,new Date());
+    const extra=JSON.parse(sample.extra_json||"{}");
     const valid=assessment.fresh&&!health?.last_error&&extra.complete!==false;
     rows.push({...meter,...sample,...assessment,extra,note:health?.last_error||extra.note||"",
       status:health?.last_error?"error":!assessment.fresh?"stale":extra.complete===false?"backfilling":"ok",
       threshold_alert:valid&&assessment.threshold_alert,forecast_alert:valid&&assessment.forecast_alert,
       accurate_official_usage:sample.source==="official_api"});
   }
-  const repo=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_visibility'").first<{value:string}>())?.value;
-  const githubError=collectors.find(x=>x.provider==="github")?.last_error;
+  const githubError=healthByProvider.get("github")?.last_error;
   rows.push({name:"GitHub",metric:"github_actions",detail:"代码仓库 / 标准 Actions",unit:"分钟",provider:"github",
     source:repo?"official_repository":"not_connected",status:githubError?"error":repo==="public"?"not_applicable":"waiting",
     used:null,quota:null,percentage:null,threshold_alert:false,forecast_alert:false,

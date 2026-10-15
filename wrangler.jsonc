@@ -3,15 +3,43 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
-  "observability": { "enabled": true },
+  "observability": {
+    "enabled": true
+  },
   "d1_databases": [
-    { "binding": "DB", "database_name": "ethereum_usdt_monitor", "database_id": "a207e930-774e-4a3e-9071-ab7ea1a6fc36", "migrations_dir": "migrations" }
+    {
+      "binding": "DB",
+      "database_name": "ethereum_usdt_monitor",
+      "database_id": "a207e930-774e-4a3e-9071-ab7ea1a6fc36",
+      "migrations_dir": "migrations"
+    }
   ],
   "queues": {
-    "producers": [{ "binding": "TASKS", "queue": "ethereum-usdt-monitor-tasks" }],
-    "consumers": [{ "queue": "ethereum-usdt-monitor-tasks", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "ethereum-usdt-monitor-dlq" }]
+    "producers": [
+      {
+        "binding": "TASKS",
+        "queue": "ethereum-usdt-monitor-tasks"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "ethereum-usdt-monitor-tasks",
+        "max_batch_size": 10,
+        "max_retries": 5,
+        "dead_letter_queue": "ethereum-usdt-monitor-dlq"
+      },
+      {
+        "queue": "ethereum-usdt-monitor-dlq",
+        "max_batch_size": 10,
+        "max_retries": 10
+      }
+    ]
   },
-  "triggers": { "crons": ["*/2 * * * *"] },
+  "triggers": {
+    "crons": [
+      "*/2 * * * *"
+    ]
+  },
   "vars": {
     "NETWORK": "ETH_MAINNET",
     "CF_ACCOUNT_ID": "415c5fcdf1106b794d36f6dd0853e326",

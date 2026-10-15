@@ -1,0 +1,48 @@
+{
+  "name": "ethereum-usdt-monitor-staging",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ethereum_usdt_monitor_staging",
+      "database_id": "REPLACE_WITH_SEPARATE_STAGING_D1_UUID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "TASKS",
+        "queue": "ethereum-usdt-monitor-staging-tasks"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "ethereum-usdt-monitor-staging-tasks",
+        "max_batch_size": 10,
+        "max_retries": 5,
+        "dead_letter_queue": "ethereum-usdt-monitor-staging-dlq"
+      },
+      {
+        "queue": "ethereum-usdt-monitor-staging-dlq",
+        "max_batch_size": 10,
+        "max_retries": 10
+      }
+    ]
+  },
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "NETWORK": "ETH_MAINNET",
+    "PUBLIC_BASE_URL": "https://REPLACE_WITH_SEPARATE_STAGING_WORKER_HOST",
+    "EMAIL_ALERTS": "false",
+    "USAGE_ALERT_PERCENT": "80",
+    "USAGE_FORECAST_DAYS": "7"
+  }
+}

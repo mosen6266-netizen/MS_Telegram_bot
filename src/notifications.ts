@@ -236,8 +236,11 @@ export async function renderTemplate(env,key,chatId,data={},safeHtml={}){
 export async function flushOutbox(env,max=30,onlyUsage=false){
   const {results:rows}=await env.DB.prepare("SELECT * FROM outbox WHERE state='pending' AND due_at<=CURRENT_TIMESTAMP "+(onlyUsage?"AND template_key='usage_alert' ":"")+"ORDER BY id ASC LIMIT ?").bind(max).all();
   for(const row of rows||[]){
-    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='pending'").bind(row.id).run();
+    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,sending_started_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending' AND due_at<=CURRENT_TIMESTAMP").bind(row.id).run();
     if(!locked.meta?.changes)continue;
+    // Once a network request starts, a transport timeout or a DB commit error
+    // cannot prove whether Telegram accepted the message. Fail closed.
+    let deliveryStarted=false;
     try {
       const payload=JSON.parse(row.payload_json||"{}");
       // A changed Spender destination must not receive delayed approval notices
@@ -246,39 +249,60 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
         const linked=await env.DB.prepare("SELECT r.chat_id,s.remark FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND r.chat_id=?")
           .bind(String(payload.spender).toLowerCase(),String(row.chat_id)).first();
         if(!linked){
-          await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Spender 通知群已更换' WHERE id=?").bind(row.id).run();
+          await env.DB.prepare("UPDATE outbox SET state='skipped',sending_started_at=NULL,last_error='Spender 通知群已更换' WHERE id=?").bind(row.id).run();
           continue;
         }
         payload.spender_remark=linked.remark;
       }
       if(row.template_key==="usage_alert"&&payload.expires_at&&Date.parse(payload.expires_at)<=Date.now()){
-        await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Usage period has reset' WHERE id=?").bind(row.id).run();
+        await env.DB.prepare("UPDATE outbox SET state='skipped',sending_started_at=NULL,last_error='Usage period has reset' WHERE id=?").bind(row.id).run();
         continue;
       }
       let remark="—";
       if(row.address){
         const sub=await env.DB.prepare("SELECT remark,status FROM subscriptions WHERE address=? AND chat_id=?").bind(row.address,row.chat_id).first();
         if(!sub || sub.status!=="active"){
-          await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Subscription no longer active' WHERE id=?").bind(row.id).run();
+          await env.DB.prepare("UPDATE outbox SET state='skipped',sending_started_at=NULL,last_error='Subscription no longer active' WHERE id=?").bind(row.id).run();
           continue;
         }
         remark=sub.remark;
       }
       const content=await renderTemplate(env,row.template_key,row.chat_id,{...payload,remark,address:row.address});
+      deliveryStarted=true;
       const result=await send(env,row.chat_id,content.slice(0,3800),row.address?buttons(row.address):undefined);
-      await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,last_error=NULL WHERE id=?").bind(now(),result.message_id,row.id).run();
+      await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,sending_started_at=NULL,last_error=NULL WHERE id=?").bind(now(),result.message_id,row.id).run();
     }catch(e){
       const message=String(e).slice(0,250);
-      if(row.attempts>=5&&row.template_key!=="usage_alert"){
-        await env.DB.prepare("UPDATE outbox SET state='failed',last_error=? WHERE id=?").bind(message,row.id).run();
-        await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
+      if(deliveryStarted&&!e?.telegramRejected){
+        // The remote message may have been delivered despite a lost response
+        // or an unsuccessful D1 commit. Never blindly send it again.
+        await env.DB.prepare("UPDATE outbox SET state='delivery_unknown',sending_started_at=NULL,last_error=? WHERE id=? AND state='sending'")
+          .bind("Telegram 投递结果无法确认："+message,row.id).run();
+        console.warn("Telegram delivery is ambiguous; requires manual reconciliation",row.id);
+        continue;
+      }
+      if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
+        await env.DB.prepare("UPDATE outbox SET state='failed',sending_started_at=NULL,last_error=? WHERE id=?").bind(message,row.id).run();
+        try{
+          await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
+        }catch(noticeError){
+          // Failure to reach the admin must not abandon the rest of the outbox.
+          console.warn("Telegram final-failure admin alert unavailable",row.id,String(noticeError));
+        }
       }else{
         const seconds=Math.max(Number(e?.retryAfter)||0,Math.min(3600,30*Math.pow(2,Math.min(row.attempts,7))));
-        await env.DB.prepare("UPDATE outbox SET state='pending',last_error=?,due_at=datetime('now',?) WHERE id=?").bind(message,"+"+seconds+" seconds",row.id).run();
+        await env.DB.prepare("UPDATE outbox SET state='pending',sending_started_at=NULL,last_error=?,due_at=datetime('now',?) WHERE id=?").bind(message,"+"+seconds+" seconds",row.id).run();
       }
     }
   }
 }
 export async function recoverStuck(env){
-  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND created_at<datetime('now','-10 minutes')").run();
+  // An abandoned 'sending' lease may have been interrupted after Telegram
+  // accepted the message, before we persisted its message ID. Its outcome is
+  // unknowable without manual verification. Automatic requeue risks duplicates.
+  await env.DB.prepare(
+    "UPDATE outbox SET state='delivery_unknown',sending_started_at=NULL,"+
+    "last_error='发送任务中断：Telegram 是否已收到消息无法确认，请人工检查后处理' "+
+    "WHERE state='sending' AND sending_started_at<datetime('now','-10 minutes')"
+  ).run();
 }

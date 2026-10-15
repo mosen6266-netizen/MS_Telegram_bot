@@ -1,6 +1,7 @@
-name: Deployment Smoke Test
+name: Production Liveness Check (not staging validation)
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read

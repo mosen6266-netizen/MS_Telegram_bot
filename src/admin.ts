@@ -3,12 +3,18 @@ import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
+import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources,listLegacySubscriptions} from "./subscription-sources";
+import {requeueFailedOutbox,listOutboxPage,acknowledgeUnknownOutbox} from "./outbox-operations";
+import {listDeadLetters,reviewDeadLetter} from "./queue-dead-letters";
+import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
 import {defaults,templateCatalog} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
+import {listWalletsPage,listSubscriptionsPage,listAuditPage,listTransfersPage} from "./admin-listing";
 import {isAdmin,configEnv} from "./setup";
 import {removeWatch} from "./core";
+import {withAlchemyMutationLease,AlchemyMutationBusy} from "./alchemy-mutation-lease";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
@@ -16,13 +22,18 @@ export async function handleAdmin(req,env,path){
   if(!await isAdmin(req,env))return bad("管理员验证失败或请求来源无效",401);
   const method=req.method;
   if(method==="GET"&&path==="/api/summary"){
-    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')","SELECT count(*) n FROM telegram_message_cleanup WHERE state='blocked'","SELECT count(*) n FROM telegram_message_cleanup WHERE state='pending'"];
+    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')","SELECT count(*) n FROM telegram_message_cleanup WHERE state='blocked'","SELECT count(*) n FROM telegram_message_cleanup WHERE state='pending'","SELECT count(*) n FROM outbox WHERE state='delivery_unknown'"];
     // One D1 roundtrip instead of seven consecutive count queries.
     const results=await env.DB.batch(qs.map(q=>env.DB.prepare(q)));
     const v=results.map(result=>result.results?.[0]?.n||0);
-    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6]});
+    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6],delivery_unknown:v[7]});
   }
   if(method==="GET"&&path==="/api/chats")return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
+  if(method==="GET"&&path==="/api/monitoring/reconciliation"){
+    // Admin authentication is verified above. This endpoint never contacts
+    // Alchemy or exposes the notify token; it serves the last safe snapshot.
+    return json(await lastAlchemyReconciliation(env.DB));
+  }
   if(method==="GET"&&path==="/api/monitoring"){
     const q=new URL(req.url).searchParams;
     const page=Math.min(100000,Math.max(0,parseInt(q.get("page")||"0",10)||0));
@@ -58,7 +69,10 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","global_wallet_remark",address,{previous,remark});
     return json({ok:true,remark,note:"此地址备注已同步所有群组、后台列表与后续消息"});
   }
-  if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/wallets"){
+    const q=new URL(req.url).searchParams;
+    return json(await listWalletsPage(env.DB,{page:q.get("page"),search:q.get("search")}));
+  }
   if(method==="POST"&&path==="/api/wallets"){
     const d=await body(req),a=addr(d.address);if(!a)return bad("无效的 Ethereum 地址");
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
@@ -67,6 +81,7 @@ export async function handleAdmin(req,env,path){
       if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("机器人必须先加入这个 Telegram 群组");
       const remark=await walletRemark(env,a,String(d.remark||"待核验 · "+short(a)).trim().slice(0,80));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,a,remark).run();
+      await sourceInsert(env.DB,chat,a,"admin","admin").run();
       await env.TASKS.send({kind:"verify_admin",owner:a,chat_id:chat});
     }
     await audit(env,"admin","create_wallet",a);
@@ -144,22 +159,35 @@ export async function handleAdmin(req,env,path){
   if(method==="DELETE"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);
     if(!a)return bad("Spender 地址无效");
-    const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
-    if(!rule)return bad("该 Spender 已不存在",404);
-    const histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
-    // Remove dependent rows before deleting the parent; spender_routes
-    // references spender_rules via a foreign key. Preserve wallet watches,
-    // subscriptions and transaction/audit archives to avoid accidental loss
-    // of unrelated monitoring. Re-adding starts a clean history scan.
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
-    ]);
-    await audit(env,"admin","delete_spender",a,{remark:rule.remark,history_wallets_deleted_from_rule:histories,monitored_wallets_retained:true});
+    let histories=0;
+    try{
+      await withAlchemyMutationLease(env,async()=>{
+        // All Alchemy address changes use the same lease. If an enrollment is
+        // still in flight, fail safely instead of deleting underneath it.
+        const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
+        if(!rule){const err=Error("Spender not found");err.code="SPENDER_NOT_FOUND";throw err;}
+        histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
+        // Remove dependent rows before deleting the parent; spender_routes
+        // references spender_rules via a foreign key. Preserve wallet watches,
+        // subscriptions and transaction/audit archives to avoid accidental loss
+        // of unrelated monitoring. Re-adding starts a clean history scan.
+        await env.DB.batch([
+          ...retainDeletedSpenderSources(env.DB,a),
+          env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
+        ]);
+        await audit(env,"admin","delete_spender",a,{remark:rule.remark,history_wallets_deleted_from_rule:histories,monitored_wallets_retained:true});
+    
+      });
+    }catch(e){
+      if(e instanceof AlchemyMutationBusy)return bad("Alchemy 正在更新监控地址，请稍后再删除 Spender",409);
+      if(e.code==="SPENDER_NOT_FOUND")return bad("该 Spender 已不存在",404);
+      throw e;
+    }
     return json({ok:true,removed_spender:a,history_records_removed:histories,monitored_wallets_retained:true,
       note:"Spender 规则已删除，历史扫描与这条规则的群组推送已停止；已接入的独立钱包监控和既有消息记录保留。"});
   }
@@ -206,28 +234,30 @@ export async function handleAdmin(req,env,path){
           "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
           "WHERE h.spender=? AND x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL)"
         ).bind(chat,a));
+        changes.push(assignSpenderSourcesForRoute(env.DB,a,chat));
       }
       // Removed routes must stop receiving this Spender's future approval
       // notifications. Only remove auto-created wallet subscriptions that do
       // not belong to another Spender, manual query or admin-added wallet.
-      for(const chat of removed)changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a,chat));
       for(const chat of removed){
-        changes.push(env.DB.prepare(
-          "UPDATE subscriptions SET status='removed',updated_at=CURRENT_TIMESTAMP "+
-          "WHERE chat_id=? AND status IN ('active','pending') "+
-          "AND address IN (SELECT owner FROM spender_history_addresses WHERE spender=?) "+
-          "AND NOT EXISTS(SELECT 1 FROM wallets w WHERE w.address=subscriptions.address "+
-            "AND (w.first_user_id IS NOT NULL OR w.discovery_source IN ('manual','admin'))) "+
-          "AND NOT EXISTS(SELECT 1 FROM spender_history_addresses h2 JOIN spender_routes r2 ON r2.spender=h2.spender "+
-            "WHERE h2.owner=subscriptions.address AND r2.chat_id=? AND h2.spender<>?)"
-        ).bind(chat,a,chat,a));
+        changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a,chat));
+        changes.push(...removeSpenderRouteSourceStatements(env.DB,a,chat));
       }
     }
     if(changes.length)await env.DB.batch(changes);
     await audit(env,"admin","update_spender",a,{remark_changed:remark!==undefined,old_groups:oldGroups,new_groups:chats||undefined,removed,added});
     return json({ok:true,remark:remark??rule.remark,groups:chats||oldGroups,added,removed,note:"Spender 备注和通知群规则已保存；旧群的手动订阅与其他 Spender 订阅保持不变。"});
   }
-  if(method==="GET"&&path==="/api/subscriptions")return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/subscriptions/legacy"){
+    const q=new URL(req.url).searchParams;
+    return json(await listLegacySubscriptions(env.DB,{page:q.get("page")||0,search:q.get("search")||""}));
+  }
+  if(method==="GET"&&path==="/api/subscriptions"){
+    const q=new URL(req.url).searchParams;
+    const result=await listSubscriptionsPage(env.DB,{page:q.get("page"),search:q.get("search"),status:q.get("status")||"all"});
+    if(result.error)return bad("订阅状态筛选无效",400);
+    return json(result);
+  }
   if(method==="PATCH"&&path==="/api/subscriptions"){
     const d=await body(req),a=addr(d.address),chat=String(d.chat_id||"");if(!a||!/^-?\d+$/.test(chat))return bad("无效订阅地址或群组");
     const old=await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a,chat).first();if(!old)return bad("订阅不存在",404);
@@ -279,9 +309,59 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","update_template",key,{chat});
     return json({ok:true});
   }
-  if(method==="GET"&&path==="/api/transfers")return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
-  if(method==="GET"&&path==="/api/outbox")return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
-  if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/transfers"){
+    const q=new URL(req.url).searchParams;
+    const result=await listTransfersPage(env.DB,{page:q.get("page"),search:q.get("search"),asset:q.get("asset")||"all"});
+    if(result.error)return bad("交易资产筛选无效",400);
+    return json(result);
+  }
+  if(method==="POST"&&path==="/api/outbox/retry"){
+    const d=await body(req);
+    const result=await requeueFailedOutbox(env.DB,Number(d.id));
+    if(result.error){
+      const messages={invalid_id:"无效通知任务编号",not_found:"通知任务不存在",not_retryable:"只有发送失败或投递结果待确认的任务才能手动重试",conflict:"任务状态已改变，请刷新后重试"};
+      return bad(messages[result.error]||"无法重新排队",result.status);
+    }
+    // A manual requeue is explicitly requested by an administrator. It never
+    // sends synchronously, and the outbox worker still validates subscription.
+    await audit(env,"admin","retry_failed_outbox",String(result.task.id),{chat:result.task.chat_id,template:result.task.template_key});
+    return json({ok:true,queued:true,note:"任务已重新排队。请先确认 Telegram 群内没有收到同一条消息，避免重复发送。"});
+  }
+  if(method==="POST"&&path==="/api/outbox/acknowledge"){
+    const d=await body(req);
+    const result=await acknowledgeUnknownOutbox(env.DB,Number(d.id));
+    if(result.error){
+      const errors={invalid_id:"无效通知任务编号",not_found:"通知任务不存在",
+        not_unknown:"只有投递结果待确认的任务才可标记已核查",conflict:"任务状态已变化，请刷新后重试"};
+      return bad(errors[result.error]||"处理失败",result.status);
+    }
+    await audit(env,"admin","acknowledge_uncertain_outbox",String(result.task.id),
+      {chat:result.task.chat_id,template:result.task.template_key});
+    return json({ok:true,note:"该通知已标记为人工核查完成，不会重新发送，也未被错误标记为已送达。"});
+  }
+  if(method==="GET"&&path==="/api/dead-letters"){
+    const q=new URL(req.url).searchParams;
+    const result=await listDeadLetters(env.DB,{page:q.get("page"),state:q.get("state")||"needs_review"});
+    if(result.error)return bad("死信状态筛选无效",result.status);
+    return json(result);
+  }
+  if(method==="POST"&&path==="/api/dead-letters/review"){
+    const d=await body(req);
+    const result=await reviewDeadLetter(env.DB,Number(d.id));
+    if(result.error)return bad("死信记录不存在或已核查",result.status);
+    await audit(env,"admin","review_dead_letter",String(result.task.id),{kind:result.task.kind});
+    return json({ok:true,note:"死信记录已标记人工核查完成；不会自动重新执行任务。"});
+  }
+  if(method==="GET"&&path==="/api/outbox"){
+    const q=new URL(req.url).searchParams;
+    const result=await listOutboxPage(env.DB,{page:q.get("page"),status:q.get("status")||"all",search:q.get("search")||""});
+    if(result.error)return bad(result.error==="invalid_status"?"通知状态筛选无效":"请输入有效任务编号或 Telegram 群 ID",result.status);
+    return json(result);
+  }
+  if(method==="GET"&&path==="/api/audit"){
+    const q=new URL(req.url).searchParams;
+    return json(await listAuditPage(env.DB,{page:q.get("page"),search:q.get("search")}));
+  }
   if(method==="GET"&&path==="/api/usage"){
     const [settings,platforms]=await Promise.all([usageSettings(env),usageSnapshot(env)]);
     return json({warning_threshold_percent:80,forecast_days:7,telegram_dm:true,email:false,
