@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
+import {recordSpenderLiveApproval} from "./spender-history";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
 export async function ownerSpenders(env,owner){
@@ -87,6 +88,7 @@ async function processApproval(env,rule,log){
   const owner=fromTopic(log.topics?.[1]);if(!owner)return;
   const ok=await receiptSuccess(env,log.transactionHash);if(ok!==true)return;
   const amount=await allowance(env,owner,rule.spender);
+  await recordSpenderLiveApproval(env,rule.spender,log,amount);
   const previous=await env.DB.prepare("SELECT amount_raw FROM allowances WHERE owner=? AND spender=?").bind(owner,rule.spender).first();
   const before=BigInt(previous?.amount_raw||"0");
   const evId="approval:"+log.transactionHash+":"+log.logIndex;
