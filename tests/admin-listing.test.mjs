@@ -27,20 +27,21 @@ test("wallet, subscription and audit pages search older data instead of dropping
    "CREATE TABLE transfer_events(event_id TEXT PRIMARY KEY,address TEXT,asset TEXT,direction TEXT,raw_amount TEXT,block_number INTEGER,tx_hash TEXT)"
   ])await db.prepare(query).run();
   await db.prepare("INSERT INTO telegram_chats(chat_id,title) VALUES('-100123','Test group')").run();
-  // Ensure old rows remain available, not just the most recent 200.
-  const records=[];
-  for(let i=1;i<=230;i++){
-   const a=addr(i);
-   records.push(db.prepare("INSERT INTO wallets(address,first_user_name,discovery_source,created_at) VALUES(?,?,?,datetime('now',?))")
-    .bind(a,i===1?"Oldest person":"User "+i,"manual",String("-"+(240-i)+" minutes")));
-   records.push(db.prepare("INSERT INTO subscriptions(chat_id,address,remark,status,updated_at) VALUES('-100123',?,?,?,datetime('now',?))")
-    .bind(a,i===1?"Rare legacy note":"ordinary note",i%3?"active":"paused",String("-"+(240-i)+" minutes")));
-   records.push(db.prepare("INSERT INTO admin_audit(id,actor,action,target,created_at) VALUES(?,'admin',?,?,CURRENT_TIMESTAMP)")
-    .bind(i,i===1?"rare_old_action":"edit",a));
-   records.push(db.prepare("INSERT INTO transfer_events(event_id,address,asset,direction,raw_amount,block_number,tx_hash) VALUES(?,? ,?,'IN','1',?,?)")
-    .bind("event-"+i,a,i%2?"USDT":"ETH",i,i===1?"0x"+"ee".repeat(32):"0x"+"ab".repeat(32)));
-  }
-  for(let i=0;i<records.length;i+=35)await db.batch(records.slice(i,i+35));
+  // Populate 230 rows per table through SQL recursive inserts, avoiding
+  // hundreds of network round trips from Miniflare's D1 test bridge.
+  const nums="WITH RECURSIVE nums(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM nums WHERE i<230) ";
+  await db.prepare(nums+"INSERT INTO wallets(address,first_user_name,discovery_source,created_at) "+
+    "SELECT printf('0x%040x',i),CASE WHEN i=1 THEN 'Oldest person' ELSE 'User '||i END,'manual',"+
+    "datetime('now',printf('-%d minutes',240-i)) FROM nums").run();
+  await db.prepare(nums+"INSERT INTO subscriptions(chat_id,address,remark,status,updated_at) "+
+    "SELECT '-100123',printf('0x%040x',i),CASE WHEN i=1 THEN 'Rare legacy note' ELSE 'ordinary note' END,"+
+    "CASE WHEN i%3<>0 THEN 'active' ELSE 'paused' END,datetime('now',printf('-%d minutes',240-i)) FROM nums").run();
+  await db.prepare(nums+"INSERT INTO admin_audit(id,actor,action,target,created_at) "+
+    "SELECT i,'admin',CASE WHEN i=1 THEN 'rare_old_action' ELSE 'edit' END,printf('0x%040x',i),CURRENT_TIMESTAMP FROM nums").run();
+  await db.prepare(nums+"INSERT INTO transfer_events(event_id,address,asset,direction,raw_amount,block_number,tx_hash) "+
+    "SELECT 'event-'||i,printf('0x%040x',i),CASE WHEN i%2=1 THEN 'USDT' ELSE 'ETH' END,'IN','1',i,"+
+    "CASE WHEN i=1 THEN ? ELSE ? END FROM nums")
+    .bind("0x"+"ee".repeat(32),"0x"+"ab".repeat(32)).run();
   await db.prepare("INSERT INTO wallet_global_remarks(address,remark) VALUES(?,'Important audit label')").bind(addr(1)).run();
   const w1=await listWalletsPage(db,{page:0});
   assert.equal(w1.total,230);assert.equal(w1.rows.length,50);assert.equal(w1.total_pages,5);
