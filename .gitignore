@@ -7,3 +7,8 @@ dist/
 .wrangler/
 *.log
 coverage/
+
+# Locally provisioned staging bindings (IDs/URLs) and environment secrets
+wrangler.staging.jsonc
+wrangler.staging.local.jsonc
+.dev.vars.staging
