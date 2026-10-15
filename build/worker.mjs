@@ -1867,7 +1867,20 @@ async function handleAdmin(req, env, path) {
     await audit(env, "admin", "global_wallet_remark", address, { previous, remark });
     return json({ ok: true, remark, note: "\u6B64\u5730\u5740\u5907\u6CE8\u5DF2\u540C\u6B65\u6240\u6709\u7FA4\u7EC4\u3001\u540E\u53F0\u5217\u8868\u4E0E\u540E\u7EED\u6D88\u606F" });
   }
-  if (method === "GET" && path === "/api/wallets") return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if (method === "GET" && path === "/api/wallets") {
+    const q = new URL(req.url).searchParams;
+    const select = "SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ";
+    if (q.get("paged") !== "1") return json((await env.DB.prepare(select + "ORDER BY w.created_at DESC LIMIT 200").all()).results);
+    const page = Math.min(1e5, Math.max(0, Number.parseInt(q.get("page") || "0", 10) || 0));
+    const search = String(q.get("search") || "").trim().slice(0, 90);
+    const where = search ? "WHERE w.address LIKE ? OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? " : "";
+    const args = search ? ["%" + search + "%", "%" + search + "%"] : [];
+    const count = env.DB.prepare("SELECT COUNT(*) n FROM wallets w LEFT JOIN wallet_global_remarks g ON g.address=w.address " + where).bind(...args);
+    const rows = env.DB.prepare(select + where + "ORDER BY w.created_at DESC,w.address ASC LIMIT 50 OFFSET ?").bind(...args, page * 50);
+    const [countResult, rowsResult] = await env.DB.batch([count, rows]);
+    const total = countResult.results?.[0]?.n || 0;
+    return json({ rows: rowsResult.results || [], total, page, total_pages: Math.ceil(total / 50) });
+  }
   if (method === "POST" && path === "/api/wallets") {
     const d = await body(req), a = addr(d.address);
     if (!a) return bad("\u65E0\u6548\u7684 Ethereum \u5730\u5740");
