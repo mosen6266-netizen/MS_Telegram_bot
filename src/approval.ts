@@ -180,6 +180,20 @@ export async function pollSpenders(env){
         break;
       }
     }
+    // Etherscan and other providers may index a log after its block has
+    // passed the forward cursor. Revisit recent finalized blocks; event/outbox
+    // IDs deduplicate replays. Keep this separate from forward cursor writes.
+    const completedThrough=Math.min(cursor,preferBackup?Math.max(0,head-12):head);
+    if(completedThrough>=Number(rule.start_block||0)+1&&preferBackup&&cursor>=head-160){
+      const replayFrom=Math.max(Number(rule.start_block||0)+1,completedThrough-127);
+      try{
+        const recent=await etherscanApprovalLogs(env,rule.spender,replayFrom,completedThrough);
+        for(const log of recent)if(!log.removed)await processApproval(env,rule,log);
+      }catch(e){
+        console.error("Spender trailing log recheck failed",rule.spender,String(e));
+        await savePollState(env.DB,rule.spender,{status:"warning",stage:"trailing_recheck",cursor,head,message:String(e.message||e).slice(0,220),at:now()});
+      }
+    }
   }
 }
 async function processApproval(env,rule,log){
@@ -190,7 +204,6 @@ async function processApproval(env,rule,log){
   if(ok===null)throw Error("Transaction receipt is not indexed yet; retry this block");
   if(ok===false)return;
   const amount=await allowance(env,owner,rule.spender);
-  await recordSpenderLiveApproval(env,rule.spender,log,amount);
   // Keep an archival event, but do not restore monitoring for a manually removed wallet.
   const manuallyExcluded=await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
   const walletRecord=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
@@ -202,10 +215,15 @@ async function processApproval(env,rule,log){
   // outbox insert failed. Recomputing against the updated allowances row
   // would silently turn a genuine new approval into "unchanged".
   const eventRecord=await env.DB.prepare("SELECT event_type FROM approval_events WHERE event_id=?").bind(evId).first();
-  const type=eventRecord?.event_type||(amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"unchanged");
+  // A freshly mined Approval log is notification-worthy even when the
+  // spender allowance is identical to the previously observed value.
+  const type=eventRecord?.event_type==="unchanged"?"reconfirmed":
+    eventRecord?.event_type||(amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"reconfirmed");
+  // Replayed logs must not perpetually reset historical enrollment verification.
+  if(!eventRecord)await recordSpenderLiveApproval(env,rule.spender,log,amount);
   await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)")
    .bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type).run();
-  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP")
+  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=MAX(allowances.latest_block,excluded.latest_block),updated_at=CURRENT_TIMESTAMP")
    .bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber))).run();
   const registered=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
   if(amount>0n && (type==="new"||type==="reauthorized")){
