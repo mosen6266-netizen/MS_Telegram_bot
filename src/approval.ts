@@ -53,8 +53,10 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id),owner,first?.first_user_name||display_name).run();
   const watched=await ensureWatch(env,owner);
   if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id),owner).run();
+  const current=await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id),owner).first();
+  const groupRemark=current?.remark||first?.first_user_name||display_name;
   const lines=positives.slice(0,25).map((x,i)=>(i+1)+". <code>"+x.spender+"</code>\n额度："+(BigInt(x.amount)>=(1n<<255n)?"无限":formatUnits(x.amount,6)+" USDT"));
-  await send(env,chat_id,"🛡️ <b>USDT 有效授权</b>\n备注："+esc(first?.first_user_name||display_name)+"\n地址：<code>"+owner+"</code>\n"+
+  await send(env,chat_id,"🛡️ <b>USDT 有效授权</b>\n备注："+esc(groupRemark)+"\n地址：<code>"+owner+"</code>\n"+
    lines.join("\n")+(positives.length>25?"\n另有 "+(positives.length-25)+" 项有效授权，请在后台查看。":"")+
    "\n资金监控："+(watched?"✅ ETH / USDT / USDC 已启动":"⚠️ 等待 Alchemy 订阅同步，尚未正式启动"),buttons(owner));
   await increment(env,"wallet_lookups");
