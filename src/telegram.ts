@@ -2,6 +2,7 @@
 import {addr,esc,send,telegram,buttons,now,trunc,increment} from "./core";
 import {checkOwner} from "./approval";
 import {scheduleMessageDeletion,finishRemarkCleanup} from "./cleanup";
+import {renderTemplate} from "./notifications";
 async function memberAllowed(env,chatId,userId){
   try{
     const m=await telegram(env,"getChatMember",{chat_id:chatId,user_id:Number(userId)});
@@ -18,7 +19,7 @@ export async function handleTelegram(env,upd){
     if(!await memberAllowed(env,chat.id,c.from.id))return;
     const sub=await env.DB.prepare("SELECT 1 FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(String(chat.id),address).first();
     if(!sub)return;
-    const prompt=await send(env,chat.id,"✏️ "+esc(c.from.first_name)+"，请<b>回复这条消息</b>输入新的地址备注：\n<code>"+address+"</code>\n限 1–80 个字符，10 分钟内有效。",{force_reply:true,selective:true});
+    const prompt=await send(env,chat.id,await renderTemplate(env,"remark_prompt",String(chat.id),{user_name:c.from.first_name,address}),{force_reply:true,selective:true});
     await env.DB.prepare("INSERT OR REPLACE INTO remark_sessions(chat_id,user_id,prompt_message_id,address,expires_at) VALUES(?,?,?,?,datetime('now','+10 minutes'))")
       .bind(String(chat.id),String(c.from.id),prompt.message_id,address).run();
     // Remove even abandoned 10-minute input prompts. Never remove the original result.
@@ -37,7 +38,7 @@ export async function handleTelegram(env,upd){
     if(session){
       const remark=trunc(m.text.trim(),80);
       if(!remark || Array.from(m.text.trim()).length>80 || /[\u0000-\u001f\u007f]/.test(remark)){
-        const notice=await send(env,chatId,"⚠️ 备注必须为 1–80 个有效字符，请重新回复。");
+        const notice=await send(env,chatId,await renderTemplate(env,"remark_invalid",chatId));
         await scheduleMessageDeletion(env,chatId,m.message_id,"invalid_remark_input",90);
         await scheduleMessageDeletion(env,chatId,notice.message_id,"temporary_validation_notice",90);
         return;
@@ -45,7 +46,7 @@ export async function handleTelegram(env,upd){
       if(!await memberAllowed(env,m.chat.id,m.from.id))return;
       const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(chatId,session.address).first();
       if(!old){
-        await send(env,chatId,"⚠️ 当前群组已停止监控这个地址。");
+        await send(env,chatId,await renderTemplate(env,"remark_unwatched",chatId));
         await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
         try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark cancellation cleanup",String(e));}
         return;
@@ -53,7 +54,7 @@ export async function handleTelegram(env,upd){
       const result=await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=? AND remark_version=?")
         .bind(remark,now(),chatId,session.address,old.remark_version).run();
       if(!result.meta?.changes){
-        await send(env,chatId,"⚠️ 备注已被其他成员更新，请重新点击修改按钮。");
+        await send(env,chatId,await renderTemplate(env,"remark_conflict",chatId));
         await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
         try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark conflict cleanup",String(e));}
         return;
@@ -61,7 +62,7 @@ export async function handleTelegram(env,upd){
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId,session.address,userId,old.remark,remark).run();
       // Show the permanent result first, then delete BOTH temporary group messages.
       // Do not keep the editor's identity in the visible result.
-      await send(env,chatId,"✅ 地址备注已更新：<b>"+esc(remark)+"</b>\n<code>"+session.address+"</code>",buttons(session.address));
+      await send(env,chatId,await renderTemplate(env,"remark_saved",chatId,{remark,address:session.address}),buttons(session.address));
       await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
       try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}
       catch(e){console.warn("Remark cleanup deferred",String(e));}
@@ -79,7 +80,7 @@ export async function handleTelegram(env,upd){
     }
   }
   if(m.chat.type==="private"){
-    if(/^\/start/.test(m.text))await send(env,chatId,"欢迎使用 Ethereum USDT 授权监控机器人。请将机器人加入群组后发送 Ethereum 地址查询。\n管理员私聊预警需配置本聊天 ID："+chatId);
+    if(/^\/start/.test(m.text))await send(env,chatId,await renderTemplate(env,"start_welcome",chatId,{chat_id:chatId}));
     return;
   }
   const match=m.text.trim().match(/^(?:\/check(?:@\w+)?\s+)?(0x[0-9a-fA-F]{40})$/);
@@ -88,7 +89,7 @@ export async function handleTelegram(env,upd){
   // First *request* wins, not first completed external API lookup.
   await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,first_user_id,first_user_name,discovery_source) VALUES(?,?,?,'manual')").bind(owner,userId,name).run();
   await env.DB.prepare("UPDATE wallets SET first_user_id=?,first_user_name=? WHERE address=? AND first_user_id IS NULL").bind(userId,name,owner).run();
-  const progress=await send(env,chatId,"🔎 已收到地址查询，正在检索历史 USDT 授权并核验当前额度……");
+  const progress=await send(env,chatId,await renderTemplate(env,"query_progress",chatId,{address:owner}));
   // Thirty-minute fail-safe: clean temporary inputs even if the queue stalls permanently.
   await Promise.all([
     scheduleMessageDeletion(env,chatId,m.message_id,"query_address_stale",1800),
