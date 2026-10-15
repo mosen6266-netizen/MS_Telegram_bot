@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {USDT,USDC,addr,esc,receiptSuccess,queueNotice,increment} from "./core";
+import {USDT,USDC,addr,receiptSuccess,increment} from "./core";
 const asNum=x => typeof x==="string" && x.startsWith("0x")?Number(BigInt(x)):Number(x||0);
 function identify(a){
   const category=String(a.category||"").toLowerCase();
@@ -43,15 +43,24 @@ export async function processActivity(env,payload){
       const watch=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=? AND state='active'").bind(o.address).first();
       if(!watch)continue;
       const eventId=baseId+":"+o.address+":"+o.direction;
-      const inserted=await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .bind(eventId,o.address,asset.asset,o.direction,val,from,to,hash,block,a.blockHash||null).run();
-      if(!inserted.meta?.changes)continue;
+      // D1.batch is transactional: commit the event and every recipient notice
+      // together, or roll all of them back on error.
       const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
-      for(const s of subs||[])await queueNotice(env,{
-        dedup:eventId+":"+s.chat_id,chat_id:s.chat_id,address:o.address,template:"transfer",
-        payload:{asset:asset.asset,direction:o.direction,amount:val,from_address:from,to_address:to,tx_hash:hash,block_number:block}
-      });
-      await increment(env,"transfer_events");
+      const statements=[
+        env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
+          .bind(eventId,o.address,asset.asset,o.direction,val,from,to,hash,block,a.blockHash||null)
+      ];
+      for(const sub of subs||[]){
+        const payload={asset:asset.asset,direction:o.direction,amount:val,from_address:from,to_address:to,tx_hash:hash,block_number:block};
+        statements.push(env.DB.prepare("INSERT OR IGNORE INTO outbox(dedup_key,chat_id,address,template_key,payload_json) VALUES(?,?,?,?,?)")
+          .bind(eventId+":"+sub.chat_id,String(sub.chat_id),o.address,"transfer",JSON.stringify(payload)));
+      }
+      const committed=await env.DB.batch(statements);
+      // Retrying also repairs older partial event writes, without duplicating notices.
+      // Noncritical metrics cannot invalidate a successfully committed event.
+      if(committed[0]?.meta?.changes){
+        try{await increment(env,"transfer_events")}catch(error){console.warn("Transfer metric unavailable",String(error))}
+      }
     }
   }
 }
