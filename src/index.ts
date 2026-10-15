@@ -113,6 +113,15 @@ export default {
         }
         else if(item.kind==="activity")await processActivity(configured,item.payload);
         else if(item.kind==="approval_webhook")await processRealtimeApprovalWebhook(configured,item.payload);
+        else if(item.kind==="enroll_owner"){
+          const owner=item.owner;
+          const excluded=await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
+          const wallet=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
+          if(!excluded&&!wallet?.deleted_at){
+            if(await ensureWatch(configured,owner,item.block))
+              await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
+          }
+        }
         else if(item.kind==="verify_admin")await verifyAdminOwner(configured,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
         // The queue should send Telegram notices immediately after ingest,
