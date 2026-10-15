@@ -3,6 +3,7 @@ import {addr,esc,send,telegram,buttons,now,trunc,increment} from "./core";
 import {checkOwner} from "./approval";
 import {scheduleMessageDeletion,finishRemarkCleanup} from "./cleanup";
 import {renderTemplate} from "./notifications";
+import {saveWalletRemark} from "./wallet-remarks";
 async function memberAllowed(env,chatId,userId){
   try{
     const m=await telegram(env,"getChatMember",{chat_id:chatId,user_id:Number(userId)});
@@ -59,6 +60,7 @@ export async function handleTelegram(env,upd){
         try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark conflict cleanup",String(e));}
         return;
       }
+      await saveWalletRemark(env,session.address,remark);
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId,session.address,userId,old.remark,remark).run();
       // Show the permanent result first, then delete BOTH temporary group messages.
       // Do not keep the editor's identity in the visible result.
