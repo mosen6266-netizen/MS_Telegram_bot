@@ -1151,6 +1151,7 @@ async function processApproval(env, rule, log) {
 
 // src/spender-enroll.ts
 async function enrollHistoricalOwners(env, limit = 8) {
+  await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=COALESCE(synced_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE state IN ('retrying','pending','running') AND EXISTS (SELECT 1 FROM wallet_watches w WHERE w.address=spender_history_monitor_enrollments.owner AND w.state='active') AND EXISTS (SELECT 1 FROM subscriptions s JOIN spender_routes r ON r.chat_id=s.chat_id AND r.spender=spender_history_monitor_enrollments.spender WHERE s.address=spender_history_monitor_enrollments.owner AND s.status='active') AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=spender_history_monitor_enrollments.owner)").run();
   const { results: rows } = await env.DB.prepare(
     "SELECT h.spender,h.owner FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 LEFT JOIN wallets w ON w.address=h.owner LEFT JOIN wallet_exclusions x ON x.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now','-90 seconds')) OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) ORDER BY h.first_seen_block ASC LIMIT ?"
   ).bind(Math.max(1, Math.min(20, limit))).all();
@@ -1176,7 +1177,10 @@ async function enrollHistoricalOwners(env, limit = 8) {
       }
       const watch = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
       const synced = watch?.state === "active" || await ensureWatch(env, owner);
-      if (!synced) throw Error("Alchemy \u94B1\u5305\u76D1\u63A7\u8BA2\u9605\u5C1A\u672A\u6210\u529F\uFF0C\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5");
+      if (!synced) {
+        const detail = await env.DB.prepare("SELECT last_error FROM wallet_watches WHERE address=?").bind(owner).first();
+        throw Error("Alchemy \u8BA2\u9605\u5931\u8D25\uFF1A" + String(detail?.last_error || "\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5").slice(0, 180));
+      }
       await env.DB.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner, spender).run();
       await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
     } catch (e) {
