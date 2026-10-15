@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {persistSecret} from './setup';
+import {withAlchemyMutationLease,alchemyMutationFetch,AlchemyMutationBusy} from './alchemy-mutation-lease';
 export const USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7";
 export const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 export const APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
@@ -76,77 +77,83 @@ export async function audit(env,actor,action,target,details={}){
   await env.DB.prepare("INSERT INTO admin_audit(actor,action,target,details_json) VALUES(?,?,?,?)")
     .bind(String(actor),action,String(target),JSON.stringify(details)).run();
 }
-export async function syncWatch(env,address,remove=false) {
-  if(!env.ALCHEMY_NOTIFY_TOKEN) throw Error("Alchemy Notify token is missing");
-  if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID && !remove){
-    // Create a webhook ONLY when a genuine monitored Owner exists.
-    // Hold a short-lived D1 lock to avoid simultaneous duplicate webhook creation.
-    const lock=await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value) VALUES('activity_webhook_lock',?)").bind(now()).run();
-    if(!lock.meta?.changes){
-      const old=await env.DB.prepare("SELECT updated_at FROM runtime_state WHERE key='activity_webhook_lock'").first();
-      if(old&&Date.now()-new Date(old.updated_at+"Z").getTime()>180000){
-        await env.DB.prepare("DELETE FROM runtime_state WHERE key='activity_webhook_lock'").run();
-      }
-      throw Error("Alchemy webhook creation is already running; retry shortly");
-    }
-    try{
-      const r=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
+export async function syncWatch(env,address,remove=false,{leaseHeld=false}={}){
+  const work=async()=>{
+    if(!env.ALCHEMY_NOTIFY_TOKEN)throw Error("Alchemy Notify token is missing");
+    if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID && !remove){
+      // The shared lease serializes webhook creation across all entry points.
+      const response=await alchemyMutationFetch("https://dashboard.alchemy.com/api/create-webhook",{
         method:"POST",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
         body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"ADDRESS_ACTIVITY",
           webhook_url:env.PUBLIC_BASE_URL+"/webhooks/alchemy",name:"Ethereum USDT Owner Monitor",addresses:[address]})
       });
-      const d=await r.json();const created=d.data||d;
-      if(!r.ok || !created.id || !created.signing_key)
-        throw Error("Alchemy webhook creation rejected: "+String(d.message||r.status).slice(0,100));
+      const d=await response.json(),created=d.data||d;
+      if(!response.ok||!created.id||!created.signing_key)
+        throw Error("Alchemy webhook creation rejected: "+String(d.message||response.status).slice(0,100));
       await persistSecret(env,"ALCHEMY_ACTIVITY_WEBHOOK_ID",created.id);
       await persistSecret(env,"ALCHEMY_SIGNING_KEY",created.signing_key);
       env.ALCHEMY_ACTIVITY_WEBHOOK_ID=created.id;
       env.ALCHEMY_SIGNING_KEY=created.signing_key;
-      // The newly created webhook already tracks this first Owner.
       return;
-    } finally{
-      await env.DB.prepare("DELETE FROM runtime_state WHERE key='activity_webhook_lock'").run();
     }
-  }
-  if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID)throw Error("Alchemy activity webhook missing");
-  const r=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
-    method:"PATCH",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
-    body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:remove?[]:[address],addresses_to_remove:remove?[address]:[]})
-  });
-  if(!r.ok)throw Error("Alchemy sync HTTP "+r.status+" "+(await r.text()).slice(0,140));
+    if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID)throw Error("Alchemy activity webhook missing");
+    const response=await alchemyMutationFetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
+      method:"PATCH",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
+      body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,
+        addresses_to_add:remove?[]:[address],addresses_to_remove:remove?[address]:[]})
+    });
+    if(!response.ok)throw Error("Alchemy sync HTTP "+response.status+" "+(await response.text()).slice(0,140));
+  };
+  return leaseHeld?work():withAlchemyMutationLease(env,work);
 }
+
 export async function removeWatch(env,address){
-  const active=await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(address).first();
-  if(active?.n>0)return false;
-  const rule=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
-  if(!rule || rule.state==='removed')return true;
   try{
-    if(env.ALCHEMY_ACTIVITY_WEBHOOK_ID && env.ALCHEMY_NOTIFY_TOKEN)await syncWatch(env,address,true);
-    await env.DB.prepare("UPDATE wallet_watches SET state='removed',last_error=NULL,updated_at=? WHERE address=?").bind(now(),address).run();
-    return true;
+    return await withAlchemyMutationLease(env,async()=>{
+      // Recheck within the same global mutation lease as ensureWatch.
+      const active=await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(address).first();
+      if(active?.n>0)return false;
+      const current=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+      if(!current||current.state==="removed")return true;
+      // Missing credentials must not be misreported as remote removal.
+      if(!env.ALCHEMY_NOTIFY_TOKEN||!env.ALCHEMY_ACTIVITY_WEBHOOK_ID)
+        throw Error("Alchemy removal credentials unavailable");
+      await syncWatch(env,address,true,{leaseHeld:true});
+      await env.DB.prepare("UPDATE wallet_watches SET state='removed',last_error=NULL,updated_at=? WHERE address=? AND state IN ('removal_pending','active','pending')").bind(now(),address).run();
+      return true;
+    });
   }catch(e){
-    await env.DB.prepare("UPDATE wallet_watches SET state='removal_pending',last_error=?,updated_at=? WHERE address=?").bind(String(e).slice(0,300),now(),address).run();
+    // Do not turn healthy monitoring into a removal state just because a
+    // different operation temporarily holds the Alchemy address lease.
+    if(e instanceof AlchemyMutationBusy)return false;
+    await env.DB.prepare("UPDATE wallet_watches SET state='removal_pending',last_error=?,updated_at=? WHERE address=? AND state<>'removed'").bind(String(e).slice(0,300),now(),address).run();
     return false;
   }
 }
-export async function ensureWatch(env,address,fromBlock=undefined){
+
+export async function ensureWatch(env,address,fromBlock=undefined,guard=undefined){
   await env.DB.prepare("INSERT OR IGNORE INTO wallet_watches(address,state) VALUES(?,'pending')").bind(address).run();
-  // Do not issue another Alchemy mutation for a locally active subscription:
-  // concurrent retries must not downgrade healthy wallets after a 429.
-  const existing=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
-  if(existing?.state==="active")return true;
-  try {
-    // Start recovery at first relevant authorization block when available.
+  try{
+    const existing=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+    if(existing?.state==="active")return true;
     const head=fromBlock===undefined?await blockNumber(env):fromBlock;
     await env.DB.prepare("INSERT OR IGNORE INTO wallet_checkpoints(address,last_block) VALUES(?,?)").bind(address,Math.max(0,head-1)).run();
-    await syncWatch(env,address,false);
-    await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=?").bind(now(),now(),address).run();
-    return true;
-  } catch(e) {
-    await env.DB.prepare("UPDATE wallet_watches SET state='pending',last_error=?,updated_at=? WHERE address=? AND state<>'active'").bind(String(e).slice(0,500),now(),address).run();
+    return await withAlchemyMutationLease(env,async()=>{
+      if(guard&&!(await guard()))return false;
+      if(await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(address).first())return false;
+      const fresh=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+      if(fresh?.state==="active")return true;
+      if(fresh?.state==="removed"||fresh?.state==="removal_pending")return false;
+      await syncWatch(env,address,false,{leaseHeld:true});
+      await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=? AND state='pending'").bind(now(),now(),address).run();
+      return true;
+    });
+  }catch(e){
+    await env.DB.prepare("UPDATE wallet_watches SET state='pending',last_error=?,updated_at=? WHERE address=? AND state='pending'").bind(String(e).slice(0,500),now(),address).run();
     return false;
   }
 }
+
 export async function notifyAdmin(env,html) {
   if(!env.ADMIN_TELEGRAM_CHAT_ID)return;
   try {await send(env,env.ADMIN_TELEGRAM_CHAT_ID,html);}catch(e){console.warn("Admin DM failed",String(e))}
