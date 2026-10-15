@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {persistSecret} from './setup';
+import {persistSecret,configEnv} from './setup';
 import {withAlchemyMutationLease,alchemyMutationFetch,AlchemyMutationBusy} from './alchemy-mutation-lease';
 export const USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7";
 export const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
@@ -80,6 +80,18 @@ export async function audit(env,actor,action,target,details={}){
 export async function syncWatch(env,address,remove=false,{leaseHeld=false}={}){
   const work=async()=>{
     if(!env.ALCHEMY_NOTIFY_TOKEN)throw Error("Alchemy Notify token is missing");
+    if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID && !remove){
+      // Another invocation may have created the webhook while this request
+      // waited for the global lease. Reload its persisted ID under the lease.
+      const stored=await env.DB.prepare("SELECT 1 FROM setup_secrets WHERE key='ALCHEMY_ACTIVITY_WEBHOOK_ID'").first();
+      if(stored){
+        const latest=await configEnv(env);
+        if(!latest.ALCHEMY_ACTIVITY_WEBHOOK_ID)
+          throw Error("Saved Alchemy webhook ID cannot be read; refusing to create a duplicate");
+        env.ALCHEMY_ACTIVITY_WEBHOOK_ID=latest.ALCHEMY_ACTIVITY_WEBHOOK_ID;
+        if(latest.ALCHEMY_SIGNING_KEY)env.ALCHEMY_SIGNING_KEY=latest.ALCHEMY_SIGNING_KEY;
+      }
+    }
     if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID && !remove){
       // The shared lease serializes webhook creation across all entry points.
       const response=await alchemyMutationFetch("https://dashboard.alchemy.com/api/create-webhook",{
