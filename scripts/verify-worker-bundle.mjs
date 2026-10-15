@@ -17,6 +17,8 @@ const required=[
  ["Alchemy remote address reconciliation",/async function maybeReconcileAlchemy\s*\(/],
  ["Alchemy pending-removal retry",/async function retryPendingWatchRemovals\s*\(/],
  ["subscription source attribution",/function sourceInsert\s*\(/],
+ ["generation-fenced history writer",/function generationValid\s*\(/],
+ ["legacy provenance review",/async function listLegacySubscriptions\s*\(/],
  ["safe Spender route source cleanup",/function removeSpenderRouteSourceStatements\s*\(/],
  ["administrator failed-notification retry",/async function requeueFailedOutbox\s*\(/],
  ["live approval monitor",/async function pollSpenders\s*\(/],
