@@ -1601,7 +1601,7 @@ async function getOneDirection(env, address, direction, from, to) {
 async function scanWalletGaps(env, maxWallets = 8) {
   const head = await blockNumber(env);
   const { results: wallets } = await env.DB.prepare(
-    "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? AND (c.last_error IS NULL OR c.checked_at IS NULL OR c.checked_at<datetime('now','-5 minutes')) ORDER BY c.last_block ASC,c.checked_at ASC LIMIT ?"
+    "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? AND (c.last_error IS NULL OR c.checked_at IS NULL OR datetime(c.checked_at)<datetime('now','-5 minutes')) ORDER BY c.last_block ASC,c.checked_at ASC LIMIT ?"
   ).bind(head, maxWallets).all();
   for (const w of wallets || []) {
     const from = Math.max(0, w.last_block - 5), to = Math.min(head, w.last_block + 600);
