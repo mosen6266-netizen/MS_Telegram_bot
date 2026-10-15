@@ -8,6 +8,7 @@ import {flushOutbox,recoverStuck} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
 import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
+import {finishAddressQueryCleanup,flushMessageCleanup} from "./cleanup";
 async function cron(env){
   await recoverStuck(env);
   const {results:pending}=await env.DB.prepare("SELECT address FROM wallet_watches WHERE state='pending' LIMIT 15").all();
@@ -31,7 +32,7 @@ export default {
       }
       const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
       const configured=active?await configEnv(env):env;
-      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-usage-v1",database_configured:!!env.DB});
+      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-auto-cleanup-v1",database_configured:!!env.DB});
       if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
       if(path.startsWith("/api/"))return await handleAdmin(req,env,path);
       if(req.method==="POST"&&path==="/webhooks/telegram"){
@@ -67,7 +68,12 @@ export default {
         const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
         if(!active){message.retry({delaySeconds:120});continue;}
         const configured=await configEnv(env);
-        if(item.kind==="check")await checkOwner(configured,item.owner,item.chat_id,item.user_id,item.display_name);
+        if(item.kind==="check"){
+          await checkOwner(configured,item.owner,item.chat_id,item.user_id,item.display_name);
+          // A final query result was delivered; temporary user input and progress are no longer needed.
+          try{await finishAddressQueryCleanup(configured,item);}
+          catch(cleanErr){console.warn("Address query cleanup deferred",String(cleanErr));}
+        }
         else if(item.kind==="activity")await processActivity(configured,item.payload);
         else if(item.kind==="verify_admin")await verifyAdminOwner(configured,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
@@ -77,6 +83,8 @@ export default {
         if(message.attempts>=5){
           if(item.kind==="check"){
             try{await send(configured,item.chat_id,"⚠️ <b>USDT 授权查询未完成</b>\n请稍后重试。系统未把此地址错误标记为无授权，也未擅自开启监控。");}catch{}
+            try{await finishAddressQueryCleanup(configured,item);}
+            catch(cleanErr){console.warn("Failed query cleanup deferred",String(cleanErr));}
           }
           message.ack();
         }else message.retry({delaySeconds:Math.min(120,10*Math.pow(2,message.attempts||1))});
@@ -89,6 +97,9 @@ export default {
       try{await collectUsage(configured);await runUsageAlerts(configured);await flushOutbox(configured,10,true);}
       catch(e){console.error("Usage maintenance failed",String(e));}
     })());
+    // Always expire abandoned remark prompts, even when finance monitoring is paused.
+    ctx.waitUntil((async()=>{try{await flushMessageCleanup(configured,60);}
+      catch(e){console.warn("Telegram message cleanup maintenance",String(e));}})());
     ctx.waitUntil((async()=>{const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";if(active)await cron(configured);})());
   }
 };
