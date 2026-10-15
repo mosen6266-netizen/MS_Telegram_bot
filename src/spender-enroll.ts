@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {ensureWatch,short,now,blockNumber} from "./core";
 import {walletRemark} from "./wallet-remarks";
+import {sourceInsert} from "./subscription-sources";
 
 // Bulk enroll historical USDT Approval owners; this is distinct from discovering
 // the addresses. Alchemy can rate-limit dashboard API calls (HTTP 429 / 1015).
@@ -75,6 +76,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
           const chat=String(group.chat_id);
           if(!(await db.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))continue;
           await db.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
+          await sourceInsert(db,chat,owner,"spender",spender).run();
         }
         const state=await db.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
         if(state?.state==="active"){
