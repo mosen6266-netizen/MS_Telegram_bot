@@ -1335,6 +1335,22 @@ async function state(db, key2) {
 async function save(db, key2, value) {
   await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(key2, String(value)).run();
 }
+async function verifyWebhookConfiguration(env) {
+  const res = await fetch("https://dashboard.alchemy.com/api/team-webhooks", {
+    headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Accept": "application/json" }
+  });
+  if (!res.ok) throw Error("Alchemy webhook metadata HTTP " + res.status);
+  const body2 = await res.json();
+  const outer = Array.isArray(body2) ? body2 : [body2];
+  const all = outer.flatMap((item) => Array.isArray(item?.data) ? item.data : Array.isArray(item) ? item : []);
+  const webhook = all.find((x) => x?.id === env.ALCHEMY_ACTIVITY_WEBHOOK_ID);
+  if (!webhook) throw Error("Configured Alchemy activity webhook is not present in team");
+  if (webhook.is_active !== true) throw Error("Configured Alchemy webhook is disabled");
+  if (webhook.network !== "ETH_MAINNET" || webhook.webhook_type !== "ADDRESS_ACTIVITY") throw Error("Alchemy webhook type or network differs from Ethereum Mainnet address activity");
+  const base = String(env.PUBLIC_BASE_URL || "");
+  const expected = (base.endsWith("/") ? base.slice(0, -1) : base) + "/webhooks/alchemy";
+  if (webhook.webhook_url !== expected) throw Error("Alchemy webhook destination URL does not match the bot");
+}
 async function actualAddresses(env) {
   const result = /* @__PURE__ */ new Set();
   let cursor = null;
@@ -1392,6 +1408,7 @@ async function reconcileAlchemyAddresses(env) {
       "SELECT w.address FROM wallet_watches w WHERE w.state='active' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status='active')"
     ).all()).results || [];
     const expected = [...new Set(rows.map((r) => String(r.address).toLowerCase()))];
+    await verifyWebhookConfiguration(env);
     const actual = await actualAddresses(env);
     missing = expected.filter((a) => !actual.has(a));
     if (missing.length) {
