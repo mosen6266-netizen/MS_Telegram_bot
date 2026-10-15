@@ -231,3 +231,18 @@
 - **已确认 CI**：核心功能与新 D1 故障测试提交 `1b52c19a82af7c36b73fb920415e6c1adb1214cb` 双 CI 成功。最新构建校验与文档更新提交仍需核对最终 CI。
 - **尚未完成的风险**：仅本地模拟数据库/RPC 测试，实际外部 Cloudflare Queue/Cron/Alchemy/Etherscan 长时间运行、回调投递验证、100–200 钱包持续区块跟踪能力、生产数据库备份回滚均未验收；跨服务 429 仍需云端压力测试。不得承诺完全消除重组与通知延迟风险。
 - **发布隔离边界**：未修改生产 Worker、生产 D1、Queues、Telegram Bot、Alchemy、`main`；PR #1 继续保持草稿。下一阶段优先使用 `docs/ISOLATED_STAGING.md` 的独立环境验收，在用户批准并确认资源隔离后再实际创建预发布资源；在此之前继续修复阻断正式发布的代码问题和静态核对。
+
+## 2026-10-15 第十五轮：Cloudflare 失败 Queue 保留、死信 D1 归档和转账哈希修复
+
+- **起点核验**：第十四轮最新进度提交 `c9b5f5e425...` 的两组 CI 均成功。继续使用独立开发分支，不合并 `main`。
+- **关键 Queue 丢单漏洞**：`src/index.ts` 原在 `message.attempts>=5` 时 `message.ack()`，可能静默丢弃处理失败的链上活动或钱包核验任务。已改为 `message.retry()`，由 Cloudflare Queue 已配置的 `max_retries:5` 与 `dead_letter_queue` 负责后续死信处理；成功任务仍 ACK。
+- **官方 DLQ 保留期限限制**：Cloudflare 未消费的 DLQ 消息一般只保留约 4 天。仅指向 DLQ 不能保证长期保留，因此新增 `migrations/20261018_queue_dead_letters.sql` 和 `src/queue-dead-letters.ts`，对 DLQ 的新消费者执行“D1 归档成功才 ACK，失败后 retry”，按 Queue 消息 ID 幂等去重、不会自动重播原任务。
+- `wrangler.jsonc` 与 `wrangler.staging.example.jsonc` **开发分支**均增加 DLQ consumer；保留生产/预发布互相独立的 Queue 名称。此配置从未部署到正式 Cloudflare，实际 Queue 的消费与归档仍必须在独立测试环境检查。若 DLQ 的 D1 写入失败持续超过其重试/保留上限，仍有丢单风险，正式上线须增加监控告警。
+- `src/admin.ts`、`src/admin-ui.ts`：管理员“通知队列”页面新增“Cloudflare 异常任务归档”查询与已核查操作；摘要列表不返回原始负载，未登录和未经 CSRF 授权的写入禁止；核查有 `admin_audit` 审计。**已核查不代表成功，绝不自动重播**。
+- `tests/queue-dead-letter.test.mjs`：真实 Worker 的失败/成功 Queue 分支和正式配置 DLQ 规则；`tests/queue-dead-letter-archive.test.mjs`：D1 归档成功、幂等重复消息、D1 触发器模拟写入失败不 ACK、重试恢复、管理 API 权限和审计以及 staging/production 各自的 DLQ consumer。
+- **转账重组核查缺口**：`src/core.ts` 新增 `confirmedReceipt`（保留 `receiptSuccess` 原有三态行为），`src/transfers.ts` 使用真正成功交易回执的 `blockHash` 保存区块哈希；重播时只补齐原本为 NULL 的哈希，不能修改已经存在的哈希或重复发送通知。
+- `src/recovery.ts` 新增 `backfillMissingTransferBlockHashes`：从历史仍确认且哈希缺失的转账中至多检查 3 条，每 6 小时执行一次，仅在真实交易回执 `blockNumber` 与数据库高度匹配且区块哈希格式正确时写入。没有找到或不匹配则不伪造、不改写重组事件。
+- `tests/transfer-atomicity.test.mjs` 增加区块哈希优先级及重复回放修复测试；`tests/transfer-blockhash-backfill.test.mjs` 使用隔离 D1 与合成 RPC 检查匹配/不匹配、重组记录不可修改、6 小时退避。
+- `tests/in-place-upgrade-rehearsal.test.mjs` 已纳入新的死信归档迁移与空表验证；`scripts/verify-worker-bundle.mjs` 检验相关 Worker 模块不会在编译中丢失；`docs/RELEASE_AND_ROLLBACK.md` 增加 DLQ、迁移、重组与真实云端验收门槛。
+- **CI**：Queue 修复与转账哈希逻辑已成功，DLQ 消费及管理完整集成测试提交 `2dacbd6540a2fe4ec11e10d5caa26c1729239f08` 双 CI 成功，打包完整性提交 `02fdd49243792ec531000259b6d595e01d404e4c` 双 CI 成功。后续迁移测试及文档提交的最终 CI 需继续核验。
+- **边界**：正式 Worker、D1、Queues、Telegram/Alchemy 外部服务和 `main` 均未修改；未新建/部署隔离云端预发布资源。接下来正式发布前必须先在独立预发布环境验证真实 Queue/DLQ 消费、Webhook、Cron、链上 RPC、Telegram 群接收、完整 D1 备份与回滚。别把本地 Miniflare/D1 模拟测试等同于生产可靠性证明。
