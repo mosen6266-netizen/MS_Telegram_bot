@@ -17,7 +17,11 @@
   - `20261015_subscription_sources.sql`
   - `20261015_outbox_pagination_index.sql`
   - `20261016_spender_generation_fence.sql`（必须在 `20261015_spender_history.sql` 和 `20261015_spender_history_times.sql` 之后执行）
+  - `20261017_admin_list_indexes.sql`（钱包、群组订阅及链上交易分页索引）
 - [ ] 使用实际 D1 `PRAGMA table_info`、`PRAGMA foreign_key_check`、`SELECT count(*)` 检查迁移结果。
+- [ ] 运行 `tests/in-place-upgrade-rehearsal.test.mjs`：基于旧架构的非空模拟 D1，升级后比较监控、旧订阅、通知队列、审计和 Spender 断点；验证索引和外键。
+- [ ] 运行 `tests/admin-listing.test.mjs`：验证超过 200 条的钱包、订阅、链上交易和审计记录可分页/搜索，保留旧数据。
+- [ ] **注意**：现有 `.github/workflows/smoke.yml` 只检查生产 Worker 的健康与身份初始化接口，无法证明本次 PR 的新代码在隔离预发布环境能正常运行；不要将其显示为预发布端到端验收通过。
 - [ ] 验证旧 `subscriptions` 被标记为 `legacy` 且未被取消，现有监控/通知不丢失。
 - [ ] 新版 Worker 在**隔离预发布环境**通过健康检查、管理员登录、查询/修改备注、Spender 创建/编辑/删除（含删除期间扫描和相同地址重建）、Alchemy webhook 模拟、Telegram outbox 发送模拟、Cron 恢复和限流测试。
 - [ ] 确定生产部署时间窗口及负责验收的管理员，事先告知现有监控风险。
