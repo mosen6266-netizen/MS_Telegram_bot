@@ -44,10 +44,20 @@ export async function handleTelegram(env,upd){
       }
       if(!await memberAllowed(env,m.chat.id,m.from.id))return;
       const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(chatId,session.address).first();
-      if(!old){await send(env,chatId,"该地址未在当前群启用监控。");return;}
+      if(!old){
+        await send(env,chatId,"⚠️ 当前群组已停止监控这个地址。");
+        await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
+        try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark cancellation cleanup",String(e));}
+        return;
+      }
       const result=await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=? AND remark_version=?")
         .bind(remark,now(),chatId,session.address,old.remark_version).run();
-      if(!result.meta?.changes){await send(env,chatId,"备注刚被其他成员修改，请重新点击修改按钮。");return;}
+      if(!result.meta?.changes){
+        await send(env,chatId,"⚠️ 备注已被其他成员更新，请重新点击修改按钮。");
+        await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
+        try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark conflict cleanup",String(e));}
+        return;
+      }
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId,session.address,userId,old.remark,remark).run();
       // Show the permanent result first, then delete BOTH temporary group messages.
       // Do not keep the editor's identity in the visible result.
@@ -55,6 +65,16 @@ export async function handleTelegram(env,upd){
       await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
       try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}
       catch(e){console.warn("Remark cleanup deferred",String(e));}
+      return;
+    }
+    // An answer to a prompt that has already timed out is disposable too.
+    // It must not be mistaken for a new query or remain permanently visible.
+    const knownPrompt=await env.DB.prepare(
+      "SELECT 1 FROM telegram_message_cleanup WHERE chat_id=? AND message_id=? AND reason LIKE 'remark_prompt%'"
+    ).bind(chatId,m.reply_to_message.message_id).first();
+    if(knownPrompt){
+      try{await scheduleMessageDeletion(env,chatId,m.message_id,"late_remark_reply");}
+      catch(e){console.warn("Late remark cleanup deferred",String(e));}
       return;
     }
   }
