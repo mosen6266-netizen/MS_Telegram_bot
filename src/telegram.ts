@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {addr,esc,send,telegram,buttons,now,trunc,increment} from "./core";
 import {checkOwner} from "./approval";
+import {scheduleMessageDeletion,finishRemarkCleanup} from "./cleanup";
 async function memberAllowed(env,chatId,userId){
   try{
     const m=await telegram(env,"getChatMember",{chat_id:chatId,user_id:Number(userId)});
@@ -20,6 +21,8 @@ export async function handleTelegram(env,upd){
     const prompt=await send(env,chat.id,"✏️ "+esc(c.from.first_name)+"，请<b>回复这条消息</b>输入新的地址备注：\n<code>"+address+"</code>\n限 1–80 个字符，10 分钟内有效。",{force_reply:true,selective:true});
     await env.DB.prepare("INSERT OR REPLACE INTO remark_sessions(chat_id,user_id,prompt_message_id,address,expires_at) VALUES(?,?,?,?,datetime('now','+10 minutes'))")
       .bind(String(chat.id),String(c.from.id),prompt.message_id,address).run();
+    // Remove even abandoned 10-minute input prompts. Never remove the original result.
+    await scheduleMessageDeletion(env,String(chat.id),prompt.message_id,"remark_prompt_expired",600);
     return;
   }
   const m=upd.message;if(!m||!m.from||!m.chat||!m.text)return;
@@ -34,7 +37,10 @@ export async function handleTelegram(env,upd){
     if(session){
       const remark=trunc(m.text.trim(),80);
       if(!remark || Array.from(m.text.trim()).length>80 || /[\u0000-\u001f\u007f]/.test(remark)){
-        await send(env,chatId,"⚠️ 备注必须为 1–80 个有效字符，请重新回复。");return;
+        const notice=await send(env,chatId,"⚠️ 备注必须为 1–80 个有效字符，请重新回复。");
+        await scheduleMessageDeletion(env,chatId,m.message_id,"invalid_remark_input",90);
+        await scheduleMessageDeletion(env,chatId,notice.message_id,"temporary_validation_notice",90);
+        return;
       }
       if(!await memberAllowed(env,m.chat.id,m.from.id))return;
       const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(chatId,session.address).first();
@@ -43,8 +49,12 @@ export async function handleTelegram(env,upd){
         .bind(remark,now(),chatId,session.address,old.remark_version).run();
       if(!result.meta?.changes){await send(env,chatId,"备注刚被其他成员修改，请重新点击修改按钮。");return;}
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId,session.address,userId,old.remark,remark).run();
+      // Show the permanent result first, then delete BOTH temporary group messages.
+      // Do not keep the editor's identity in the visible result.
+      await send(env,chatId,"✅ 地址备注已更新：<b>"+esc(remark)+"</b>\n<code>"+session.address+"</code>",buttons(session.address));
       await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
-      await send(env,chatId,"✅ 地址备注已更新：<b>"+esc(remark)+"</b>\n修改者："+esc(name)+"\n<code>"+session.address+"</code>",buttons(session.address));
+      try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}
+      catch(e){console.warn("Remark cleanup deferred",String(e));}
       return;
     }
   }
@@ -58,7 +68,13 @@ export async function handleTelegram(env,upd){
   // First *request* wins, not first completed external API lookup.
   await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,first_user_id,first_user_name,discovery_source) VALUES(?,?,?,'manual')").bind(owner,userId,name).run();
   await env.DB.prepare("UPDATE wallets SET first_user_id=?,first_user_name=? WHERE address=? AND first_user_id IS NULL").bind(userId,name,owner).run();
-  await send(env,chatId,"🔎 已收到地址查询，正在检索历史 USDT 授权并核验当前额度……");
-  await env.TASKS.send({kind:"check",owner,chat_id:chatId,user_id:userId,display_name:name});
+  const progress=await send(env,chatId,"🔎 已收到地址查询，正在检索历史 USDT 授权并核验当前额度……");
+  // Thirty-minute fail-safe: clean temporary inputs even if the queue stalls permanently.
+  await Promise.all([
+    scheduleMessageDeletion(env,chatId,m.message_id,"query_address_stale",1800),
+    scheduleMessageDeletion(env,chatId,progress.message_id,"query_progress_stale",1800)
+  ]);
+  await env.TASKS.send({kind:"check",owner,chat_id:chatId,user_id:userId,display_name:name,
+    user_message_id:m.message_id,progress_message_id:progress.message_id});
   await increment(env,"telegram_queries");
 }
