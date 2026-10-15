@@ -868,7 +868,7 @@ async function handleTelegram(env, upd) {
 }
 
 // src/spender-history.ts
-var HISTORY_WINDOW = 2e5;
+var HISTORY_WINDOW = 1e6;
 var HISTORY_PAGE_SIZE = 200;
 async function startSpenderHistory(env, spender) {
   const rule = await env.DB.prepare("SELECT start_block FROM spender_rules WHERE spender=?").bind(spender).first();
@@ -927,14 +927,14 @@ async function fetchHistoryRange(env, spender, from, to) {
 }
 async function scanSpenderHistories(env) {
   const job = await env.DB.prepare("SELECT j.* FROM spender_history_jobs j JOIN spender_rules r ON r.spender=j.spender WHERE r.enabled=1 AND (j.state IN ('scanning','retrying') OR (j.state='running' AND j.updated_at<datetime('now','-5 minutes'))) ORDER BY j.updated_at ASC LIMIT 1").first();
-  if (!job) return;
+  if (!job) return false;
   const locked2 = await env.DB.prepare("UPDATE spender_history_jobs SET state='running',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND (state IN ('scanning','retrying') OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(job.spender).run();
-  if (!(locked2.meta?.changes > 0)) return;
+  if (!(locked2.meta?.changes > 0)) return false;
   try {
     const begin = Number(job.next_block), cutoff = Number(job.cutoff_block);
     if (begin > cutoff) {
       await env.DB.prepare("UPDATE spender_history_jobs SET state='completed',last_error=NULL,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(job.spender).run();
-      return;
+      return false;
     }
     const window = Math.max(1, Math.min(HISTORY_WINDOW, Number(job.window_size) || HISTORY_WINDOW));
     const end = Math.min(cutoff, begin + window - 1);
@@ -942,7 +942,7 @@ async function scanSpenderHistories(env) {
     if (logs.length >= HISTORY_PAGE_SIZE) {
       if (end === begin) throw Error("\u5355\u4E2A\u533A\u5757\u6388\u6743\u4E8B\u4EF6\u8D85\u51FA\u63A5\u53E3\u8FD4\u56DE\u4E0A\u9650\uFF1B\u9700\u8981\u5206\u9875\u68C0\u7D22\uFF0C\u4E0D\u4F1A\u8DF3\u8FC7\u6B64\u533A\u5757");
       await env.DB.prepare("UPDATE spender_history_jobs SET state='scanning',window_size=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(Math.max(1, Math.floor(window / 2)), job.spender).run();
-      return;
+      return true;
     }
     const latest = /* @__PURE__ */ new Map();
     for (const log of logs) {
@@ -977,14 +977,16 @@ async function scanSpenderHistories(env) {
     }
     const next = end + 1;
     await env.DB.prepare("UPDATE spender_history_jobs SET next_block=?,window_size=?,state=?,events_found=events_found+?,last_error=NULL,retry_count=0,updated_at=CURRENT_TIMESTAMP,finished_at=CASE WHEN ?>cutoff_block THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE spender=?").bind(next, Math.min(HISTORY_WINDOW, Math.max(5e3, window * 2)), next > cutoff ? "completed" : "scanning", logs.length, next, job.spender).run();
+    return next <= cutoff;
   } catch (e) {
     console.error("Spender history scan", job.spender, String(e));
     const message = String(e.message || e).slice(0, 240);
     if (/block range|query timeout|too large|response size|exceed|more than|too many records|window limit/i.test(message) && Number(job.window_size) > 1) {
       await env.DB.prepare("UPDATE spender_history_jobs SET window_size=?,state='scanning',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(Math.max(1, Math.floor(Number(job.window_size) / 2)), "\u8BF7\u6C42\u8303\u56F4\u8FC7\u5927\uFF0C\u6B63\u5728\u81EA\u52A8\u7F29\u5C0F\u533A\u5757\u8303\u56F4", job.spender).run();
-      return;
+      return true;
     }
     await env.DB.prepare("UPDATE spender_history_jobs SET state='retrying',last_error=?,retry_count=retry_count+1,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(String(e.message || e).slice(0, 240), job.spender).run();
+    return false;
   }
 }
 async function verifyHistoricalAllowances(env, max = 8) {
@@ -1931,7 +1933,9 @@ async function cron(env) {
     console.error("Spender scan", String(e));
   }
   try {
-    await scanSpenderHistories(env);
+    for (let i = 0; i < 4; i++) {
+      if (!await scanSpenderHistories(env)) break;
+    }
   } catch (e) {
     console.error("Spender history scan", String(e));
   }
