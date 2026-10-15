@@ -88,12 +88,21 @@ export async function handleAdmin(req,env,path){
   }
   if(method==="POST"&&path==="/api/wallets"){
     const d=await body(req),a=addr(d.address);if(!a)return bad("无效的 Ethereum 地址");
+    const chat=d.chat_id===undefined?"":String(d.chat_id).trim();
+    const existing=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(a).first();
+    if((await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(a).first())||existing?.deleted_at)
+      return bad("该钱包已被管理员移除；请先恢复档案后再重新核验",409);
+    if(chat){
+      const target=await env.DB.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+      if(!target||!target.active||!["group","supergroup"].includes(target.chat_type))
+        return bad("群组尚未登记或已停用；请先将机器人加入一个有效的 Telegram 群");
+    }
+    // Validate the entire request before inserting anything. Invalid group
+    // IDs must not leave orphaned wallets behind.
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
-    if(d.chat_id){
-      const chat=String(d.chat_id);
-      if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("机器人必须先加入这个 Telegram 群组");
+    if(chat){
       const remark=await walletRemark(env,a,String(d.remark||"待核验 · "+short(a)).trim().slice(0,80));
-      await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,a,remark).run();
+      await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END,updated_at=CURRENT_TIMESTAMP").bind(chat,a,remark).run();
       await env.TASKS.send({kind:"verify_admin",owner:a,chat_id:chat});
     }
     await audit(env,"admin","create_wallet",a);
@@ -121,10 +130,16 @@ export async function handleAdmin(req,env,path){
   if(method==="GET"&&path==="/api/spenders")return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
   if(method==="POST"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);if(!a)return bad("Spender 地址无效");
-    const groups=[...new Set((Array.isArray(d.chat_ids)?d.chat_ids:[]).map(String).filter(x=>/^-?\d+$/.test(x)))];
-    if(!groups.length)return bad("必须选择至少一个 Telegram 群组");
-    for(const chat of groups)if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("未登记的群组："+chat);
-    await addSpender(await configEnv(env),a,String(d.remark||"Spender "+short(a)).slice(0,80),groups);
+    if(!Array.isArray(d.chat_ids))return bad("请填写通知群 ID 列表");
+    const groups=[...new Set(d.chat_ids.map(x=>String(x).trim()))];
+    if(!groups.length||groups.some(x=>!(/^-\d{5,20}$/.test(x)))return bad("请填写至少一个有效的 Telegram 群 ID");
+    for(const chat of groups){
+      const target=await env.DB.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+      if(!target||!target.active||!["group","supergroup"].includes(target.chat_type))return bad("通知群尚未登记、已停用或不是群组："+chat);
+    }
+    const label=String(d.remark||"Spender "+short(a)).trim();
+    if(!label||Array.from(label).length>80||/[\u0000-\u001f\u007f]/.test(label))return bad("备注须为 1–80 个字符");
+    await addSpender(await configEnv(env),a,label,groups);
     await startSpenderHistory(env,a);
     await audit(env,"admin","create_spender",a,{groups});
     return json({ok:true,mode:"history_and_new_approvals",note:"历史上授权过此 Spender 的 Owner 将逐步加入监控；不自动监控 Spender 自身。"});
@@ -263,18 +278,27 @@ export async function handleAdmin(req,env,path){
   if(method==="PATCH"&&path==="/api/subscriptions"){
     const d=await body(req),a=addr(d.address),chat=String(d.chat_id||"");if(!a||!/^-?\d+$/.test(chat))return bad("无效订阅地址或群组");
     const old=await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a,chat).first();if(!old)return bad("订阅不存在",404);
-    if(d.remark!==undefined){
-      const text=String(d.remark).trim();if(!text||Array.from(text).length>80)return bad("备注长度为 1–80 字符");
-      await saveWalletRemark(env,a,text);
-      await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat,a,"admin",old.remark,text).run();
-    }
-    if(d.status!==undefined){
-      if(!["active","paused","removed"].includes(d.status))return bad("状态无效");
-      if(d.status==="active"&&(await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state!=="active"){
+    // Validate both fields before mutating either one. A rejected status
+    // transition must never leave behind a changed global remark.
+    const nextRemark=d.remark===undefined?undefined:String(d.remark).trim();
+    if(nextRemark!==undefined&&(!nextRemark||Array.from(nextRemark).length>80||/[\u0000-\u001f\u007f]/.test(nextRemark)))
+      return bad("备注长度须为 1–80 字符且不能包含控制字符");
+    if(d.status!==undefined && !["active","paused","removed"].includes(d.status))return bad("状态无效");
+    if(d.status==="active"){
+      if((await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(a).first())||
+        (await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(a).first())?.deleted_at)
+        return bad("该钱包已全局移除，必须先由管理员恢复档案",409);
+      if((await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state!=="active"){
         // Only previously monitored addresses can be resumed without another USDT approval verification.
         if(!["paused","removed"].includes(old.status))return bad("该地址尚未完成有效 USDT 授权核验",409);
         if(!await ensureWatch(await configEnv(env),a))return bad("Alchemy 监控订阅仍未完成，请稍后重试",409);
       }
+    }
+    if(nextRemark!==undefined){
+      await saveWalletRemark(env,a,nextRemark);
+      await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat,a,"admin",old.remark,nextRemark).run();
+    }
+    if(d.status!==undefined){
       await env.DB.prepare("UPDATE subscriptions SET status=?,updated_at=? WHERE chat_id=? AND address=?").bind(d.status,now(),chat,a).run();
       if(d.status==="removed"||d.status==="paused"){
         const still=(await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(a).first())?.n||0;
