@@ -66,39 +66,16 @@ export async function authRoute(req,env,path){
     const b=await req.json(),code=String(b.setup_code||""),password=String(b.password||"");
     if(await locked(env,"setup"))return json({error:"Too many setup attempts, retry later"},429);
     if(password.length<14||password.length>200)return json({error:"Password must be 14-200 characters"},400);
-    if(env.INIT_SETUP_CODE){
-      if(!equal(code,env.INIT_SETUP_CODE)){await fail(env,"setup");return json({error:"Invalid one-time setup code"},403);}
-    }else{
-      // Bootstrap is secured by proof of Cloudflare Worker-edit permission for THIS account.
-      // The token is used once and never stored in the database or Worker.
-      const cfToken=String(b.cloudflare_api_token||"").trim();
-      if(!/^\S{20,300}$/.test(cfToken)){await fail(env,"setup");return json({error:"Enter a Cloudflare API token with Workers Scripts Edit permission for this account"},403);}
-      if(!env.CF_ACCOUNT_ID)return json({error:"Cloudflare account binding unavailable"},503);
-      const workerBase="https://api.cloudflare.com/client/v4/accounts/"+encodeURIComponent(env.CF_ACCOUNT_ID)+"/workers/scripts/ethereum-usdt-monitor";
-      const headers={"authorization":"Bearer "+cfToken};
-      if(env.APP_ENCRYPTION_KEY){
-        // The secret was provisioned during a previous attempt. NEVER rotate it on retries.
-        // Verify ownership against the actual Worker without performing a script update.
-        const check=await fetch(workerBase+"/settings",{headers});
-        if(!check.ok){await fail(env,"setup");return json({error:"Cloudflare token cannot access this Worker's settings. Please verify the token account and Workers Scripts Edit permission."},403);}
-        await check.body?.cancel();
-      }else{
-        // Updating a Worker secret may restart the current running instance.
-        // Provision only once and require a new request to complete registration safely.
-        const master=b64(random(32));
-        const result=await fetch(workerBase+"/secrets",{
-          method:"PUT",headers:{...headers,"content-type":"application/json"},
-          body:JSON.stringify({name:"APP_ENCRYPTION_KEY",type:"secret_text",text:master})
-        });
-        const response=await result.json();
-        if(!result.ok||!response.success){await fail(env,"setup");return json({error:"Cloudflare encryption key provisioning failed. Check the token's Workers Scripts Edit permission."},403);}
-        return json({ok:false,code:"KEY_PROVISIONED_RETRY",error:"Encryption key created. Reload this page, then submit again using the same setup token and password. Do not generate a new Cloudflare token."},409);
-      }
-    }
+    // A short-lived, single-use code replaces the fragile Cloudflare API self-modification.
+    if(!env.APP_ENCRYPTION_KEY)return json({error:"Service encryption secret not configured. Contact the deployment administrator."},503);
+    const digest=await sha256(code);
+    const invite=await env.DB.prepare("SELECT 1 FROM setup_invites WHERE code_hash=? AND used_at IS NULL AND expires_at>?").bind(digest,now()).first();
+    if(!invite){await fail(env,"setup");return json({error:"一次性初始化码无效或已经过期，请联系部署管理员获取新码。"},403);}
     const salt=b64(random(24)),hash=await passwordHash(password,salt);
     // Database uniqueness prevents two simultaneous first-run initializations.
     const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,200000)").bind(salt,hash).run();
     if(!result.meta?.changes)return json({error:"Already initialized"},409);
+    await env.DB.prepare("UPDATE setup_invites SET used_at=? WHERE code_hash=? AND used_at IS NULL").bind(now(),digest).run();
     await clearFail(env,"setup");
     return new Response(JSON.stringify({ok:true}),{headers:{"content-type":"application/json","set-cookie":await session(env)}});
   }
