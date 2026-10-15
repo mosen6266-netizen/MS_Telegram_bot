@@ -28,6 +28,8 @@ const required=[
  ["paginated transfer history",/async function listTransfersPage\s*\(/],
  ["safe Spender route source cleanup",/function removeSpenderRouteSourceStatements\s*\(/],
  ["administrator failed-notification retry",/async function requeueFailedOutbox\s*\(/],
+ ["administrator uncertain-delivery acknowledgement",/async function acknowledgeUnknownOutbox\s*\(/],
+ ["ambiguous Telegram delivery state",/delivery_unknown/],
  ["live approval monitor",/async function pollSpenders\s*\(/],
  ["transfer processing",/async function processActivity\s*\(/],
  ["Telegram outbox",/async function flushOutbox\s*\(/],
