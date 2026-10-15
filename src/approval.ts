@@ -92,7 +92,11 @@ export async function pollSpenders(env){
 }
 async function processApproval(env,rule,log){
   const owner=fromTopic(log.topics?.[1]);if(!owner)return;
-  const ok=await receiptSuccess(env,log.transactionHash);if(ok!==true)return;
+  const ok=await receiptSuccess(env,log.transactionHash);
+  // A missing receipt is a transient RPC/indexing race, not a failed transaction.
+  // Retrying this block is essential: advancing the cursor here loses approvals.
+  if(ok===null)throw Error("Transaction receipt is not indexed yet; retry this block");
+  if(ok===false)return;
   const amount=await allowance(env,owner,rule.spender);
   await recordSpenderLiveApproval(env,rule.spender,log,amount);
   // Keep an archival event, but do not restore monitoring for a manually removed wallet.
