@@ -7,7 +7,7 @@ import {build} from "esbuild";
 const bundle=await build({
   entryPoints:["src/spender-history.ts"],bundle:true,write:false,platform:"node",format:"esm",logLevel:"silent",
   plugins:[{name:"mock-chain",setup(b){
-    b.onResolve({filter:/^\\.\\/core$/},()=>({path:"chain",namespace:"mock-chain"}));
+    b.onResolve({filter:/^\.\/core$/},()=>({path:"chain",namespace:"mock-chain"}));
     b.onLoad({filter:/.*/,namespace:"mock-chain"},()=>({loader:"js",contents:`
       export const USDT="0x0000000000000000000000000000000000000000";
       export const APPROVAL_TOPIC="0x00";
@@ -78,8 +78,8 @@ test("one failing historical Owner cannot permanently block later Owners",async(
 test("live Spender scan treats temporarily missing receipts as retryable",async()=>{
   const {readFileSync}=await import("node:fs");
   const source=readFileSync("src/approval.ts","utf8");
-  assert.match(source,/if\\(ok===null\\)throw Error/);
-  assert.match(source,/if\\(ok===false\\)return/);
+  assert.match(source,/if\(ok===null\)throw Error/);
+  assert.match(source,/if\(ok===false\)return/);
   assert.match(source,/UPDATE spender_rules SET cursor_block/);
 });
 
@@ -88,5 +88,5 @@ test("generic watcher retry excludes manually removed and unsubscribed wallets",
   const source=readFileSync("src/index.ts","utf8");
   assert.match(source,/SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address/);
   assert.match(source,/v.deleted_at IS NOT NULL/);
-  assert.match(source,/s.status IN \\('active','pending'\\)/);
+  assert.match(source,/s.status IN \('active','pending'\)/);
 });
