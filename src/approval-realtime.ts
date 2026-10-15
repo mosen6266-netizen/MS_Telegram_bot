@@ -1,0 +1,100 @@
+// @ts-nocheck
+import {USDT,APPROVAL_TOPIC,addr,fromTopic,toTopic,now} from "./core";
+import {persistSecret} from "./setup";
+import {processRealtimeApproval} from "./approval";
+const STATE="approval_realtime_status",LOCK="approval_realtime_provision_lock";
+export function approvalQuery(spenders){
+  const topics=spenders.map(toTopic);
+  // Never monitor *all* USDT Approvals: filter the enabled Spenders on topic2.
+  return '{ block { number logs(filter: { addresses: ["'+USDT+'"], topics: [["'+APPROVAL_TOPIC+'"], [], '+JSON.stringify(topics)+'] }) { account { address } topics data index transaction { hash status } } } }';
+}
+async function status(env,details){
+  await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+    .bind(STATE,JSON.stringify({...details,at:now()})).run();
+}
+export async function provisionRealtimeApprovals(env){
+  if(!env.ALCHEMY_NOTIFY_TOKEN){await status(env,{state:"blocked",reason:"Alchemy Notify token missing"});return;}
+  const {results:rules}=await env.DB.prepare("SELECT spender FROM spender_rules WHERE enabled=1 ORDER BY spender").all();
+  const spenders=(rules||[]).map(x=>addr(x.spender)).filter(Boolean);
+  if(!spenders.length)return {skipped:"no_spenders"};
+  if(env.ALCHEMY_APPROVAL_WEBHOOK_ID&&env.ALCHEMY_APPROVAL_SIGNING_KEY){
+    const prior=await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(STATE).first();
+    if(!prior||JSON.parse(prior.value||"{}").state!=="active")
+      await status(env,{state:"active",id:env.ALCHEMY_APPROVAL_WEBHOOK_ID,spender_count:spenders.length});
+    return {status:"already_configured"};
+  }
+  const pause=await env.DB.prepare("SELECT value FROM runtime_state WHERE key='approval_realtime_retry_after'").first();
+  if(Number(pause?.value||0)>Date.now())return {skipped:"cooldown"};
+  const lock=await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)")
+    .bind(LOCK,String(Date.now())).run();
+  if(!lock.meta?.changes){
+    const held=await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(LOCK).first();
+    if(Date.now()-Number(held?.value||0)>5*60*1000)await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK).run();
+    return {skipped:"locked"};
+  }
+  try{
+    const url=String(env.PUBLIC_BASE_URL).replace(/\/$/,"")+"/webhooks/alchemy-approvals";
+    const list=await fetch("https://dashboard.alchemy.com/api/team-webhooks",{headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN}});
+    if(!list.ok)throw Error("List Alchemy webhooks HTTP "+list.status);
+    const raw=await list.json();
+    const existing=(Array.isArray(raw?.data)?raw.data:Array.isArray(raw)?raw:[])
+      .filter(x=>x.webhook_url===url&&x.network==="ETH_MAINNET"&&x.webhook_type==="GRAPHQL");
+    if(existing.length){
+      await status(env,{state:"needs_key",reason:"Custom webhook already exists; missing signing key",id:existing[0].id});
+      return {status:"needs_existing_signing_key"};
+    }
+    const res=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
+      method:"POST",headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
+      body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"GRAPHQL",name:"MS007 USDT Spender Approval Seconds",
+        webhook_url:url,graphql_query:approvalQuery(spenders)})
+    });
+    const body=await res.json(),created=body?.data||body;
+    if(!res.ok||!created?.id||!created?.signing_key)
+      throw Error("Alchemy custom webhook rejected HTTP "+res.status+": "+String(body?.message||body?.error||"invalid result").slice(0,180));
+    await persistSecret(env,"ALCHEMY_APPROVAL_SIGNING_KEY",created.signing_key);
+    await persistSecret(env,"ALCHEMY_APPROVAL_WEBHOOK_ID",created.id);
+    env.ALCHEMY_APPROVAL_WEBHOOK_ID=created.id;
+    env.ALCHEMY_APPROVAL_SIGNING_KEY=created.signing_key;
+    await status(env,{state:created.is_active===false?"created_inactive":"active",id:created.id,
+      spender_count:spenders.length,active:created.is_active});
+    return {status:"created",active:created.is_active};
+  }catch(e){
+    await status(env,{state:"error",reason:String(e.message||e).slice(0,210)});
+    await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('approval_realtime_retry_after',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+      .bind(String(Date.now()+15*60*1000)).run();
+    console.warn("Realtime Approval webhook provisioning",String(e));
+    return {status:"error"};
+  }finally{
+    await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK).run();
+  }
+}
+export function parseApprovalWebhook(payload){
+  if(payload?.type!=="GRAPHQL")throw Error("Unexpected Alchemy realtime event type");
+  const block=payload.event?.data?.block;
+  if(!block||!Array.isArray(block.logs))throw Error("Invalid GraphQL approval payload");
+  const number=typeof block.number==="string"&&block.number.startsWith("0x")?Number(BigInt(block.number)):Number(block.number);
+  if(!Number.isSafeInteger(number)||number<0)throw Error("Missing block number");
+  const result=[];
+  for(const item of block.logs){
+    const topics=item.topics||[];
+    if(addr(item.account?.address)!==USDT||String(topics[0]).toLowerCase()!==APPROVAL_TOPIC||topics.length<3)continue;
+    const spender=fromTopic(topics[2]);
+    if(!spender)continue;
+    const hash=String(item.transaction?.hash||"").toLowerCase();
+    if(!/^0x[0-9a-f]{64}$/.test(hash))continue;
+    const idx=typeof item.index==="string"&&item.index.startsWith("0x")?Number(BigInt(item.index)):Number(item.index);
+    if(!Number.isSafeInteger(idx)||idx<0)throw Error("Invalid approval log index");
+    result.push({spender,log:{address:USDT,topics,transactionHash:hash,logIndex:"0x"+idx.toString(16),
+      blockNumber:"0x"+number.toString(16),data:item.data||"0x0"}});
+  }
+  return result;
+}
+export async function processRealtimeApprovalWebhook(env,payload){
+  if(payload.webhookId!==env.ALCHEMY_APPROVAL_WEBHOOK_ID)throw Error("Unexpected approval webhook ID");
+  let n=0;
+  for(const {spender,log} of parseApprovalWebhook(payload)){
+    await processRealtimeApproval(env,spender,log);
+    n++;
+  }
+  return n;
+}
