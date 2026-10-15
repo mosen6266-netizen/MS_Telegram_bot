@@ -12,10 +12,11 @@ const newFiles=[
  "20261015_outbox_sending_lease.sql",
  "20261015_subscription_sources.sql",
  "20261016_spender_generation_fence.sql",
- "20261017_admin_list_indexes.sql"
+ "20261017_admin_list_indexes.sql",
+ "20261018_queue_dead_letters.sql"
 ];
 const baseFiles=migrationFiles.filter(x=>!newFiles.includes(x));
-assert.equal(newFiles.length,5);
+assert.equal(newFiles.length,6);
 for(const file of newFiles)assert.ok(migrationFiles.includes(file),file+" is required");
 
 async function applyFile(db,file){
@@ -80,6 +81,8 @@ test("upgrade preserves live wallet monitoring, Telegram subscriptions, pending 
   assert.ok((await schema("spender_rules")).includes("generation"));
   assert.ok((await schema("spender_history_jobs")).includes("generation"));
   assert.ok((await schema("subscription_sources")).includes("source_type"));
+  assert.ok((await schema("queue_dead_letters")).includes("queue_message_id"));
+  assert.equal((await db.prepare("SELECT COUNT(*) n FROM queue_dead_letters").first()).n,0);
   const missingFks=(await db.prepare("PRAGMA foreign_key_check").all()).results||[];
   assert.deepEqual(missingFks,[],"upgrade must not break relational integrity");
   const indexes=(await db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all()).results.map(x=>x.name);
