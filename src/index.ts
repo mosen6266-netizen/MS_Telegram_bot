@@ -5,7 +5,7 @@ import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history";
 import {enrollHistoricalOwners} from "./spender-enroll";
 import {maybeReconcileAlchemy} from "./alchemy-reconcile";
-import {retryPendingWatchRemovals} from "./watch-maintenance";
+import {retryPendingWatchRemovals,selectStandalonePendingWatches} from "./watch-maintenance";
 import {processActivity} from "./transfers";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
@@ -15,7 +15,7 @@ import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 import {finishAddressQueryCleanup,flushMessageCleanup} from "./cleanup";
 async function cron(env){
   await recoverStuck(env);
-  const {results:pending}=await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
+  const pending=await selectStandalonePendingWatches(env.DB,8);
   for(const p of pending||[]){
     if(await ensureWatch(env,p.address))await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
   }
