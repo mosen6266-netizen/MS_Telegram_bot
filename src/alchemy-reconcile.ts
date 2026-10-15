@@ -61,18 +61,6 @@ async function actualAddresses(env){
   throw Error("Alchemy address pagination exceeds the safe limit");
 }
 
-async function markUnsynced(db,addresses){
-  for(let i=0;i<addresses.length;i+=20){
-    const statements=[];
-    for(const address of addresses.slice(i,i+20)){
-      statements.push(db.prepare("UPDATE wallet_watches SET state='pending',last_error='Alchemy webhook address missing; retry queued',updated_at=CURRENT_TIMESTAMP WHERE address=? AND state='active'").bind(address));
-      statements.push(db.prepare("UPDATE subscriptions SET status='pending',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='active'").bind(address));
-      statements.push(db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error='Alchemy webhook address missing; retry queued',updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='active'").bind(address));
-    }
-    await db.batch(statements);
-  }
-}
-
 // Scheduled reconciliation is deliberately infrequent, paginated and bounded.
 // It first reads the webhook's actual subscribed addresses, then *adds only*
 // missing active watches, and verifies the result with a second read.
@@ -113,7 +101,9 @@ export async function reconcileAlchemyAddresses(env){
       }
       const after=await actualAddresses(env);
       const unresolved=missing.filter(a=>!after.has(a));
-      if(unresolved.length)await markUnsynced(db,unresolved);
+      // A temporarily inconsistent Alchemy listing is not grounds for
+      // pausing local watches. Keep RPC gap recovery and Telegram subscriptions
+      // active while retrying the external repair next cycle.
       const report={status:unresolved.length?"incomplete":"repaired",expected:expected.length,actual:actual.size,missing_before:missing.length,missing_after:unresolved.length,checked_at:new Date().toISOString()};
       await save(db,RESULT,JSON.stringify(report));
       await save(db,NEXT,Date.now()+(unresolved.length?ERROR_DELAY:OK_DELAY));
