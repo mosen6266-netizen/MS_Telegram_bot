@@ -144,3 +144,44 @@ test("wallet restore has not-found and idempotent responses with no write",async
  assert.equal(current.status,200);assert.equal(current.body.already_restored,true);
  assert.equal(st.writes.length,0);
 });
+
+
+test("search escapes SQL LIKE wildcard characters rather than matching every wallet",async()=>{
+ const {readFileSync}=await import("node:fs");
+ const {runInNewContext}=await import("node:vm");
+ const admin=readFileSync("src/admin.ts","utf8");
+ const expression=admin.match(/const literalSearch=s=>[^;]+;/)?.[0];
+ assert.ok(expression,"literal search escape helper must exist");
+ const fn=runInNewContext(expression+"\nliteralSearch");
+ assert.equal(fn("0xABC"),"%0xABC%");
+ assert.equal(fn("%_~"),"%~%~_~~%");
+ assert.match(admin,/LIKE \? ESCAPE '~'/);
+});
+
+test("admin action click guard ignores repeated clicks until async work settles",async()=>{
+ const {readFileSync}=await import("node:fs");
+ const {runInNewContext}=await import("node:vm");
+ const src=readFileSync("src/admin-ui.ts","utf8");
+ const html=JSON.parse(src.slice(src.indexOf("=")+1).trim().replace(/;$/,""));
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)?.[1]||"";
+ const begin=script.indexOf("function action(p,name,fn,style)");
+ const end=script.indexOf("function table(",begin);
+ assert.ok(begin>=0&&end>begin);
+ const calls=[];
+ const action=runInNewContext(script.slice(begin,end)+"\naction",{
+  put:(_p,x)=>x,node:()=>({dataset:{},disabled:false,isConnected:true}),
+  err:e=>{throw e},Promise
+ });
+ let complete;
+ const button=action(null,"保存",()=>{calls.push(1);return new Promise(resolve=>{complete=resolve})});
+ button.onclick();button.onclick();button.onclick();
+ assert.equal(calls.length,1);
+ assert.equal(button.disabled,true);
+ complete();
+ await new Promise(resolve=>setTimeout(resolve,0));
+ assert.equal(button.disabled,false);
+ button.onclick();
+ assert.equal(calls.length,2);
+ complete();
+ await new Promise(resolve=>setTimeout(resolve,0));
+});
