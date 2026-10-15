@@ -5,6 +5,7 @@ import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
 import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources,listLegacySubscriptions} from "./subscription-sources";
 import {requeueFailedOutbox,listOutboxPage,acknowledgeUnknownOutbox} from "./outbox-operations";
+import {listDeadLetters,reviewDeadLetter} from "./queue-dead-letters";
 import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
@@ -337,6 +338,19 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","acknowledge_uncertain_outbox",String(result.task.id),
       {chat:result.task.chat_id,template:result.task.template_key});
     return json({ok:true,note:"该通知已标记为人工核查完成，不会重新发送，也未被错误标记为已送达。"});
+  }
+  if(method==="GET"&&path==="/api/dead-letters"){
+    const q=new URL(req.url).searchParams;
+    const result=await listDeadLetters(env.DB,{page:q.get("page"),state:q.get("state")||"needs_review"});
+    if(result.error)return bad("死信状态筛选无效",result.status);
+    return json(result);
+  }
+  if(method==="POST"&&path==="/api/dead-letters/review"){
+    const d=await body(req);
+    const result=await reviewDeadLetter(env.DB,Number(d.id));
+    if(result.error)return bad("死信记录不存在或已核查",result.status);
+    await audit(env,"admin","review_dead_letter",String(result.task.id),{kind:result.task.kind});
+    return json({ok:true,note:"死信记录已标记人工核查完成；不会自动重新执行任务。"});
   }
   if(method==="GET"&&path==="/api/outbox"){
     const q=new URL(req.url).searchParams;
