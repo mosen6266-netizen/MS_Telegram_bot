@@ -56,7 +56,7 @@ export async function handleAdmin(req,env,path){
     const groups=[...new Set((Array.isArray(d.chat_ids)?d.chat_ids:[]).map(String).filter(x=>/^-?\d+$/.test(x)))];
     if(!groups.length)return bad("必须选择至少一个 Telegram 群组");
     for(const chat of groups)if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("未登记的群组："+chat);
-    await addSpender(env,a,String(d.remark||"Spender "+short(a)).slice(0,80),groups);
+    await addSpender(await configEnv(env),a,String(d.remark||"Spender "+short(a)).slice(0,80),groups);
     await audit(env,"admin","create_spender",a,{groups});
     return json({ok:true,mode:"new_approvals_only",note:"只监控新授权 Owner 的资金，不自动监控 Spender 自身。"});
   }
