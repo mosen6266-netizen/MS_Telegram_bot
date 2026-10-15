@@ -908,7 +908,7 @@ async function recordSpenderLiveApproval(env, spender, log, amount) {
   if (stamp) await historyTimeStmt(env, spender, owner, block, stamp).run();
   await env.DB.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND latest_event_block<=?").bind(amount.toString(), amount > 0n ? "active" : "revoked", spender, owner, block).run();
 }
-async function fetchHistoryRange(env, spender, from, to) {
+async function fetchHistoryRange(env, spender, from, to, page = 1) {
   if (!env.ETHERSCAN_API_KEY) throw Error("Etherscan V2 API Key \u672A\u914D\u7F6E");
   const q = new URLSearchParams({
     chainid: "1",
@@ -920,7 +920,7 @@ async function fetchHistoryRange(env, spender, from, to) {
     topic0: APPROVAL_TOPIC,
     topic2: toTopic(spender),
     topic0_2_opr: "and",
-    page: "1",
+    page: String(page),
     offset: String(HISTORY_PAGE_SIZE),
     apikey: env.ETHERSCAN_API_KEY
   });
@@ -947,8 +947,15 @@ async function scanSpenderHistories(env) {
     const window = Math.max(1, Math.min(HISTORY_WINDOW, Number(job.window_size) || HISTORY_WINDOW));
     const end = Math.min(cutoff, begin + window - 1);
     const logs = await fetchHistoryRange(env, job.spender, begin, end);
-    if (logs.length >= HISTORY_PAGE_SIZE) {
-      if (end === begin) throw Error("\u5355\u4E2A\u533A\u5757\u6388\u6743\u4E8B\u4EF6\u8D85\u51FA\u63A5\u53E3\u8FD4\u56DE\u4E0A\u9650\uFF1B\u9700\u8981\u5206\u9875\u68C0\u7D22\uFF0C\u4E0D\u4F1A\u8DF3\u8FC7\u6B64\u533A\u5757");
+    if (end === begin && logs.length >= HISTORY_PAGE_SIZE) {
+      for (let page = 2; page <= 20; page++) {
+        const extra = await fetchHistoryRange(env, job.spender, begin, end, page);
+        logs.push(...extra);
+        if (extra.length < HISTORY_PAGE_SIZE) break;
+        if (page === 20) throw Error("\u5355\u533A\u5757\u6388\u6743\u8BB0\u5F55\u8D85\u8FC7\u5B89\u5168\u5206\u9875\u4E0A\u9650\uFF1B\u7B49\u5F85\u4EBA\u5DE5\u68C0\u67E5\uFF0C\u4E0D\u8DF3\u8FC7\u533A\u5757");
+      }
+    }
+    if (end !== begin && logs.length >= HISTORY_PAGE_SIZE) {
       await env.DB.prepare("UPDATE spender_history_jobs SET state='scanning',window_size=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(Math.max(1, Math.floor(window / 2)), job.spender).run();
       return true;
     }
@@ -1233,13 +1240,18 @@ async function enrollHistoricalOwners(env, limit = ENROLL_BATCH) {
         const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
         const groups = (await db.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(spender).all()).results || [];
         if (!groups.length) throw Error("Spender \u672A\u8BBE\u7F6E\u901A\u77E5\u7FA4");
+        let hasActiveRoute = false;
         for (const group of groups) {
           const chat = String(group.chat_id);
-          if (!await db.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()) continue;
+          const registered = await db.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+          if (!registered?.active || !["group", "supergroup"].includes(registered.chat_type)) continue;
           await db.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, owner, remark).run();
+          const subscription = await db.prepare("SELECT status FROM subscriptions WHERE chat_id=? AND address=?").bind(chat, owner).first();
+          if (subscription && ["active", "pending"].includes(subscription.status)) hasActiveRoute = true;
         }
-        const state = await db.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
-        if (state?.state === "active") {
+        if (!hasActiveRoute) throw Error("\u672A\u627E\u5230\u53EF\u7528\u7684\u7FA4\u7EC4\u8BA2\u9605\uFF1B\u9700\u8981\u68C0\u67E5\u7FA4\u7EC4\u542F\u7528\u72B6\u6001\u6216\u624B\u52A8\u6062\u590D\u5DF2\u79FB\u9664\u7684\u8BA2\u9605");
+        const state2 = await db.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
+        if (state2?.state === "active") {
           await db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner, spender).run();
           await db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
         } else toSync.push({ spender, owner });
@@ -1307,6 +1319,111 @@ async function enrollHistoricalOwners(env, limit = ENROLL_BATCH) {
     }
   } finally {
     await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK_KEY).run();
+  }
+}
+
+// src/alchemy-reconcile.ts
+var PREFIX = "alchemy_address_reconcile_";
+var LOCK = PREFIX + "lock";
+var NEXT = PREFIX + "next_at";
+var RESULT = PREFIX + "result";
+var OK_DELAY = 60 * 60 * 1e3;
+var ERROR_DELAY = 15 * 60 * 1e3;
+async function state(db, key2) {
+  return (await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(key2).first())?.value;
+}
+async function save(db, key2, value) {
+  await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(key2, String(value)).run();
+}
+async function actualAddresses(env) {
+  const result = /* @__PURE__ */ new Set();
+  let cursor = null;
+  const cursors = /* @__PURE__ */ new Set();
+  for (let page = 0; page < 100; page++) {
+    const params = new URLSearchParams({ webhook_id: env.ALCHEMY_ACTIVITY_WEBHOOK_ID, limit: "100" });
+    if (cursor) params.set("after", cursor);
+    const response = await fetch("https://dashboard.alchemy.com/api/webhook-addresses?" + params, {
+      headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Accept": "application/json" }
+    });
+    if (!response.ok) throw Error("Alchemy address list HTTP " + response.status);
+    const body2 = await response.json();
+    if (!Array.isArray(body2?.data)) throw Error("Alchemy address list response malformed");
+    for (const raw of body2.data) {
+      if (typeof raw !== "string" || !/^0x[0-9a-f]{40}$/i.test(raw)) throw Error("Alchemy returned an invalid address");
+      result.add(raw.toLowerCase());
+    }
+    const next = body2.pagination?.cursors?.after;
+    if (!next) {
+      const total = Number(body2.pagination?.total_count);
+      if (Number.isFinite(total) && total > result.size) throw Error("Alchemy address pagination incomplete");
+      return result;
+    }
+    if (typeof next !== "string" || cursors.has(next)) throw Error("Alchemy address pagination cursor repeated");
+    cursors.add(next);
+    cursor = next;
+  }
+  throw Error("Alchemy address pagination exceeds the safe limit");
+}
+async function markUnsynced(db, addresses) {
+  for (let i = 0; i < addresses.length; i += 20) {
+    const statements = [];
+    for (const address of addresses.slice(i, i + 20)) {
+      statements.push(db.prepare("UPDATE wallet_watches SET state='pending',last_error='Alchemy webhook address missing; retry queued',updated_at=CURRENT_TIMESTAMP WHERE address=? AND state='active'").bind(address));
+      statements.push(db.prepare("UPDATE subscriptions SET status='pending',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='active'").bind(address));
+      statements.push(db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error='Alchemy webhook address missing; retry queued',updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='active'").bind(address));
+    }
+    await db.batch(statements);
+  }
+}
+async function reconcileAlchemyAddresses(env) {
+  const db = env.DB;
+  if (Number(await state(db, NEXT) || 0) > Date.now()) return { skipped: "not_due" };
+  const lock = await db.prepare("INSERT OR IGNORE INTO runtime_state(key,value) VALUES(?,?)").bind(LOCK, String(Date.now())).run();
+  if (!lock.meta?.changes) {
+    const since = Number(await state(db, LOCK) || 0);
+    if (since && Date.now() - since > 5 * 60 * 1e3) await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK).run();
+    return { skipped: "running" };
+  }
+  let missing = [];
+  try {
+    await save(db, NEXT, Date.now() + ERROR_DELAY);
+    if (!env.ALCHEMY_NOTIFY_TOKEN || !env.ALCHEMY_ACTIVITY_WEBHOOK_ID) throw Error("Alchemy webhook credentials not configured");
+    const rows = (await db.prepare(
+      "SELECT w.address FROM wallet_watches w WHERE w.state='active' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status='active')"
+    ).all()).results || [];
+    const expected = [...new Set(rows.map((r) => String(r.address).toLowerCase()))];
+    const actual = await actualAddresses(env);
+    missing = expected.filter((a) => !actual.has(a));
+    if (missing.length) {
+      for (let i = 0; i < missing.length; i += 50) {
+        const addresses = missing.slice(i, i + 50);
+        const res = await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses", {
+          method: "PATCH",
+          headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ webhook_id: env.ALCHEMY_ACTIVITY_WEBHOOK_ID, addresses_to_add: addresses, addresses_to_remove: [] })
+        });
+        if (!res.ok) throw Error("Alchemy address repair HTTP " + res.status);
+      }
+      const after = await actualAddresses(env);
+      const unresolved = missing.filter((a) => !after.has(a));
+      if (unresolved.length) await markUnsynced(db, unresolved);
+      const report2 = { status: unresolved.length ? "incomplete" : "repaired", expected: expected.length, actual: actual.size, missing_before: missing.length, missing_after: unresolved.length, checked_at: (/* @__PURE__ */ new Date()).toISOString() };
+      await save(db, RESULT, JSON.stringify(report2));
+      await save(db, NEXT, Date.now() + (unresolved.length ? ERROR_DELAY : OK_DELAY));
+      return report2;
+    }
+    const report = { status: "verified", expected: expected.length, actual: actual.size, missing_before: 0, missing_after: 0, checked_at: (/* @__PURE__ */ new Date()).toISOString() };
+    await save(db, RESULT, JSON.stringify(report));
+    await save(db, NEXT, Date.now() + OK_DELAY);
+    return report;
+  } catch (e) {
+    const report = { status: "error", missing_identified: missing.length, reason: String(e.message || e).slice(0, 180), checked_at: (/* @__PURE__ */ new Date()).toISOString() };
+    await save(db, RESULT, JSON.stringify(report));
+    await save(db, NEXT, Date.now() + ERROR_DELAY);
+    console.warn("Alchemy webhook reconciliation", report.reason);
+    return report;
+  } finally {
+    await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK).run();
   }
 }
 
@@ -2158,6 +2275,11 @@ async function cron(env) {
     await enrollHistoricalOwners(env, 20);
   } catch (e) {
     console.error("Historical monitoring enrollment", String(e));
+  }
+  try {
+    await reconcileAlchemyAddresses(env);
+  } catch (e) {
+    console.error("Alchemy address reconciliation", String(e));
   }
   try {
     await scanWalletGaps(env, 3);
