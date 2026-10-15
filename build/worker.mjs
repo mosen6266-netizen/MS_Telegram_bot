@@ -2059,12 +2059,19 @@ async function handleAdmin(req, env, path) {
   if (method === "POST" && path === "/api/wallets") {
     const d = await body(req), a = addr(d.address);
     if (!a) return bad("\u65E0\u6548\u7684 Ethereum \u5730\u5740");
+    const chat = d.chat_id === void 0 ? "" : String(d.chat_id).trim();
+    const existing = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(a).first();
+    if (await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(a).first() || existing?.deleted_at)
+      return bad("\u8BE5\u94B1\u5305\u5DF2\u88AB\u7BA1\u7406\u5458\u79FB\u9664\uFF1B\u8BF7\u5148\u6062\u590D\u6863\u6848\u540E\u518D\u91CD\u65B0\u6838\u9A8C", 409);
+    if (chat) {
+      const target = await env.DB.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+      if (!target || !target.active || !["group", "supergroup"].includes(target.chat_type))
+        return bad("\u7FA4\u7EC4\u5C1A\u672A\u767B\u8BB0\u6216\u5DF2\u505C\u7528\uFF1B\u8BF7\u5148\u5C06\u673A\u5668\u4EBA\u52A0\u5165\u4E00\u4E2A\u6709\u6548\u7684 Telegram \u7FA4");
+    }
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
-    if (d.chat_id) {
-      const chat = String(d.chat_id);
-      if (!await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()) return bad("\u673A\u5668\u4EBA\u5FC5\u987B\u5148\u52A0\u5165\u8FD9\u4E2A Telegram \u7FA4\u7EC4");
+    if (chat) {
       const remark = await walletRemark(env, a, String(d.remark || "\u5F85\u6838\u9A8C \xB7 " + short(a)).trim().slice(0, 80));
-      await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, a, remark).run();
+      await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END,updated_at=CURRENT_TIMESTAMP").bind(chat, a, remark).run();
       await env.TASKS.send({ kind: "verify_admin", owner: a, chat_id: chat });
     }
     await audit(env, "admin", "create_wallet", a);
@@ -2095,10 +2102,16 @@ async function handleAdmin(req, env, path) {
   if (method === "POST" && path === "/api/spenders") {
     const d = await body(req), a = addr(d.spender);
     if (!a) return bad("Spender \u5730\u5740\u65E0\u6548");
-    const groups = [...new Set((Array.isArray(d.chat_ids) ? d.chat_ids : []).map(String).filter((x) => /^-?\d+$/.test(x)))];
-    if (!groups.length) return bad("\u5FC5\u987B\u9009\u62E9\u81F3\u5C11\u4E00\u4E2A Telegram \u7FA4\u7EC4");
-    for (const chat of groups) if (!await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()) return bad("\u672A\u767B\u8BB0\u7684\u7FA4\u7EC4\uFF1A" + chat);
-    await addSpender(await configEnv(env), a, String(d.remark || "Spender " + short(a)).slice(0, 80), groups);
+    if (!Array.isArray(d.chat_ids)) return bad("\u8BF7\u586B\u5199\u901A\u77E5\u7FA4 ID \u5217\u8868");
+    const groups = [...new Set(d.chat_ids.map((x) => String(x).trim()))];
+    if (!groups.length || groups.some((x) => !/^\-\d{5,20}$/.test(x))) return bad("\u8BF7\u586B\u5199\u81F3\u5C11\u4E00\u4E2A\u6709\u6548\u7684 Telegram \u7FA4 ID");
+    for (const chat of groups) {
+      const target = await env.DB.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+      if (!target || !target.active || !["group", "supergroup"].includes(target.chat_type)) return bad("\u901A\u77E5\u7FA4\u5C1A\u672A\u767B\u8BB0\u3001\u5DF2\u505C\u7528\u6216\u4E0D\u662F\u7FA4\u7EC4\uFF1A" + chat);
+    }
+    const label = String(d.remark || "Spender " + short(a)).trim();
+    if (!label || Array.from(label).length > 80 || /[\u0000-\u001f\u007f]/.test(label)) return bad("\u5907\u6CE8\u987B\u4E3A 1\u201380 \u4E2A\u5B57\u7B26");
+    await addSpender(await configEnv(env), a, label, groups);
     await startSpenderHistory(env, a);
     await audit(env, "admin", "create_spender", a, { groups });
     return json({ ok: true, mode: "history_and_new_approvals", note: "\u5386\u53F2\u4E0A\u6388\u6743\u8FC7\u6B64 Spender \u7684 Owner \u5C06\u9010\u6B65\u52A0\u5165\u76D1\u63A7\uFF1B\u4E0D\u81EA\u52A8\u76D1\u63A7 Spender \u81EA\u8EAB\u3002" });
@@ -2218,18 +2231,23 @@ async function handleAdmin(req, env, path) {
     if (!a || !/^-?\d+$/.test(chat)) return bad("\u65E0\u6548\u8BA2\u9605\u5730\u5740\u6216\u7FA4\u7EC4");
     const old = await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a, chat).first();
     if (!old) return bad("\u8BA2\u9605\u4E0D\u5B58\u5728", 404);
-    if (d.remark !== void 0) {
-      const text = String(d.remark).trim();
-      if (!text || Array.from(text).length > 80) return bad("\u5907\u6CE8\u957F\u5EA6\u4E3A 1\u201380 \u5B57\u7B26");
-      await saveWalletRemark(env, a, text);
-      await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat, a, "admin", old.remark, text).run();
-    }
-    if (d.status !== void 0) {
-      if (!["active", "paused", "removed"].includes(d.status)) return bad("\u72B6\u6001\u65E0\u6548");
-      if (d.status === "active" && (await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state !== "active") {
+    const nextRemark = d.remark === void 0 ? void 0 : String(d.remark).trim();
+    if (nextRemark !== void 0 && (!nextRemark || Array.from(nextRemark).length > 80 || /[\u0000-\u001f\u007f]/.test(nextRemark)))
+      return bad("\u5907\u6CE8\u957F\u5EA6\u987B\u4E3A 1\u201380 \u5B57\u7B26\u4E14\u4E0D\u80FD\u5305\u542B\u63A7\u5236\u5B57\u7B26");
+    if (d.status !== void 0 && !["active", "paused", "removed"].includes(d.status)) return bad("\u72B6\u6001\u65E0\u6548");
+    if (d.status === "active") {
+      if (await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(a).first() || (await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(a).first())?.deleted_at)
+        return bad("\u8BE5\u94B1\u5305\u5DF2\u5168\u5C40\u79FB\u9664\uFF0C\u5FC5\u987B\u5148\u7531\u7BA1\u7406\u5458\u6062\u590D\u6863\u6848", 409);
+      if ((await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(a).first())?.state !== "active") {
         if (!["paused", "removed"].includes(old.status)) return bad("\u8BE5\u5730\u5740\u5C1A\u672A\u5B8C\u6210\u6709\u6548 USDT \u6388\u6743\u6838\u9A8C", 409);
         if (!await ensureWatch(await configEnv(env), a)) return bad("Alchemy \u76D1\u63A7\u8BA2\u9605\u4ECD\u672A\u5B8C\u6210\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5", 409);
       }
+    }
+    if (nextRemark !== void 0) {
+      await saveWalletRemark(env, a, nextRemark);
+      await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat, a, "admin", old.remark, nextRemark).run();
+    }
+    if (d.status !== void 0) {
       await env.DB.prepare("UPDATE subscriptions SET status=?,updated_at=? WHERE chat_id=? AND address=?").bind(d.status, now(), chat, a).run();
       if (d.status === "removed" || d.status === "paused") {
         const still = (await env.DB.prepare("SELECT count(*) n FROM subscriptions WHERE address=? AND status='active'").bind(a).first())?.n || 0;
