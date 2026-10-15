@@ -94,7 +94,7 @@ test("outbox insert failure is repaired on retry after event was saved",async()=
 test("same USDT log from webhook and recovery receives one notice",async()=>{
   const {db,context}=fixture();
   const webhook=token(USDT,"token");
-  const replay={...token(USDT,"erc20"),log:undefined,uniqueId:h+":2",rawContract:{address:USDT,value:"0x7270e0"}};
+  const replay={...token(USDT,"erc20"),log:undefined,uniqueId:h+":log:2",rawContract:{address:USDT,value:"0x7270e0"}};
   await processActivity(context,{event:{network:"ETH_MAINNET",activity:[webhook]}});
   await processActivity(context,{network:"ETH_MAINNET",event:{activity:[replay]}});
   assert.equal(db.events.size,1);
