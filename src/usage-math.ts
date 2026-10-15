@@ -63,20 +63,26 @@ function nonnegative(value: unknown, name: string) {
 
 export function parseAlchemySummary(response: unknown) {
   const data = (response as {data?: Record<string, any>})?.data;
-  if (!data?.billingPeriod || !data?.usageLimit) throw Error("Alchemy 用量响应不完整");
+  const limitData = data?.usageLimit;
+  const total = data?.totals?.monthToDate;
+  if (!data?.billingPeriod || !limitData && !total) throw Error("Alchemy 用量响应不完整");
+  if (limitData ? limitData.unit && limitData.unit !== "CU" : !["CU", "ALCHEMY_COMPUTE_UNIT"].includes(total?.unit))
+    throw Error("Alchemy 返回了非 CU 用量，不能用于 CU 额度预警");
   const start = new Date(data.billingPeriod.startTime);
   const end = new Date(data.billingPeriod.endTime);
   const observed = new Date(data.freshness?.dataThrough);
   if (![+start, +end, +observed].every(Number.isFinite) || end <= start)
     throw Error("Alchemy 未返回有效的账期或数据时间");
-  const used = nonnegative(data.usageLimit.used, "Alchemy CU");
-  const limit = data.usageLimit.limit === null ? null : nonnegative(data.usageLimit.limit, "Alchemy 额度");
+  const used = nonnegative(limitData ? limitData.used : total.amount, "Alchemy CU");
+  const limit = !limitData || limitData.limit === null ? null : nonnegative(limitData.limit, "Alchemy 额度");
   const usd = data.totals?.monthToDate?.usd;
   return {
     metric: "alchemy_cu", used, quota: limit && limit > 0 ? limit : null,
     unit: "CU", period_start: start.toISOString(), period_end: end.toISOString(),
     observed_at: observed.toISOString(), source: "official_api", scope: "Alchemy 整个团队",
-    extra: {usd: usd === undefined ? null : nonnegative(usd, "Alchemy 费用")}
+    extra: {usd: usd === undefined ? null : nonnegative(usd, "Alchemy 费用"),
+      quota_source: limitData ? "official_api" : "not_returned",
+      note: limitData ? "平台聚合数据可能有延迟" : "官方 API 未返回额度，请按当前套餐确认 CU 额度"}
   };
 }
 

@@ -128,10 +128,10 @@ export async function handleAdmin(req,env,path){
     const d=await body(req);
     const allowed=Object.fromEntries(USAGE_METERS.map(x=>[x.metric,x.name]));
     if(!allowed[d.metric]||!["daily","monthly"].includes(d.period)||!Number.isSafeInteger(d.quota)||d.quota<1)return bad("配额参数无效");
-    if(d.metric==="alchemy_cu")return bad("Alchemy 额度由官方 Usage API 返回，无需手动覆盖");
-    await env.DB.prepare("INSERT INTO usage_limits(metric,platform,unit,quota,period) VALUES(?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET quota=excluded.quota,unit=excluded.unit,period=excluded.period,updated_at=CURRENT_TIMESTAMP").bind(d.metric,allowed[d.metric],USAGE_METERS.find(x=>x.metric===d.metric).unit,d.quota,d.period).run();
+    if(d.metric==="alchemy_cu"&&d.period!=="monthly")return bad("Alchemy CU 额度按官方月账期计算，请选择每月");
+    await env.DB.prepare("INSERT INTO usage_limits(metric,platform,unit,quota,period,source) VALUES(?,?,?,?,?,'configured_quota') ON CONFLICT(metric) DO UPDATE SET quota=excluded.quota,unit=excluded.unit,period=excluded.period,source=excluded.source,updated_at=CURRENT_TIMESTAMP").bind(d.metric,allowed[d.metric],USAGE_METERS.find(x=>x.metric===d.metric).unit,d.quota,d.period).run();
     await audit(env,"admin","update_usage_limit",d.metric,{quota:d.quota});
-    return json({ok:true,source:"internal_estimate"});
+    return json({ok:true,source:"configured_quota"});
   }
   return bad("Unknown admin route",404);
 }

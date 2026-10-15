@@ -64,6 +64,14 @@ async function collectAlchemy(env:Env){
   if(!env.ALCHEMY_USAGE_TOKEN)throw Error("待配置 Alchemy Usage read 只读访问 Key；RPC / Notify Key 不能读取用量");
   const body=await requestJson("https://admin-api.alchemy.com/v1/usage/summary",{headers:{Authorization:"Bearer "+env.ALCHEMY_USAGE_TOKEN}},"Alchemy");
   const data=parseAlchemySummary(body);
+  if(data.extra.quota_source==="not_returned"){
+    const limit=await env.DB.prepare("SELECT quota,period FROM usage_limits WHERE metric='alchemy_cu'").first<Limit>();
+    if(limit?.period==="monthly"&&Number.isFinite(limit.quota)&&limit.quota>0){
+      data.quota=limit.quota;
+      data.extra.quota_source="configured_plan";
+      data.extra.note="已用量来自官方 API；额度采用已确认的账号套餐基准，套餐变更后请更新";
+    }
+  }
   await storeSample(env,{...data,extra_json:JSON.stringify(data.extra)});
 }
 async function cfDay(env:Env,day:string){

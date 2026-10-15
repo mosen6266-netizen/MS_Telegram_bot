@@ -40,9 +40,18 @@ const cfBody=()=>({data:{viewer:{accounts:[{
 function alchemyBody(used=900){
   const period=monthPeriod(new Date());
   return {data:{billingPeriod:{startTime:period.start,endTime:period.end},
-    usageLimit:{used:String(used),limit:"1000"},freshness:{dataThrough:new Date().toISOString()},
-    totals:{monthToDate:{usd:"0.00"}}}};
+    usageLimit:{used:String(used),limit:"1000",unit:"CU"},freshness:{dataThrough:new Date().toISOString()},
+    totals:{monthToDate:{amount:String(used),unit:"ALCHEMY_COMPUTE_UNIT",usd:"0.00"}}}};
 }
+test("Alchemy responses without usageLimit preserve official totals without inventing a quota",()=>{
+  const body=alchemyBody(8766);delete body.data.usageLimit;
+  const parsed=parseAlchemySummary(body);
+  assert.equal(parsed.used,8766);
+  assert.equal(parsed.quota,null);
+  assert.equal(parsed.extra.quota_source,"not_returned");
+  body.data.totals.monthToDate.unit="USD";
+  assert.throws(()=>parseAlchemySummary(body),/非 CU/);
+});
 test("official response parsers reject missing data, negatives and partial GraphQL failures",()=>{
   assert.equal(parseCloudflareDay(cfBody()).workers_cpu_ms,3162.519);
   assert.throws(()=>parseCloudflareDay({data:{viewer:{accounts:[{}]}}}));
@@ -64,7 +73,12 @@ test("real D1: collect, preserve failed samples, deduplicate alerts and retry de
   globalThis.fetch=async(url,options)=>{
     const target=String(url);
     if(target==="https://api.cloudflare.com/client/v4/graphql")return Response.json(mode==="cf-error"?{errors:[{message:"denied"}]}:cfBody());
-    if(target==="https://admin-api.alchemy.com/v1/usage/summary")return Response.json(alchemyBody());
+    if(target==="https://admin-api.alchemy.com/v1/usage/summary"){
+      const response=alchemyBody();
+      if(mode==="alchemy-no-limit")delete response.data.usageLimit;
+      if(mode==="alchemy-unlimited")response.data.usageLimit.limit=null;
+      return Response.json(response);
+    }
     if(target==="https://api.github.com/repos/mosen6266-netizen/MS_Telegram_bot")return mode==="github-error"?Response.json({message:"rate limited"},{status:429}):Response.json({private:false});
     if(target.startsWith("https://api.telegram.org/bot")){
       sends++;
@@ -139,6 +153,26 @@ test("real D1: collect, preserve failed samples, deduplicate alerts and retry de
     rows=await implementation.usageSnapshot(env);
     assert.equal(rows.find(x=>x.metric==="github_actions").status,"error");
     assert.match(rows.find(x=>x.metric==="github_actions").note,/HTTP 429/);
+
+    mode="alchemy-no-limit";
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").used,900);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").quota,null);
+    await DB.prepare("INSERT INTO usage_limits(metric,platform,unit,quota,period) VALUES('alchemy_cu','Alchemy','CU',2000,'monthly')").run();
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").quota,2000);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").extra.quota_source,"configured_plan");
+    mode="ok";
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").quota,1000);
+    mode="alchemy-unlimited";
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").quota,null);
+    assert.equal(rows.find(x=>x.metric==="alchemy_cu").extra.quota_source,"official_api");
 
     env.CF_ANALYTICS_API_TOKEN="";env.ALCHEMY_USAGE_TOKEN="";
     await implementation.collectUsage(env,true);
