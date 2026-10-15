@@ -1158,43 +1158,121 @@ async function processApproval(env, rule, log) {
 }
 
 // src/spender-enroll.ts
-async function enrollHistoricalOwners(env, limit = 8) {
-  await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=COALESCE(synced_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE state IN ('retrying','pending','running') AND EXISTS (SELECT 1 FROM wallet_watches w WHERE w.address=spender_history_monitor_enrollments.owner AND w.state='active') AND EXISTS (SELECT 1 FROM subscriptions s JOIN spender_routes r ON r.chat_id=s.chat_id AND r.spender=spender_history_monitor_enrollments.spender WHERE s.address=spender_history_monitor_enrollments.owner AND s.status='active') AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=spender_history_monitor_enrollments.owner)").run();
-  const { results: rows } = await env.DB.prepare(
-    "SELECT h.spender,h.owner FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 LEFT JOIN wallets w ON w.address=h.owner LEFT JOIN wallet_exclusions x ON x.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now','-90 seconds')) OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) ORDER BY h.first_seen_block ASC LIMIT ?"
-  ).bind(Math.max(1, Math.min(20, limit))).all();
-  for (const row of rows || []) {
-    const spender = row.spender, owner = row.owner;
-    try {
-      await env.DB.prepare("INSERT OR IGNORE INTO spender_history_monitor_enrollments(spender,owner,state) VALUES(?,?,'pending')").bind(spender, owner).run();
-      const claim = await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='running',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND (state='pending' OR (state='retrying' AND updated_at<datetime('now','-90 seconds')) OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(spender, owner).run();
-      if (!claim.meta?.changes) continue;
-      const excluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
-      const deleted = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
-      if (excluded || deleted?.deleted_at) {
-        await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='excluded',last_error='\u7BA1\u7406\u5458\u5DF2\u624B\u52A8\u79FB\u9664',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
-        continue;
-      }
-      await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender_history')").bind(owner).run();
-      const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
-      const chats = (await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(spender).all()).results || [];
-      if (!chats.length) throw Error("Spender \u5C1A\u672A\u7ED1\u5B9A\u901A\u77E5\u7FA4\u7EC4");
-      for (const rowChat of chats) {
-        if (!await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(String(rowChat.chat_id)).first()) continue;
-        await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(String(rowChat.chat_id), owner, remark).run();
-      }
-      const watch = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
-      const synced = watch?.state === "active" || await ensureWatch(env, owner);
-      if (!synced) {
-        const detail = await env.DB.prepare("SELECT last_error FROM wallet_watches WHERE address=?").bind(owner).first();
-        throw Error("Alchemy \u8BA2\u9605\u5931\u8D25\uFF1A" + String(detail?.last_error || "\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5").slice(0, 180));
-      }
-      await env.DB.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner, spender).run();
-      await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
-    } catch (e) {
-      console.error("Historical Owner enrollment", spender, owner, String(e));
-      await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(String(e.message || e).slice(0, 240), spender, owner).run();
+var ENROLL_BATCH = 20;
+var BACKOFF_KEY = "spender_enroll_retry_after";
+var LOCK_KEY = "spender_enroll_batch_lock";
+async function setEnrollmentCooldown(env, minutes) {
+  const until = String(Date.now() + minutes * 6e4);
+  await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(BACKOFF_KEY, until).run();
+}
+async function enrollHistoricalOwners(env, limit = ENROLL_BATCH) {
+  const db = env.DB;
+  await db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=COALESCE(synced_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE state IN ('retrying','pending','running') AND EXISTS (SELECT 1 FROM wallet_watches w WHERE w.address=spender_history_monitor_enrollments.owner AND w.state='active') AND EXISTS (SELECT 1 FROM subscriptions s JOIN spender_routes r ON r.chat_id=s.chat_id AND r.spender=spender_history_monitor_enrollments.spender WHERE s.address=spender_history_monitor_enrollments.owner AND s.status='active') AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=spender_history_monitor_enrollments.owner)").run();
+  const wait = await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(BACKOFF_KEY).first();
+  if (Number(wait?.value || 0) > Date.now()) return { cooldown: true, until: Number(wait.value) };
+  const lock = await db.prepare("INSERT OR IGNORE INTO runtime_state(key,value) VALUES(?,?)").bind(LOCK_KEY, now()).run();
+  if (!lock.meta?.changes) {
+    const old = await db.prepare("SELECT updated_at FROM runtime_state WHERE key=?").bind(LOCK_KEY).first();
+    if (old && Date.now() - (/* @__PURE__ */ new Date(old.updated_at + "Z")).getTime() > 3e5) {
+      await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK_KEY).run();
     }
+    return { busy: true };
+  }
+  try {
+    const query = "SELECT h.spender,h.owner FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 LEFT JOIN wallets w ON w.address=h.owner LEFT JOIN wallet_exclusions x ON x.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now','-90 seconds')) OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) ORDER BY h.first_seen_block ASC LIMIT ?";
+    const rows = (await db.prepare(query).bind(Math.max(1, Math.min(ENROLL_BATCH, limit))).all()).results || [];
+    if (!rows.length) return { processed: 0 };
+    const toSync = [];
+    for (const row of rows) {
+      const { spender, owner } = row;
+      try {
+        await db.prepare("INSERT OR IGNORE INTO spender_history_monitor_enrollments(spender,owner,state) VALUES(?,?,'pending')").bind(spender, owner).run();
+        const claimed = await db.prepare("UPDATE spender_history_monitor_enrollments SET state='running',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND (state='pending' OR (state='retrying' AND updated_at<datetime('now','-90 seconds')) OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(spender, owner).run();
+        if (!claimed.meta?.changes) continue;
+        const exclude = await db.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
+        const archived = await db.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
+        if (exclude || archived?.deleted_at) {
+          await db.prepare("UPDATE spender_history_monitor_enrollments SET state='excluded',last_error='\u7BA1\u7406\u5458\u5DF2\u624B\u52A8\u79FB\u9664',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
+          continue;
+        }
+        await db.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender_history')").bind(owner).run();
+        const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
+        const groups = (await db.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(spender).all()).results || [];
+        if (!groups.length) throw Error("Spender \u672A\u8BBE\u7F6E\u901A\u77E5\u7FA4");
+        for (const group of groups) {
+          const chat = String(group.chat_id);
+          if (!await db.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()) continue;
+          await db.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, owner, remark).run();
+        }
+        const state = await db.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
+        if (state?.state === "active") {
+          await db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner, spender).run();
+          await db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
+        } else toSync.push({ spender, owner });
+      } catch (e) {
+        const reason = String(e.message || e).slice(0, 210);
+        await db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(reason, spender, owner).run();
+      }
+    }
+    if (!toSync.length) return { processed: rows.length, alreadyWatched: true };
+    const unique = [...new Set(toSync.map((x) => x.owner))];
+    try {
+      if (!env.ALCHEMY_ACTIVITY_WEBHOOK_ID) {
+        const created = await ensureWatch(env, unique[0]);
+        if (!created) throw Error("Alchemy webhook \u521B\u5EFA\u5931\u8D25");
+        const one = unique.shift();
+        const matched = toSync.filter((x) => x.owner === one);
+        for (const row of matched) {
+          await db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(row.owner, row.spender).run();
+          await db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(row.spender, row.owner).run();
+        }
+      }
+      if (!unique.length) return { processed: rows.length };
+      if (!env.ALCHEMY_NOTIFY_TOKEN || !env.ALCHEMY_ACTIVITY_WEBHOOK_ID) throw Error("Alchemy Notify Token / Webhook ID \u672A\u914D\u7F6E");
+      const latest = await blockNumber(env);
+      const setup = [];
+      for (const owner of unique) {
+        setup.push(db.prepare("INSERT OR IGNORE INTO wallet_watches(address,state) VALUES(?,'pending')").bind(owner));
+        setup.push(db.prepare("INSERT OR IGNORE INTO wallet_checkpoints(address,last_block) VALUES(?,?)").bind(owner, Math.max(0, latest - 1)));
+      }
+      await db.batch(setup);
+      const res = await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses", {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN },
+        body: JSON.stringify({ webhook_id: env.ALCHEMY_ACTIVITY_WEBHOOK_ID, addresses_to_add: unique, addresses_to_remove: [] })
+      });
+      const body2 = await res.text();
+      if (!res.ok) throw Error("Alchemy batch sync HTTP " + res.status + " " + body2.slice(0, 130));
+      let parsed;
+      try {
+        parsed = JSON.parse(body2);
+      } catch {
+      }
+      if (parsed?.success === false || parsed?.error) throw Error("Alchemy batch rejected: " + JSON.stringify(parsed.error || parsed.message).slice(0, 150));
+      const stamp = now();
+      const statements = [];
+      for (const owner of unique) statements.push(db.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=?").bind(stamp, stamp, owner));
+      for (const row of toSync) {
+        statements.push(db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(row.owner, row.spender));
+        statements.push(db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(row.spender, row.owner));
+      }
+      await db.batch(statements);
+      await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(BACKOFF_KEY).run();
+      return { processed: rows.length, synced: unique.length };
+    } catch (e) {
+      const reason = String(e.message || e).slice(0, 225);
+      const limited = /HTTP 429|error code:\s*1015|rate limit/i.test(reason);
+      if (limited) await setEnrollmentCooldown(env, 15);
+      else if (/HTTP 5\d\d/.test(reason)) await setEnrollmentCooldown(env, 5);
+      console.error("Historical Spender bulk enrollment failed", reason);
+      for (const row of toSync) {
+        await db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(reason, row.spender, row.owner).run();
+        await db.prepare("UPDATE wallet_watches SET last_error=?,updated_at=CURRENT_TIMESTAMP WHERE address=? AND state='pending'").bind(reason, row.owner).run();
+      }
+      return { processed: 0, error: reason, cooldown: limited };
+    }
+  } finally {
+    await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK_KEY).run();
   }
 }
 
@@ -1514,14 +1592,14 @@ async function cfDay(env, day) {
 }
 async function collectCloudflare(env, settings) {
   if (!env.CF_ANALYTICS_API_TOKEN) throw Error("\u5F85\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684 Account Analytics Read \u53EA\u8BFB\u4EE4\u724C");
-  const now4 = /* @__PURE__ */ new Date(), today = now4.toISOString().slice(0, 10), monthly = monthPeriod(now4, settings.cloudflare_billing_day), daily = dayPeriod(now4);
+  const now3 = /* @__PURE__ */ new Date(), today = now3.toISOString().slice(0, 10), monthly = monthPeriod(now3, settings.cloudflare_billing_day), daily = dayPeriod(now3);
   const rows = (await env.DB.prepare("SELECT day FROM usage_cf_days WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const cached = new Set(rows.map((x) => x.day));
   await cfDay(env, today);
-  const yesterday = new Date(+now4 - 864e5).toISOString().slice(0, 10);
+  const yesterday = new Date(+now3 - 864e5).toISOString().slice(0, 10);
   if (yesterday >= monthly.start.slice(0, 10)) await cfDay(env, yesterday);
   const required = [];
-  for (let time = Date.parse(monthly.start); time < +now4; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
+  for (let time = Date.parse(monthly.start); time < +now3; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
   for (const day of required.filter((d) => !cached.has(d) && d !== today && d !== yesterday).slice(0, 4)) await cfDay(env, day);
   const updated = (await env.DB.prepare("SELECT day,payload_json FROM usage_cf_days WHERE day>=? AND day<=?").bind(monthly.start.slice(0, 10), today).all()).results;
   const totals = new Map(updated.map((x) => [x.day, JSON.parse(x.payload_json)]));
@@ -1539,7 +1617,7 @@ async function collectCloudflare(env, settings) {
       used,
       quota: known && complete ? limit?.quota ?? presets[key2] : null,
       unit: meter.unit,
-      period_start: storage ? monthPeriod(now4).start : period.start,
+      period_start: storage ? monthPeriod(now3).start : period.start,
       period_end: storage ? "9999-12-31T00:00:00.000Z" : period.end,
       observed_at: ISO(),
       source: "official_api",
@@ -1554,7 +1632,7 @@ async function collectCloudflare(env, settings) {
   }
 }
 async function collectInternal(env) {
-  const now4 = /* @__PURE__ */ new Date(), daily = dayPeriod(now4), monthly = monthPeriod(now4);
+  const now3 = /* @__PURE__ */ new Date(), daily = dayPeriod(now3), monthly = monthPeriod(now3);
   const rows = (await env.DB.prepare("SELECT metric,day,value FROM counters WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const limits = (await env.DB.prepare("SELECT * FROM usage_limits").all()).results;
   const started = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_started_at'").first())?.value;
@@ -1991,7 +2069,7 @@ async function handleAdmin(req, env, path) {
 // src/index.ts
 async function cron(env) {
   await recoverStuck(env);
-  const { results: pending } = await env.DB.prepare("SELECT address FROM wallet_watches WHERE state='pending' LIMIT 15").all();
+  const { results: pending } = await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
   for (const p of pending || []) {
     if (await ensureWatch(env, p.address)) await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
   }
@@ -2013,7 +2091,7 @@ async function cron(env) {
     console.error("Historical allowance checks", String(e));
   }
   try {
-    await enrollHistoricalOwners(env, 8);
+    await enrollHistoricalOwners(env, 20);
   } catch (e) {
     console.error("Historical monitoring enrollment", String(e));
   }
