@@ -12,6 +12,16 @@ import {removeWatch} from "./core";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
+async function pagedRows(env,req,countSql,rowsSql){
+  const q=new URL(req.url).searchParams;
+  const page=Math.min(100000,Math.max(0,parseInt(q.get("page")||"0",10)||0));
+  const [c,r]=await env.DB.batch([
+    env.DB.prepare(countSql),
+    env.DB.prepare(rowsSql).bind(page*50)
+  ]);
+  const total=c.results?.[0]?.n||0;
+  return json({rows:r.results||[],total,page,total_pages:Math.ceil(total/50)});
+}
 export async function handleAdmin(req,env,path){
   if(!await isAdmin(req,env))return bad("管理员验证失败或请求来源无效",401);
   const method=req.method;
@@ -244,7 +254,12 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","update_spender",a,{remark_changed:remark!==undefined,old_groups:oldGroups,new_groups:chats||undefined,removed,added});
     return json({ok:true,remark:remark??rule.remark,groups:chats||oldGroups,added,removed,note:"Spender 备注和通知群规则已保存；旧群的手动订阅与其他 Spender 订阅保持不变。"});
   }
-  if(method==="GET"&&path==="/api/subscriptions")return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/subscriptions"){
+    if(new URL(req.url).searchParams.get("paged")==="1")
+      return pagedRows(env,req,"SELECT COUNT(*) n FROM subscriptions",
+        "SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 50 OFFSET ?");
+    return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  }
   if(method==="PATCH"&&path==="/api/subscriptions"){
     const d=await body(req),a=addr(d.address),chat=String(d.chat_id||"");if(!a||!/^-?\d+$/.test(chat))return bad("无效订阅地址或群组");
     const old=await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a,chat).first();if(!old)return bad("订阅不存在",404);
@@ -296,9 +311,24 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","update_template",key,{chat});
     return json({ok:true});
   }
-  if(method==="GET"&&path==="/api/transfers")return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
-  if(method==="GET"&&path==="/api/outbox")return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
-  if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/transfers"){
+    if(new URL(req.url).searchParams.get("paged")==="1")
+      return pagedRows(env,req,"SELECT COUNT(*) n FROM transfer_events",
+        "SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 50 OFFSET ?");
+    return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
+  }
+  if(method==="GET"&&path==="/api/outbox"){
+    if(new URL(req.url).searchParams.get("paged")==="1")
+      return pagedRows(env,req,"SELECT COUNT(*) n FROM outbox",
+        "SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 50 OFFSET ?");
+    return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
+  }
+  if(method==="GET"&&path==="/api/audit"){
+    if(new URL(req.url).searchParams.get("paged")==="1")
+      return pagedRows(env,req,"SELECT COUNT(*) n FROM admin_audit",
+        "SELECT * FROM admin_audit ORDER BY id DESC LIMIT 50 OFFSET ?");
+    return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  }
   if(method==="GET"&&path==="/api/usage"){
     const [settings,platforms]=await Promise.all([usageSettings(env),usageSnapshot(env)]);
     return json({warning_threshold_percent:80,forecast_days:7,telegram_dm:true,email:false,
