@@ -3,7 +3,7 @@ import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
-import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources} from "./subscription-sources";
+import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources,listLegacySubscriptions} from "./subscription-sources";
 import {requeueFailedOutbox,listOutboxPage} from "./outbox-operations";
 import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
@@ -229,6 +229,10 @@ export async function handleAdmin(req,env,path){
     if(changes.length)await env.DB.batch(changes);
     await audit(env,"admin","update_spender",a,{remark_changed:remark!==undefined,old_groups:oldGroups,new_groups:chats||undefined,removed,added});
     return json({ok:true,remark:remark??rule.remark,groups:chats||oldGroups,added,removed,note:"Spender 备注和通知群规则已保存；旧群的手动订阅与其他 Spender 订阅保持不变。"});
+  }
+  if(method==="GET"&&path==="/api/subscriptions/legacy"){
+    const q=new URL(req.url).searchParams;
+    return json(await listLegacySubscriptions(env.DB,{page:q.get("page")||0,search:q.get("search")||""}));
   }
   if(method==="GET"&&path==="/api/subscriptions")return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
   if(method==="PATCH"&&path==="/api/subscriptions"){
