@@ -12,6 +12,7 @@ import {removeWatch} from "./core";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
+const literalSearch=s=>"%"+String(s).replace(/[~%_]/g,x=>"~"+x)+"%";
 async function pagedRows(env,req,countSql,rowsSql){
   const q=new URL(req.url).searchParams;
   const page=Math.min(100000,Math.max(0,parseInt(q.get("page")||"0",10)||0));
@@ -40,8 +41,8 @@ export async function handleAdmin(req,env,path){
     if(!["all","active","pending","removal_pending"].includes(status))return bad("监控状态筛选无效");
     const where="ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)"
       +(status==="all"?"":" AND ww.state=?")
-      +(search?" AND (ww.address LIKE ? OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ?)":"");
-    const args=[...(status==="all"?[]:[status]),...(search?["%"+search+"%","%"+search+"%"]:[])];
+      +(search?" AND (ww.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ? ESCAPE '~')":"");
+    const args=[...(status==="all"?[]:[status]),...(search?[literalSearch(search),literalSearch(search)]:[])];
     const countQuery=env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE "+where).bind(...args);
     const rowsQuery=env.DB.prepare(
       "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,"+
@@ -78,8 +79,8 @@ export async function handleAdmin(req,env,path){
     if(q.get("paged")!=="1")return json((await env.DB.prepare(select+"ORDER BY w.created_at DESC LIMIT 200").all()).results);
     const page=Math.min(100000,Math.max(0,Number.parseInt(q.get("page")||"0",10)||0));
     const search=String(q.get("search")||"").trim().slice(0,90);
-    const where=search?"WHERE w.address LIKE ? OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? ":"";
-    const args=search?["%"+search+"%","%"+search+"%"]:[];
+    const where=search?"WHERE w.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? ESCAPE '~' ":"";
+    const args=search?[literalSearch(search),literalSearch(search)]:[];
     const count=env.DB.prepare("SELECT COUNT(*) n FROM wallets w LEFT JOIN wallet_global_remarks g ON g.address=w.address "+where).bind(...args);
     const rows=env.DB.prepare(select+where+"ORDER BY w.created_at DESC,w.address ASC LIMIT 50 OFFSET ?").bind(...args,page*50);
     const [countResult,rowsResult]=await env.DB.batch([count,rows]);
