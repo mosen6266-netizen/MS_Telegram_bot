@@ -269,7 +269,7 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
       await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,sending_started_at=NULL,last_error=NULL WHERE id=?").bind(now(),result.message_id,row.id).run();
     }catch(e){
       const message=String(e).slice(0,250);
-      if(row.attempts>=5&&row.template_key!=="usage_alert"){
+      if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
         await env.DB.prepare("UPDATE outbox SET state='failed',sending_started_at=NULL,last_error=? WHERE id=?").bind(message,row.id).run();
         await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
       }else{
