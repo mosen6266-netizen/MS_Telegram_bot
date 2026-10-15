@@ -1112,7 +1112,8 @@ async function processApproval(env, rule, log) {
   const owner = fromTopic(log.topics?.[1]);
   if (!owner) return;
   const ok = await receiptSuccess(env, log.transactionHash);
-  if (ok !== true) return;
+  if (ok === null) throw Error("Transaction receipt is not indexed yet; retry this block");
+  if (ok === false) return;
   const amount = await allowance(env, owner, rule.spender);
   await recordSpenderLiveApproval(env, rule.spender, log, amount);
   const manuallyExcluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
