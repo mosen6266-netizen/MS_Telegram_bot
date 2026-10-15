@@ -60,9 +60,27 @@ test("full Worker preflight: admin routes, authentication, pagination and privac
 
   const headers={cookie};
   assert.equal((await request("/auth/status",headers)).content.authenticated,true);
+  await db.prepare(
+    "INSERT INTO outbox(dedup_key,chat_id,template_key,payload_json,state,attempts,last_error) "+
+    "VALUES('uncertain-test',?,'usage_alert','{}','delivery_unknown',1,'lost response')"
+  ).bind(chat).run();
   const summary=await request("/api/summary",headers);
   assert.equal(summary.status,200);assert.equal(summary.content.wallets,1);
   assert.equal(summary.content.subscriptions,1);
+  assert.equal(summary.content.delivery_unknown,1);
+  const uncertainList=await request("/api/outbox?status=delivery_unknown",headers);
+  assert.equal(uncertainList.status,200);
+  assert.equal(uncertainList.content.total,1);
+  const taskId=uncertainList.content.rows[0].id;
+  const authBlocked=await request("/api/outbox/acknowledge",
+    {"content-type":"application/json"},"POST",{id:taskId});
+  assert.equal(authBlocked.status,401);
+  const adminAcknowledgement=await request("/api/outbox/acknowledge",
+    {...headers,origin:domain,"x-app-action":"1","content-type":"application/json"},"POST",{id:taskId});
+  assert.equal(adminAcknowledgement.status,200);
+  assert.equal((await db.prepare("SELECT state FROM outbox WHERE id=?").bind(taskId).first()).state,"acknowledged");
+  assert.equal((await request("/api/summary",headers)).content.delivery_unknown,0);
+
 
   const wallets=await request("/api/wallets?page=0&search=Global%20test",headers);
   assert.equal(wallets.status,200);
