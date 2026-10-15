@@ -236,7 +236,7 @@ export async function renderTemplate(env,key,chatId,data={},safeHtml={}){
 export async function flushOutbox(env,max=30,onlyUsage=false){
   const {results:rows}=await env.DB.prepare("SELECT * FROM outbox WHERE state='pending' AND due_at<=CURRENT_TIMESTAMP "+(onlyUsage?"AND template_key='usage_alert' ":"")+"ORDER BY id ASC LIMIT ?").bind(max).all();
   for(const row of rows||[]){
-    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='pending'").bind(row.id).run();
+    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,due_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending'").bind(row.id).run();
     if(!locked.meta?.changes)continue;
     try {
       const payload=JSON.parse(row.payload_json||"{}");
@@ -269,7 +269,7 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
       await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,last_error=NULL WHERE id=?").bind(now(),result.message_id,row.id).run();
     }catch(e){
       const message=String(e).slice(0,250);
-      if(row.attempts>=5&&row.template_key!=="usage_alert"){
+      if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
         await env.DB.prepare("UPDATE outbox SET state='failed',last_error=? WHERE id=?").bind(message,row.id).run();
         await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
       }else{
@@ -280,5 +280,5 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
   }
 }
 export async function recoverStuck(env){
-  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND created_at<datetime('now','-10 minutes')").run();
+  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND due_at<datetime('now','-10 minutes')").run();
 }
