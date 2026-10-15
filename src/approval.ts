@@ -72,7 +72,7 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
 }
 export async function addSpender(env,spender,remark,chat_ids){
   const head=await blockNumber(env);
-  await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block) VALUES(?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender,remark,head,head).run();
+  await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block,generation) VALUES(?,?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender,remark,head,head,crypto.randomUUID()).run();
   for(const chat of chat_ids||[])await env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender,String(chat)).run();
 }
 export async function pollSpenders(env){
@@ -80,6 +80,8 @@ export async function pollSpenders(env){
   const {results:rules}=await env.DB.prepare("SELECT * FROM spender_rules WHERE enabled=1 ORDER BY cursor_block ASC LIMIT 40").all();
   for(const rule of rules||[]){
     const from=rule.cursor_block+1;
+    // Captured generation prevents a deleted/recreated address from sharing
+    // an earlier polling cycle's checkpoint.
     const to=Math.min(head,from+499);
     if(from>to)continue;
     try {
@@ -88,7 +90,7 @@ export async function pollSpenders(env){
         if(log.removed)continue;
         await processApproval(env,rule,log);
       }
-      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=?").bind(to,rule.spender).run();
+      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=? AND generation=? AND enabled=1 AND cursor_block=?").bind(to,rule.spender,rule.generation,rule.cursor_block).run();
     }catch(e){console.error("Spender polling failed",rule.spender,String(e));}
   }
 }
@@ -96,7 +98,9 @@ async function processApproval(env,rule,log){
   const owner=fromTopic(log.topics?.[1]);if(!owner)return;
   const ok=await receiptSuccess(env,log.transactionHash);if(ok!==true)return;
   const amount=await allowance(env,owner,rule.spender);
-  await recordSpenderLiveApproval(env,rule.spender,log,amount);
+  const current=await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1").bind(rule.spender,rule.generation).first();
+  if(!current)return; // Rule was removed or replaced during chain RPC.
+  await recordSpenderLiveApproval(env,rule.spender,log,amount,rule.generation);
   // Keep an archival event, but do not restore monitoring for a manually removed wallet.
   const manuallyExcluded=await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
   const walletRecord=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
