@@ -236,7 +236,7 @@ export async function renderTemplate(env,key,chatId,data={},safeHtml={}){
 export async function flushOutbox(env,max=30,onlyUsage=false){
   const {results:rows}=await env.DB.prepare("SELECT * FROM outbox WHERE state='pending' AND due_at<=CURRENT_TIMESTAMP "+(onlyUsage?"AND template_key='usage_alert' ":"")+"ORDER BY id ASC LIMIT ?").bind(max).all();
   for(const row of rows||[]){
-    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,sending_started_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending'").bind(row.id).run();
+    const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,sending_started_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending' AND due_at<=CURRENT_TIMESTAMP").bind(row.id).run();
     if(!locked.meta?.changes)continue;
     // Once a network request starts, a transport timeout or a DB commit error
     // cannot prove whether Telegram accepted the message. Fail closed.
@@ -283,7 +283,12 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
       }
       if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
         await env.DB.prepare("UPDATE outbox SET state='failed',sending_started_at=NULL,last_error=? WHERE id=?").bind(message,row.id).run();
-        await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
+        try{
+          await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
+        }catch(noticeError){
+          // Failure to reach the admin must not abandon the rest of the outbox.
+          console.warn("Telegram final-failure admin alert unavailable",row.id,String(noticeError));
+        }
       }else{
         const seconds=Math.max(Number(e?.retryAfter)||0,Math.min(3600,30*Math.pow(2,Math.min(row.attempts,7))));
         await env.DB.prepare("UPDATE outbox SET state='pending',sending_started_at=NULL,last_error=?,due_at=datetime('now',?) WHERE id=?").bind(message,"+"+seconds+" seconds",row.id).run();
