@@ -1985,6 +1985,16 @@ var body = async (req) => {
     return {};
   }
 };
+async function pagedRows(env, req, countSql, rowsSql) {
+  const q = new URL(req.url).searchParams;
+  const page = Math.min(1e5, Math.max(0, parseInt(q.get("page") || "0", 10) || 0));
+  const [c, r] = await env.DB.batch([
+    env.DB.prepare(countSql),
+    env.DB.prepare(rowsSql).bind(page * 50)
+  ]);
+  const total = c.results?.[0]?.n || 0;
+  return json({ rows: r.results || [], total, page, total_pages: Math.ceil(total / 50) });
+}
 async function handleAdmin(req, env, path) {
   if (!await isAdmin(req, env)) return bad("\u7BA1\u7406\u5458\u9A8C\u8BC1\u5931\u8D25\u6216\u8BF7\u6C42\u6765\u6E90\u65E0\u6548", 401);
   const method = req.method;
@@ -2193,7 +2203,16 @@ async function handleAdmin(req, env, path) {
     await audit(env, "admin", "update_spender", a, { remark_changed: remark !== void 0, old_groups: oldGroups, new_groups: chats || void 0, removed, added });
     return json({ ok: true, remark: remark ?? rule.remark, groups: chats || oldGroups, added, removed, note: "Spender \u5907\u6CE8\u548C\u901A\u77E5\u7FA4\u89C4\u5219\u5DF2\u4FDD\u5B58\uFF1B\u65E7\u7FA4\u7684\u624B\u52A8\u8BA2\u9605\u4E0E\u5176\u4ED6 Spender \u8BA2\u9605\u4FDD\u6301\u4E0D\u53D8\u3002" });
   }
-  if (method === "GET" && path === "/api/subscriptions") return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  if (method === "GET" && path === "/api/subscriptions") {
+    if (new URL(req.url).searchParams.get("paged") === "1")
+      return pagedRows(
+        env,
+        req,
+        "SELECT COUNT(*) n FROM subscriptions",
+        "SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 50 OFFSET ?"
+      );
+    return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
+  }
   if (method === "PATCH" && path === "/api/subscriptions") {
     const d = await body(req), a = addr(d.address), chat = String(d.chat_id || "");
     if (!a || !/^-?\d+$/.test(chat)) return bad("\u65E0\u6548\u8BA2\u9605\u5730\u5740\u6216\u7FA4\u7EC4");
@@ -2247,9 +2266,36 @@ async function handleAdmin(req, env, path) {
     await audit(env, "admin", "update_template", key2, { chat });
     return json({ ok: true });
   }
-  if (method === "GET" && path === "/api/transfers") return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
-  if (method === "GET" && path === "/api/outbox") return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
-  if (method === "GET" && path === "/api/audit") return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  if (method === "GET" && path === "/api/transfers") {
+    if (new URL(req.url).searchParams.get("paged") === "1")
+      return pagedRows(
+        env,
+        req,
+        "SELECT COUNT(*) n FROM transfer_events",
+        "SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 50 OFFSET ?"
+      );
+    return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
+  }
+  if (method === "GET" && path === "/api/outbox") {
+    if (new URL(req.url).searchParams.get("paged") === "1")
+      return pagedRows(
+        env,
+        req,
+        "SELECT COUNT(*) n FROM outbox",
+        "SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 50 OFFSET ?"
+      );
+    return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
+  }
+  if (method === "GET" && path === "/api/audit") {
+    if (new URL(req.url).searchParams.get("paged") === "1")
+      return pagedRows(
+        env,
+        req,
+        "SELECT COUNT(*) n FROM admin_audit",
+        "SELECT * FROM admin_audit ORDER BY id DESC LIMIT 50 OFFSET ?"
+      );
+    return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
+  }
   if (method === "GET" && path === "/api/usage") {
     const [settings, platforms] = await Promise.all([usageSettings(env), usageSnapshot(env)]);
     return json({
