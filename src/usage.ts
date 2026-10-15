@@ -35,12 +35,15 @@ export async function saveUsageSettings(env:Env,d:Settings){
   await env.DB.prepare("INSERT INTO runtime_state(key,value) VALUES('usage_settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(JSON.stringify(d)).run();
 }
 async function storeSample(env:Env,s:Sample){
-  await env.DB.batch([
+  const complete=JSON.parse(s.extra_json||"{}").complete!==false;
+  const statements=[
     env.DB.prepare("INSERT INTO usage_samples(metric,used,quota,unit,period_start,period_end,observed_at,source,scope,extra_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET used=excluded.used,quota=excluded.quota,unit=excluded.unit,period_start=excluded.period_start,period_end=excluded.period_end,observed_at=excluded.observed_at,source=excluded.source,scope=excluded.scope,extra_json=excluded.extra_json")
-      .bind(s.metric,s.used,s.quota,s.unit,s.period_start,s.period_end,s.observed_at,s.source,s.scope,s.extra_json||"{}"),
-    env.DB.prepare("INSERT OR IGNORE INTO usage_observations(metric,observed_at,used,period_start,source) VALUES(?,?,?,?,?)")
-      .bind(s.metric,s.observed_at,s.used,s.period_start,s.source)
-  ]);
+      .bind(s.metric,s.used,s.quota,s.unit,s.period_start,s.period_end,s.observed_at,s.source,s.scope,s.extra_json||"{}")
+  ];
+  // Backfilled history is not new consumption and must never become a forecast baseline.
+  if(complete)statements.push(env.DB.prepare("INSERT OR IGNORE INTO usage_observations(metric,observed_at,used,period_start,source) VALUES(?,?,?,?,?)")
+    .bind(s.metric,s.observed_at,s.used,s.period_start,s.source));
+  await env.DB.batch(statements);
 }
 async function collector(env:Env,provider:string,work:()=>Promise<void>){
   const attempted=ISO();
@@ -167,10 +170,11 @@ export async function usageSnapshot(env:Env):Promise<MeterView[]>{
       accurate_official_usage:sample.source==="official_api"});
   }
   const repo=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_visibility'").first<{value:string}>())?.value;
+  const githubError=collectors.find(x=>x.provider==="github")?.last_error;
   rows.push({name:"GitHub",metric:"github_actions",detail:"代码仓库 / 标准 Actions",unit:"分钟",provider:"github",
-    source:repo?"official_repository":"not_connected",status:repo==="public"?"not_applicable":"waiting",
+    source:repo?"official_repository":"not_connected",status:githubError?"error":repo==="public"?"not_applicable":"waiting",
     used:null,quota:null,percentage:null,threshold_alert:false,forecast_alert:false,
-    note:repo==="public"?"当前为公开仓库，标准 Actions 不消耗私有仓库分钟包；程序日常监控运行在 Cloudflare":"仓库可见性未确认或为私有，需另外配置账单读取权限"});
+    note:githubError||(repo==="public"?"当前为公开仓库，标准 Actions 不消耗私有仓库分钟包；程序日常监控运行在 Cloudflare":"仓库可见性未确认或为私有，需另外配置账单读取权限")});
   return rows;
 }
 export async function runUsageAlerts(env:Env){

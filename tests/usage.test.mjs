@@ -65,7 +65,7 @@ test("real D1: collect, preserve failed samples, deduplicate alerts and retry de
     const target=String(url);
     if(target==="https://api.cloudflare.com/client/v4/graphql")return Response.json(mode==="cf-error"?{errors:[{message:"denied"}]}:cfBody());
     if(target==="https://admin-api.alchemy.com/v1/usage/summary")return Response.json(alchemyBody());
-    if(target==="https://api.github.com/repos/mosen6266-netizen/MS_Telegram_bot")return Response.json({private:false});
+    if(target==="https://api.github.com/repos/mosen6266-netizen/MS_Telegram_bot")return mode==="github-error"?Response.json({message:"rate limited"},{status:429}):Response.json({private:false});
     if(target.startsWith("https://api.telegram.org/bot")){
       sends++;
       if(mode==="send-error")return Response.json({ok:false,description:"Too Many Requests",parameters:{retry_after:2}},{status:429});
@@ -122,6 +122,23 @@ test("real D1: collect, preserve failed samples, deduplicate alerts and retry de
     await implementation.flushOutbox(env,10,true);
     assert.equal((await DB.prepare("SELECT state FROM outbox WHERE dedup_key='expired'").first()).state,"skipped");
     assert.equal(sends,2);
+
+    // Start a long billing window without cached history. Partial totals must not
+    // become a consumption baseline when the remaining days are filled later.
+    await implementation.saveUsageSettings(env,{cloudflare_plan:"standard",cloudflare_billing_day:new Date().getUTCDate()%31+1});
+    await DB.prepare("DELETE FROM usage_cf_days").run();
+    await DB.prepare("DELETE FROM usage_observations WHERE metric LIKE 'workers_%' OR metric LIKE 'd1_%' OR metric='queue_ops'").run();
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="workers_requests").status,"backfilling");
+    assert.equal((await DB.prepare("SELECT count(*) n FROM usage_observations WHERE metric='workers_requests'").first()).n,0);
+
+    mode="github-error";
+    await DB.prepare("DELETE FROM runtime_state WHERE key='usage_github_checked_at'").run();
+    await implementation.collectUsage(env,true);
+    rows=await implementation.usageSnapshot(env);
+    assert.equal(rows.find(x=>x.metric==="github_actions").status,"error");
+    assert.match(rows.find(x=>x.metric==="github_actions").note,/HTTP 429/);
 
     env.CF_ANALYTICS_API_TOKEN="";env.ALCHEMY_USAGE_TOKEN="";
     await implementation.collectUsage(env,true);
