@@ -83,7 +83,7 @@ test("upgrade preserves live wallet monitoring, Telegram subscriptions, pending 
   const missingFks=(await db.prepare("PRAGMA foreign_key_check").all()).results||[];
   assert.deepEqual(missingFks,[],"upgrade must not break relational integrity");
   const indexes=(await db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all()).results.map(x=>x.name);
-  for(const name of ["idx_outbox_state_id_desc","idx_outbox_sending_lease","idx_subscription_sources_route","idx_wallets_created_address","idx_subscriptions_updated_chat_address"])
+  for(const name of ["idx_outbox_state_id_desc","idx_outbox_sending_lease","idx_subscription_sources_route","idx_wallets_created_address","idx_subscriptions_updated_chat_address","idx_transfers_block_event"])
    assert.ok(indexes.includes(name),"missing index "+name);
  }finally{await mf.dispose()}
 });
