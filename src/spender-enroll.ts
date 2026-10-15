@@ -10,24 +10,65 @@ import {withAlchemyMutationLease,alchemyMutationFetch} from "./alchemy-mutation-
 const ENROLL_BATCH=20;
 const BACKOFF_KEY="spender_enroll_retry_after";
 const LOCK_KEY="spender_enroll_batch_lock";
-async function setEnrollmentCooldown(env,minutes){
-  const until=String(Date.now()+minutes*60000);
+// Longer than one Worker execution; a crashed invocation can be reclaimed
+// without deleting a newer invocation's independently owned lease.
+const LOCK_TTL_MS=15*60000;
+export async function withEnrollmentLease(env,work,{clock=()=>Date.now(),ttlMs=LOCK_TTL_MS}={}){
+  const started=clock(),value=String(started+ttlMs)+"|"+crypto.randomUUID();
+  const acquired=await env.DB.prepare(
+    "INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP "+
+    "WHERE CAST(substr(runtime_state.value,1,instr(runtime_state.value,'|')-1) AS INTEGER)<=?"
+  ).bind(LOCK_KEY,value,started).run();
+  if(!acquired.meta?.changes)return {busy:true};
+  try{return await work()}
+  finally{await env.DB.prepare("DELETE FROM runtime_state WHERE key=? AND value=?").bind(LOCK_KEY,value).run()}
+}
+export function enrollmentRetryAfterSeconds(headerValue,nowMs=Date.now()){
+  if(!headerValue)return null;
+  const str=String(headerValue).trim(),number=Number(str);
+  const seconds=Number.isFinite(number)&&number>=0?number:
+    (Number.isFinite(Date.parse(str))?(Date.parse(str)-nowMs)/1000:NaN);
+  return Number.isFinite(seconds)?Math.max(1,Math.min(4*3600,Math.ceil(seconds))):null;
+}
+async function setEnrollmentCooldown(env,seconds){
+  const until=String(Date.now()+Math.max(1,Math.min(4*3600,Math.ceil(seconds)))*1000);
   await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(BACKOFF_KEY,until).run();
 }
-
 export async function selectEnrollmentCandidates(db,limit=ENROLL_BATCH){
-  const query="SELECT h.spender,h.owner,r.generation FROM spender_history_addresses h "+
-      "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
-      "LEFT JOIN wallets w ON w.address=h.owner "+
-      "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
-      "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
-      "WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) "+
-      "AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
-        "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END)) "+
-      "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) "+
-      // Never let the oldest failed 20 addresses starve all fresh discoveries.
-      "ORDER BY CASE WHEN e.spender IS NULL THEN 0 ELSE 1 END, e.updated_at ASC, h.first_seen_block ASC LIMIT ?";
-  return (await db.prepare(query).bind(Math.max(1,Math.min(ENROLL_BATCH,limit))).all()).results||[];
+  const max=Math.max(1,Math.min(ENROLL_BATCH,limit));
+  const base="SELECT h.spender,h.owner,r.generation FROM spender_history_addresses h "+
+    "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
+    "LEFT JOIN wallets w ON w.address=h.owner "+
+    "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
+    "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
+    "WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) AND ";
+  const retry="(e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
+      "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END) "+
+    "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes')))";
+  // Always reserve at least one slot for a due failed attempt, even when a
+  // continuous feed of fresh Owners would otherwise permanently starve it.
+  const reserved=max>=4?Math.max(1,Math.floor(max/4)):max===1?0:1;
+  const freshCount=max-reserved;
+  const [newcomers,retries]=await db.batch([
+    db.prepare(base+"e.spender IS NULL ORDER BY h.first_seen_block ASC,h.spender,h.owner LIMIT ?").bind(freshCount),
+    db.prepare(base+retry+" ORDER BY e.updated_at ASC,h.first_seen_block ASC,h.owner LIMIT ?").bind(reserved)
+  ]);
+  const rows=[...(newcomers.results||[]),...(retries.results||[])];
+  if(rows.length<max){
+    // Fill unused slots from whichever queue has more work, with OFFSET
+    // values grounded in the already returned ordering.
+    const needed=max-rows.length;
+    const [moreFresh,moreRetry]=await db.batch([
+      db.prepare(base+"e.spender IS NULL ORDER BY h.first_seen_block ASC,h.spender,h.owner LIMIT ? OFFSET ?")
+        .bind(needed,newcomers.results?.length||0),
+      db.prepare(base+retry+" ORDER BY e.updated_at ASC,h.first_seen_block ASC,h.owner LIMIT ? OFFSET ?")
+        .bind(needed,retries.results?.length||0)
+    ]);
+    rows.push(...(moreFresh.results||[]).slice(0,needed));
+    rows.push(...(moreRetry.results||[]).slice(0,Math.max(0,max-rows.length)));
+  }
+  return rows;
 }
 
 export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
@@ -43,16 +84,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
   const wait=await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(BACKOFF_KEY).first();
   if(Number(wait?.value||0)>Date.now())return {cooldown:true,until:Number(wait.value)};
 
-  // Avoid concurrent bulk submissions during long scheduled Worker invocations.
-  const lock=await db.prepare("INSERT OR IGNORE INTO runtime_state(key,value) VALUES(?,?)").bind(LOCK_KEY,now()).run();
-  if(!lock.meta?.changes){
-    const old=await db.prepare("SELECT updated_at FROM runtime_state WHERE key=?").bind(LOCK_KEY).first();
-    if(old && Date.now()-new Date(old.updated_at+"Z").getTime()>300000){
-      await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK_KEY).run();
-    }
-    return {busy:true};
-  }
-  try{
+  return withEnrollmentLease(env,async()=>{
     const rows=await selectEnrollmentCandidates(db,limit);
     if(!rows.length)return {processed:0};
 
@@ -170,7 +202,5 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       }
       return {processed:0,error:reason,cooldown:limited};
     }
-  }finally{
-    await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK_KEY).run();
-  }
+  });
 }
