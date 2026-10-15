@@ -12,6 +12,7 @@ import {defaults,templateCatalog} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
 import {isAdmin,configEnv} from "./setup";
 import {removeWatch} from "./core";
+import {withAlchemyMutationLease,AlchemyMutationBusy} from "./alchemy-mutation-lease";
 export const adminHtml=()=>ADMIN_HTML;
 const bad=(message,status=400)=>json({error:message},status);
 const body=async req=>{try{return await req.json()}catch{return {}}};
@@ -153,23 +154,34 @@ export async function handleAdmin(req,env,path){
   if(method==="DELETE"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);
     if(!a)return bad("Spender 地址无效");
-    const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
-    if(!rule)return bad("该 Spender 已不存在",404);
-    const histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
-    // Remove dependent rows before deleting the parent; spender_routes
-    // references spender_rules via a foreign key. Preserve wallet watches,
-    // subscriptions and transaction/audit archives to avoid accidental loss
-    // of unrelated monitoring. Re-adding starts a clean history scan.
-    await env.DB.batch([
-      ...retainDeletedSpenderSources(env.DB,a),
-      env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
-      env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
-    ]);
-    await audit(env,"admin","delete_spender",a,{remark:rule.remark,history_wallets_deleted_from_rule:histories,monitored_wallets_retained:true});
+    let histories=0;
+    try{
+      await withAlchemyMutationLease(env,async()=>{
+        // All Alchemy address changes use the same lease. If an enrollment is
+        // still in flight, fail safely instead of deleting underneath it.
+        const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
+        if(!rule)return bad("该 Spender 已不存在",404);
+        histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
+        // Remove dependent rows before deleting the parent; spender_routes
+        // references spender_rules via a foreign key. Preserve wallet watches,
+        // subscriptions and transaction/audit archives to avoid accidental loss
+        // of unrelated monitoring. Re-adding starts a clean history scan.
+        await env.DB.batch([
+          ...retainDeletedSpenderSources(env.DB,a),
+          env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
+          env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
+        ]);
+        await audit(env,"admin","delete_spender",a,{remark:rule.remark,history_wallets_deleted_from_rule:histories,monitored_wallets_retained:true});
+    
+      });
+    }catch(e){
+      if(e instanceof AlchemyMutationBusy)return bad("Alchemy 正在更新监控地址，请稍后再删除 Spender",409);
+      throw e;
+    }
     return json({ok:true,removed_spender:a,history_records_removed:histories,monitored_wallets_retained:true,
       note:"Spender 规则已删除，历史扫描与这条规则的群组推送已停止；已接入的独立钱包监控和既有消息记录保留。"});
   }
