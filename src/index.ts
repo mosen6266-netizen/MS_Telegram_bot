@@ -13,14 +13,14 @@ import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 import {finishAddressQueryCleanup,flushMessageCleanup} from "./cleanup";
 async function cron(env){
   await recoverStuck(env);
-  const {results:pending}=await env.DB.prepare("SELECT address FROM wallet_watches WHERE state='pending' LIMIT 15").all();
+  const {results:pending}=await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
   for(const p of pending||[]){
     if(await ensureWatch(env,p.address))await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
   }
   try{await pollSpenders(env);}catch(e){console.error("Spender scan",String(e))}
   try{for(let i=0;i<4;i++){if(!await scanSpenderHistories(env))break;}}catch(e){console.error("Spender history scan",String(e))}
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
-  try{await enrollHistoricalOwners(env,8);}catch(e){console.error("Historical monitoring enrollment",String(e))}
+  try{await enrollHistoricalOwners(env,20);}catch(e){console.error("Historical monitoring enrollment",String(e))}
   try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
   await flushOutbox(env,40);
