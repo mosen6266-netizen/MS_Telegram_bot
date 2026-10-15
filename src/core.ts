@@ -36,9 +36,13 @@ export async function allowance(env,owner,spender,block="latest"){
   const value=await rpc(env,"eth_call",[{to:USDT,data},block]);
   return BigInt(value || "0x0");
 }
+export async function confirmedReceipt(env,hash){
+  const receipt=await rpc(env,"eth_getTransactionReceipt",[hash]);
+  return receipt?.status==="0x1"?receipt:null;
+}
 export async function receiptSuccess(env,hash){
-  const d=await rpc(env,"eth_getTransactionReceipt",[hash]);
-  return d ? d.status==="0x1" : null;
+  const receipt=await confirmedReceipt(env,hash);
+  return receipt?true:null;
 }
 export async function telegram(env,method,body){
   if(!env.TELEGRAM_BOT_TOKEN)throw Error("TELEGRAM_BOT_TOKEN is missing");
