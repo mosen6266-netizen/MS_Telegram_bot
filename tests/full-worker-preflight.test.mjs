@@ -94,6 +94,20 @@ test("full Worker preflight: admin routes, authentication, pagination and privac
   assert.equal(csrfDenied.status,401);
   assert.equal((await db.prepare("SELECT status FROM subscriptions WHERE address=?").bind(owner).first()).status,"active");
 
+  const remarkUpdate=await request("/api/monitoring/remark",{...headers,"origin":domain,
+    "x-app-action":"1","content-type":"application/json"},"POST",
+    {address:owner,remark:"Synced from the staging Worker"});
+  assert.equal(remarkUpdate.status,200);
+  assert.equal(remarkUpdate.content.remark,"Synced from the staging Worker");
+  const persisted=await db.prepare("SELECT remark FROM wallet_global_remarks WHERE address=?").bind(owner).first();
+  assert.equal(persisted.remark,"Synced from the staging Worker");
+  const syncedSubscription=await db.prepare("SELECT remark FROM subscriptions WHERE address=? AND chat_id=?").bind(owner,chat).first();
+  assert.equal(syncedSubscription.remark,"Synced from the staging Worker");
+  const newWalletPage=await request("/api/wallets?search=Synced",headers);
+  assert.equal(newWalletPage.content.total,1,"new remark must be searchable without a worker restart");
+  const remarkAudit=await db.prepare("SELECT COUNT(*) n FROM admin_audit WHERE action='global_wallet_remark'").first();
+  assert.equal(remarkAudit.n,1,"global edit must be audited");
+
   const validPost=await request("/api/subscriptions",{...headers,"origin":domain,"x-app-action":"1",
     "content-type":"application/json"},"PATCH",{chat_id:chat,address:owner,status:"paused"});
   assert.equal(validPost.status,200);
