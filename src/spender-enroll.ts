@@ -174,7 +174,12 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
         body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:verified,addresses_to_remove:[]})
       });
       const body=await res.text();
-      if(!res.ok)throw Error("Alchemy batch sync HTTP "+res.status+" "+body.slice(0,130));
+      if(!res.ok){
+        const error=Error("Alchemy batch sync HTTP "+res.status+" "+body.slice(0,130));
+        error.httpStatus=res.status;
+        error.retryAfterSeconds=enrollmentRetryAfterSeconds(res.headers?.get("retry-after"));
+        throw error;
+      }
       let parsed;
       try{parsed=JSON.parse(body)}catch{}
       if(parsed?.success===false||parsed?.error)throw Error("Alchemy batch rejected: "+JSON.stringify(parsed.error||parsed.message).slice(0,150));
@@ -187,13 +192,22 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       }
       await db.batch(statements);
       await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(BACKOFF_KEY).run();
+      await db.prepare("DELETE FROM runtime_state WHERE key='spender_enroll_throttle_count'").run();
       return {processed:rows.length,synced:verified.length};
       });
     }catch(e){
       const reason=String(e.message||e).slice(0,225);
-      const limited=/HTTP 429|error code:\s*1015|rate limit/i.test(reason);
-      if(limited)await setEnrollmentCooldown(env,15);
-      else if(/HTTP 5\d\d/.test(reason))await setEnrollmentCooldown(env,5);
+      const limited=e?.httpStatus===429||/HTTP 429|error code:\\s*1015|rate limit/i.test(reason);
+      // Exact Retry-After wins when present; exponential fallback grows
+      // across repeated rate-limit incidents and is capped at two hours.
+      if(limited){
+        const failures=Number((await db.prepare("SELECT value FROM runtime_state WHERE key='spender_enroll_throttle_count'").first())?.value||0);
+        const next=Math.min(6,failures+1);
+        await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_enroll_throttle_count',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(String(next)).run();
+        await setEnrollmentCooldown(env,e?.retryAfterSeconds??Math.min(7200,900*Math.pow(2,next-1)));
+      }else if(e?.httpStatus>=500||/HTTP 5\\d\\d/.test(reason)){
+        await setEnrollmentCooldown(env,e?.retryAfterSeconds??300);
+      }
       console.error("Historical Spender bulk enrollment failed",reason);
       for(const row of toSync){
         await db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?")
