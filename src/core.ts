@@ -165,8 +165,11 @@ export async function ensureWatch(env,address,fromBlock=undefined,guard=undefine
       if(fresh?.state==="active")return true;
       if(fresh?.state==="removed"||fresh?.state==="removal_pending")return false;
       await syncWatch(env,address,false,{leaseHeld:true});
-      await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=? AND state='pending'").bind(now(),now(),address).run();
-      return true;
+      const committed=await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=? AND state='pending'").bind(now(),now(),address).run();
+      // A concurrent explicit removal may have changed pending to
+      // removal_pending while we were awaiting the remote API. Do not claim
+      // success when the local state intentionally requests removal.
+      return !!committed.meta?.changes;
     });
   }catch(e){
     await env.DB.prepare("UPDATE wallet_watches SET state='pending',last_error=?,updated_at=? WHERE address=? AND state='pending'").bind(String(e).slice(0,500),now(),address).run();
