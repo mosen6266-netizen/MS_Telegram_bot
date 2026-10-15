@@ -74,13 +74,26 @@ export async function authRoute(req,env,path){
       const cfToken=String(b.cloudflare_api_token||"").trim();
       if(!/^\S{20,300}$/.test(cfToken)){await fail(env,"setup");return json({error:"Enter a Cloudflare API token with Workers Scripts Edit permission for this account"},403);}
       if(!env.CF_ACCOUNT_ID)return json({error:"Cloudflare account binding unavailable"},503);
-      const master=b64(random(32));
-      const result=await fetch("https://api.cloudflare.com/client/v4/accounts/"+encodeURIComponent(env.CF_ACCOUNT_ID)+"/workers/scripts/ethereum-usdt-monitor/secrets",{
-        method:"PUT",headers:{"authorization":"Bearer "+cfToken,"content-type":"application/json"},
-        body:JSON.stringify({name:"APP_ENCRYPTION_KEY",type:"secret_text",text:master})
-      });
-      const resultData=await result.json();
-      if(!result.ok||!resultData.success){await fail(env,"setup");return json({error:"Cloudflare key provisioning failed. The API token must be authorized to edit the ethereum-usdt-monitor Worker in this Cloudflare account."},403);}
+      const workerBase="https://api.cloudflare.com/client/v4/accounts/"+encodeURIComponent(env.CF_ACCOUNT_ID)+"/workers/scripts/ethereum-usdt-monitor";
+      const headers={"authorization":"Bearer "+cfToken};
+      if(env.APP_ENCRYPTION_KEY){
+        // The secret was provisioned during a previous attempt. NEVER rotate it on retries.
+        // Verify ownership against the actual Worker without performing a script update.
+        const check=await fetch(workerBase+"/settings",{headers});
+        if(!check.ok){await fail(env,"setup");return json({error:"Cloudflare token cannot access this Worker's settings. Please verify the token account and Workers Scripts Edit permission."},403);}
+        await check.body?.cancel();
+      }else{
+        // Updating a Worker secret may restart the current running instance.
+        // Provision only once and require a new request to complete registration safely.
+        const master=b64(random(32));
+        const result=await fetch(workerBase+"/secrets",{
+          method:"PUT",headers:{...headers,"content-type":"application/json"},
+          body:JSON.stringify({name:"APP_ENCRYPTION_KEY",type:"secret_text",text:master})
+        });
+        const response=await result.json();
+        if(!result.ok||!response.success){await fail(env,"setup");return json({error:"Cloudflare encryption key provisioning failed. Check the token's Workers Scripts Edit permission."},403);}
+        return json({ok:false,code:"KEY_PROVISIONED_RETRY",error:"Encryption key created. Reload this page, then submit again using the same setup token and password. Do not generate a new Cloudflare token."},409);
+      }
     }
     const salt=b64(random(24)),hash=await passwordHash(password,salt);
     // Database uniqueness prevents two simultaneous first-run initializations.
