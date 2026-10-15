@@ -998,16 +998,49 @@ async function scanSpenderHistories(env) {
   }
 }
 async function verifyHistoricalAllowances(env, max = 8) {
-  const rows = (await env.DB.prepare("SELECT h.spender,h.owner FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender WHERE h.verify_status='pending' AND r.enabled=1 ORDER BY h.latest_event_block DESC LIMIT ?").bind(max).all()).results || [];
+  const db = env.DB;
+  const cursorKey = "spender_history_verify_cursor";
+  const retryKey = "spender_history_verify_retry_after";
+  const wait = await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(retryKey).first();
+  if (Number(wait?.value || 0) > Date.now()) return { cooldown: true };
+  const saved = await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(cursorKey).first();
+  let cursor = null;
+  if (saved?.value) {
+    try {
+      const v = JSON.parse(saved.value);
+      if (Number.isSafeInteger(v.block) && v.block >= 0 && /^0x[0-9a-f]{40}$/.test(v.spender) && /^0x[0-9a-f]{40}$/.test(v.owner)) cursor = v;
+    } catch {
+    }
+  }
+  async function getPending(after) {
+    const sql = "SELECT h.spender,h.owner,h.latest_event_block FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender WHERE h.verify_status='pending' AND r.enabled=1 " + (after ? "AND (h.latest_event_block<? OR (h.latest_event_block=? AND (h.spender>? OR (h.spender=? AND h.owner>?)))) " : "") + "ORDER BY h.latest_event_block DESC,h.spender ASC,h.owner ASC LIMIT ?";
+    const args = after ? [after.block, after.block, after.spender, after.spender, after.owner, max] : [max];
+    return (await db.prepare(sql).bind(...args).all()).results || [];
+  }
+  let rows = await getPending(cursor);
+  if (!rows.length && cursor) {
+    await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(cursorKey).run();
+    rows = await getPending(null);
+  }
+  if (!rows.length) return { attempted: 0, verified: 0 };
+  const last = rows[rows.length - 1];
+  await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(cursorKey, JSON.stringify({ block: Number(last.latest_event_block), spender: last.spender, owner: last.owner })).run();
+  let verified = 0;
   for (const row of rows) {
     try {
       const value = await allowance(env, row.owner, row.spender);
-      await env.DB.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND verify_status='pending'").bind(value.toString(), value > 0n ? "active" : "revoked", row.spender, row.owner).run();
+      await db.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND verify_status='pending'").bind(value.toString(), value > 0n ? "active" : "revoked", row.spender, row.owner).run();
+      verified++;
     } catch (e) {
-      console.error("History allowance verification", row.spender, row.owner, String(e));
-      break;
+      const reason = String(e.message || e);
+      console.error("History allowance verification", row.spender, row.owner, reason);
+      if (/429|1015|rate.limit|quota|too many requests|HTTP 5\\d\\d|not configured/i.test(reason)) {
+        await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(retryKey, String(Date.now() + 5 * 6e4)).run();
+        break;
+      }
     }
   }
+  return { attempted: rows.length, verified };
 }
 
 // src/approval.ts
