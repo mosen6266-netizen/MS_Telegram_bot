@@ -719,7 +719,8 @@ async function flushOutbox(env, max = 30, onlyUsage = false) {
       let remark = "\u2014";
       if (row.address) {
         const sub = await env.DB.prepare("SELECT remark,status FROM subscriptions WHERE address=? AND chat_id=?").bind(row.address, row.chat_id).first();
-        if (!sub || sub.status !== "active") {
+        const approvalAlert = row.template_key === "new_approval" || row.template_key === "approval_change";
+        if (!sub || sub.status !== "active" && !(approvalAlert && sub.status === "pending")) {
           await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Subscription no longer active' WHERE id=?").bind(row.id).run();
           continue;
         }
@@ -1199,11 +1200,12 @@ async function processApproval(env, rule, log) {
   const previous = await env.DB.prepare("SELECT amount_raw FROM allowances WHERE owner=? AND spender=?").bind(owner, rule.spender).first();
   const before = BigInt(previous?.amount_raw || "0");
   const evId = "approval:" + log.transactionHash + ":" + log.logIndex;
-  const type = amount2 === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount2 > before ? "increased" : amount2 < before ? "decreased" : "unchanged";
+  const eventRecord = await env.DB.prepare("SELECT event_type FROM approval_events WHERE event_id=?").bind(evId).first();
+  const type = eventRecord?.event_type || (amount2 === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount2 > before ? "increased" : amount2 < before ? "decreased" : "unchanged");
   await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)").bind(evId, owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), log.transactionHash, type).run();
   await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP").bind(owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), Number(BigInt(log.blockNumber))).run();
-  const registered = await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
-  if (amount2 > 0n && (!registered || !previous)) {
+  const registered = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
+  if (amount2 > 0n && (type === "new" || type === "reauthorized")) {
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
     const { results: routes } = await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for (const route of routes || []) {
@@ -1213,7 +1215,14 @@ async function processApproval(env, rule, log) {
       const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, owner, remark).run();
     }
-    const watched = await ensureWatch(env, owner, Number(BigInt(log.blockNumber)));
+    let watched = registered?.state === "active";
+    if (!watched) {
+      try {
+        watched = await ensureWatch(env, owner, Number(BigInt(log.blockNumber)));
+      } catch (watchError) {
+        console.warn("Approval Owner monitor pending", owner, String(watchError));
+      }
+    }
     if (watched) await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
     for (const route of routes || []) await queueNotice(env, {
       dedup: evId + ":" + route.chat_id,
@@ -1222,8 +1231,8 @@ async function processApproval(env, rule, log) {
       template: "new_approval",
       payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount2, 6) + " USDT", tx_hash: log.transactionHash, watch_status: watched ? "active" : "pending" }
     });
-    await increment(env, "discovered_wallets");
-  } else if (type !== "unchanged" && previous) {
+    if (!registered) await increment(env, "discovered_wallets");
+  } else if (type !== "unchanged") {
     const { results: routes } = await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for (const route of routes || []) await queueNotice(env, {
       dedup: evId + ":" + route.chat_id,
