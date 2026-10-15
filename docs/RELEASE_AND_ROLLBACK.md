@@ -6,6 +6,12 @@
 
 **当前状态：** `stabilization/2026-10-15-p0` 为测试分支；`main` 与 `ethereum-usdt-monitor` 生产服务未获本项目授权修改。
 
+## 预发布安全检查
+
+- 单独阅读 [独立预发布环境手册](ISOLATED_STAGING.md)，使用 `wrangler.staging.example.jsonc` 生成本地专属配置，不能直接用默认 `wrangler.jsonc` 发布到预发布。
+- 运行 `node scripts/verify-staging-config.mjs wrangler.staging.jsonc` 核验独立 Worker 名、全新 D1 UUID、Queue/DLQ 与 HTTPS 回调 URL；禁用 Cron、禁止提交真实凭证。
+- 配置校验和 GitHub CI 成功**不表示已部署**。目前仍未创建 Cloudflare 预发布 Worker、D1 或 Queue。
+
 ## 1. 发布前检查
 
 - [ ] 确定 PR #1 最新 head SHA，所有 CI、Smoke Test、`npm run bundle:verify` 均为 green。
