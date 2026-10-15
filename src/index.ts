@@ -7,7 +7,7 @@ import {enrollHistoricalOwners} from "./spender-enroll";
 import {maybeReconcileAlchemy} from "./alchemy-reconcile";
 import {retryPendingWatchRemovals,selectStandalonePendingWatches} from "./watch-maintenance";
 import {processActivity} from "./transfers";
-import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
+import {scanWalletGaps,reconcileRecentReorgs,backfillMissingTransferBlockHashes} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
@@ -26,6 +26,7 @@ async function cron(env){
   try{await retryPendingWatchRemovals(env,{limit:2});}catch(e){console.warn("Alchemy pending removal cleanup",String(e))}
   try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
+  try{await backfillMissingTransferBlockHashes(env,3);}catch(e){console.warn("Transfer block-hash repair deferred",String(e))}
   await flushOutbox(env,40);
   await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
 }
