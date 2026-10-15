@@ -231,7 +231,7 @@ var APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8
 var ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 var addr = (s) => ADDRESS_RE.test(String(s || "")) ? String(s).toLowerCase() : null;
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
-var json = (data, status2 = 200) => Response.json(data, { status: status2, headers: { "cache-control": "no-store" } });
+var json = (data, status3 = 200) => Response.json(data, { status: status3, headers: { "cache-control": "no-store" } });
 var esc = (s) => String(s ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 var short = (s) => s ? s.slice(0, 8) + "\u2026" + s.slice(-6) : "\u2014";
 var toTopic = (s) => "0x" + s.slice(2).toLowerCase().padStart(64, "0");
@@ -1266,6 +1266,13 @@ async function pollSpenders(env) {
     }
   }
 }
+async function processRealtimeApproval(env, spender, log) {
+  const rule = await env.DB.prepare("SELECT * FROM spender_rules WHERE spender=? AND enabled=1").bind(addr(spender)).first();
+  if (!rule) return { ignored: "spender_disabled_or_unknown" };
+  if (addr(log.address) !== USDT || String(log.topics?.[0]).toLowerCase() !== APPROVAL_TOPIC || fromTopic(log.topics?.[2]) !== rule.spender) throw Error("Invalid realtime Approval log");
+  await processApproval(env, rule, log);
+  return { ok: true };
+}
 async function processApproval(env, rule, log) {
   const owner = fromTopic(log.topics?.[1]);
   if (!owner) return;
@@ -1637,6 +1644,119 @@ async function processActivity(env, payload) {
       });
     }
   }
+}
+
+// src/approval-realtime.ts
+var STATE = "approval_realtime_status";
+var LOCK2 = "approval_realtime_provision_lock";
+function approvalQuery(spenders) {
+  const topics = spenders.map(toTopic);
+  return '{ block { number logs(filter: { addresses: ["' + USDT + '"], topics: [["' + APPROVAL_TOPIC + '"], [], ' + JSON.stringify(topics) + "] }) { account { address } topics data index transaction { hash status } } } }";
+}
+async function status2(env, details) {
+  await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(STATE, JSON.stringify({ ...details, at: now() })).run();
+}
+async function provisionRealtimeApprovals(env) {
+  if (!env.ALCHEMY_NOTIFY_TOKEN) {
+    await status2(env, { state: "blocked", reason: "Alchemy Notify token missing" });
+    return;
+  }
+  const { results: rules } = await env.DB.prepare("SELECT spender FROM spender_rules WHERE enabled=1 ORDER BY spender").all();
+  const spenders = (rules || []).map((x) => addr(x.spender)).filter(Boolean);
+  if (!spenders.length) return { skipped: "no_spenders" };
+  if (env.ALCHEMY_APPROVAL_WEBHOOK_ID && env.ALCHEMY_APPROVAL_SIGNING_KEY) {
+    const prior = await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(STATE).first();
+    if (!prior || JSON.parse(prior.value || "{}").state !== "active")
+      await status2(env, { state: "active", id: env.ALCHEMY_APPROVAL_WEBHOOK_ID, spender_count: spenders.length });
+    return { status: "already_configured" };
+  }
+  const pause = await env.DB.prepare("SELECT value FROM runtime_state WHERE key='approval_realtime_retry_after'").first();
+  if (Number(pause?.value || 0) > Date.now()) return { skipped: "cooldown" };
+  const lock = await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)").bind(LOCK2, String(Date.now())).run();
+  if (!lock.meta?.changes) {
+    const held = await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(LOCK2).first();
+    if (Date.now() - Number(held?.value || 0) > 5 * 60 * 1e3) await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK2).run();
+    return { skipped: "locked" };
+  }
+  try {
+    const url = String(env.PUBLIC_BASE_URL).replace(/\/$/, "") + "/webhooks/alchemy-approvals";
+    const list = await fetch("https://dashboard.alchemy.com/api/team-webhooks", { headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN } });
+    if (!list.ok) throw Error("List Alchemy webhooks HTTP " + list.status);
+    const raw = await list.json();
+    const existing = (Array.isArray(raw?.data) ? raw.data : Array.isArray(raw) ? raw : []).filter((x) => x.webhook_url === url && x.network === "ETH_MAINNET" && x.webhook_type === "GRAPHQL");
+    if (existing.length) {
+      await status2(env, { state: "needs_key", reason: "Custom webhook already exists; missing signing key", id: existing[0].id });
+      return { status: "needs_existing_signing_key" };
+    }
+    const res = await fetch("https://dashboard.alchemy.com/api/create-webhook", {
+      method: "POST",
+      headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        network: "ETH_MAINNET",
+        webhook_type: "GRAPHQL",
+        name: "MS007 USDT Spender Approval Seconds",
+        webhook_url: url,
+        graphql_query: approvalQuery(spenders)
+      })
+    });
+    const body2 = await res.json(), created = body2?.data || body2;
+    if (!res.ok || !created?.id || !created?.signing_key)
+      throw Error("Alchemy custom webhook rejected HTTP " + res.status + ": " + String(body2?.message || body2?.error || "invalid result").slice(0, 180));
+    await persistSecret(env, "ALCHEMY_APPROVAL_SIGNING_KEY", created.signing_key);
+    await persistSecret(env, "ALCHEMY_APPROVAL_WEBHOOK_ID", created.id);
+    env.ALCHEMY_APPROVAL_WEBHOOK_ID = created.id;
+    env.ALCHEMY_APPROVAL_SIGNING_KEY = created.signing_key;
+    await status2(env, {
+      state: created.is_active === false ? "created_inactive" : "active",
+      id: created.id,
+      spender_count: spenders.length,
+      active: created.is_active
+    });
+    return { status: "created", active: created.is_active };
+  } catch (e) {
+    await status2(env, { state: "error", reason: String(e.message || e).slice(0, 210) });
+    await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('approval_realtime_retry_after',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(String(Date.now() + 15 * 60 * 1e3)).run();
+    console.warn("Realtime Approval webhook provisioning", String(e));
+    return { status: "error" };
+  } finally {
+    await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(LOCK2).run();
+  }
+}
+function parseApprovalWebhook(payload) {
+  if (payload?.type !== "GRAPHQL") throw Error("Unexpected Alchemy realtime event type");
+  const block = payload.event?.data?.block;
+  if (!block || !Array.isArray(block.logs)) throw Error("Invalid GraphQL approval payload");
+  const number = typeof block.number === "string" && block.number.startsWith("0x") ? Number(BigInt(block.number)) : Number(block.number);
+  if (!Number.isSafeInteger(number) || number < 0) throw Error("Missing block number");
+  const result = [];
+  for (const item of block.logs) {
+    const topics = item.topics || [];
+    if (addr(item.account?.address) !== USDT || String(topics[0]).toLowerCase() !== APPROVAL_TOPIC || topics.length < 3) continue;
+    const spender = fromTopic(topics[2]);
+    if (!spender) continue;
+    const hash = String(item.transaction?.hash || "").toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(hash)) continue;
+    const idx = typeof item.index === "string" && item.index.startsWith("0x") ? Number(BigInt(item.index)) : Number(item.index);
+    if (!Number.isSafeInteger(idx) || idx < 0) throw Error("Invalid approval log index");
+    result.push({ spender, log: {
+      address: USDT,
+      topics,
+      transactionHash: hash,
+      logIndex: "0x" + idx.toString(16),
+      blockNumber: "0x" + number.toString(16),
+      data: item.data || "0x0"
+    } });
+  }
+  return result;
+}
+async function processRealtimeApprovalWebhook(env, payload) {
+  if (payload.webhookId !== env.ALCHEMY_APPROVAL_WEBHOOK_ID) throw Error("Unexpected approval webhook ID");
+  let n = 0;
+  for (const { spender, log } of parseApprovalWebhook(payload)) {
+    await processRealtimeApproval(env, spender, log);
+    n++;
+  }
+  return n;
 }
 
 // src/activity-replay.ts
@@ -2136,7 +2256,7 @@ var ADMIN_HTML = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 
 // src/admin.ts
 var adminHtml = () => ADMIN_HTML;
-var bad = (message, status2 = 400) => json({ error: message }, status2);
+var bad = (message, status3 = 400) => json({ error: message }, status3);
 var body = async (req) => {
   try {
     return await req.json();
@@ -2168,10 +2288,10 @@ async function handleAdmin(req, env, path) {
   if (method === "GET" && path === "/api/monitoring") {
     const q = new URL(req.url).searchParams;
     const page = Math.min(1e5, Math.max(0, parseInt(q.get("page") || "0", 10) || 0));
-    const status2 = q.get("status") || "all", search = String(q.get("search") || "").trim().slice(0, 90);
-    if (!["all", "active", "pending", "removal_pending"].includes(status2)) return bad("\u76D1\u63A7\u72B6\u6001\u7B5B\u9009\u65E0\u6548");
-    const where = "ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)" + (status2 === "all" ? "" : " AND ww.state=?") + (search ? " AND (ww.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ? ESCAPE '~')" : "");
-    const args = [...status2 === "all" ? [] : [status2], ...search ? [literalSearch(search), literalSearch(search)] : []];
+    const status3 = q.get("status") || "all", search = String(q.get("search") || "").trim().slice(0, 90);
+    if (!["all", "active", "pending", "removal_pending"].includes(status3)) return bad("\u76D1\u63A7\u72B6\u6001\u7B5B\u9009\u65E0\u6548");
+    const where = "ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)" + (status3 === "all" ? "" : " AND ww.state=?") + (search ? " AND (ww.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ? ESCAPE '~')" : "");
+    const args = [...status3 === "all" ? [] : [status3], ...search ? [literalSearch(search), literalSearch(search)] : []];
     const countQuery = env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where).bind(...args);
     const rowsQuery = env.DB.prepare(
       "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'\u5F85\u5907\u6CE8') AS remark,(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where + " ORDER BY ww.updated_at DESC,ww.address ASC LIMIT 50 OFFSET ?"
@@ -2286,12 +2406,12 @@ async function handleAdmin(req, env, path) {
     const q = new URL(req.url).searchParams, spender = addr(q.get("spender"));
     if (!spender) return bad("\u8BF7\u8F93\u5165\u6709\u6548\u7684 Spender \u5730\u5740");
     const page = Math.min(1e5, Math.max(0, Number.parseInt(q.get("page") || "0", 10) || 0));
-    const status2 = q.get("status") || "all";
-    if (!["all", "active", "revoked", "pending"].includes(status2)) return bad("\u6388\u6743\u72B6\u6001\u7B5B\u9009\u503C\u65E0\u6548");
+    const status3 = q.get("status") || "all";
+    if (!["all", "active", "revoked", "pending"].includes(status3)) return bad("\u6388\u6743\u72B6\u6001\u7B5B\u9009\u503C\u65E0\u6548");
     const jobQuery = env.DB.prepare("SELECT * FROM spender_history_jobs WHERE spender=?").bind(spender);
     const countsQuery = env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender);
-    const filter = status2 === "all" ? "" : " AND h.verify_status=?";
-    const args = status2 === "all" ? [spender, 50, page * 50] : [spender, status2, 50, page * 50];
+    const filter = status3 === "all" ? "" : " AND h.verify_status=?";
+    const args = status3 === "all" ? [spender, 50, page * 50] : [spender, status3, 50, page * 50];
     const rowsQuery = env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?" + filter + " ORDER BY h.latest_event_block DESC,h.owner ASC LIMIT ? OFFSET ?").bind(...args);
     const monitorQuery = env.DB.prepare(
       "SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN ww.state='active' THEN 1 ELSE 0 END),0) watched,COALESCE(SUM(CASE WHEN e.state='active' THEN 1 ELSE 0 END),0) connected,COALESCE(SUM(CASE WHEN e.state='retrying' THEN 1 ELSE 0 END),0) retrying FROM spender_history_addresses h LEFT JOIN wallet_watches ww ON ww.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?"
@@ -2303,7 +2423,7 @@ async function handleAdmin(req, env, path) {
     const counts = countsResult.results?.[0] || { total: 0, active: 0, revoked: 0, pending: 0 };
     const rows = rowsResult.results || [], monitor = monitorResult.results?.[0] || null;
     const cooldown = cooldownResult.results?.[0]?.value || null;
-    const total = status2 === "all" ? counts.total : counts[status2];
+    const total = status3 === "all" ? counts.total : counts[status3];
     return json({ job, counts, monitor, monitor_retry_at: cooldown ? Number(cooldown) : null, rows, page, total, total_pages: Math.ceil(total / 50) });
   }
   if (method === "POST" && path === "/api/spenders/history/refresh") {
@@ -2547,6 +2667,11 @@ async function cron(env) {
     console.error("Pending wallet discovery", String(e));
   }
   try {
+    await provisionRealtimeApprovals(env);
+  } catch (e) {
+    console.error("Realtime Approval provisioning", String(e));
+  }
+  try {
     await pollSpenders(env);
   } catch (e) {
     console.error("Spender scan", String(e));
@@ -2624,6 +2749,20 @@ var index_default = {
         await env.DB.prepare("INSERT OR IGNORE INTO telegram_updates(update_id) VALUES(?)").bind(upd.update_id).run();
         return json({ ok: true });
       }
+      if (req.method === "POST" && path === "/webhooks/alchemy-approvals") {
+        if (!active) return json({ error: "Monitor is not enabled" }, 503);
+        if (!configured.ALCHEMY_APPROVAL_WEBHOOK_ID || !configured.ALCHEMY_APPROVAL_SIGNING_KEY)
+          return json({ error: "Realtime Approval webhook not configured" }, 503);
+        const raw = await req.text();
+        const approvalEnv = { ...configured, ALCHEMY_SIGNING_KEY: configured.ALCHEMY_APPROVAL_SIGNING_KEY };
+        if (!await verifyAlchemy(approvalEnv, raw, req.headers.get("x-alchemy-signature")))
+          return json({ error: "Invalid approval webhook signature" }, 401);
+        const d = JSON.parse(raw);
+        if (d.type !== "GRAPHQL" || d.webhookId !== configured.ALCHEMY_APPROVAL_WEBHOOK_ID)
+          return json({ error: "Unexpected approval source" }, 400);
+        await env.TASKS.send({ kind: "approval_webhook", payload: d, received_at: Date.now() });
+        return json({ ok: true });
+      }
       if (req.method === "POST" && path === "/webhooks/alchemy") {
         if (!active) return json({ error: "Monitor is not enabled" }, 503);
         const raw = await req.text();
@@ -2657,8 +2796,16 @@ var index_default = {
             console.warn("Address query cleanup deferred", String(cleanErr));
           }
         } else if (item.kind === "activity") await processActivity(configured, item.payload);
+        else if (item.kind === "approval_webhook") await processRealtimeApprovalWebhook(configured, item.payload);
         else if (item.kind === "verify_admin") await verifyAdminOwner(configured, item.owner, item.chat_id);
         else throw Error("Unknown queue message kind");
+        if (item.kind === "activity" || item.kind === "approval_webhook") {
+          try {
+            await flushOutbox(configured, 20);
+          } catch (e) {
+            console.error("Immediate Telegram dispatch", String(e));
+          }
+        }
         message.ack();
       } catch (e) {
         console.error("Queue job failed", item.kind, String(e));
