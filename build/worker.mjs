@@ -700,7 +700,7 @@ async function renderTemplate(env, key2, chatId, data = {}, safeHtml = {}) {
 async function flushOutbox(env, max = 30, onlyUsage = false) {
   const { results: rows } = await env.DB.prepare("SELECT * FROM outbox WHERE state='pending' AND due_at<=CURRENT_TIMESTAMP " + (onlyUsage ? "AND template_key='usage_alert' " : "") + "ORDER BY id ASC LIMIT ?").bind(max).all();
   for (const row of rows || []) {
-    const locked2 = await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='pending'").bind(row.id).run();
+    const locked2 = await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,due_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending'").bind(row.id).run();
     if (!locked2.meta?.changes) continue;
     try {
       const payload = JSON.parse(row.payload_json || "{}");
@@ -730,7 +730,7 @@ async function flushOutbox(env, max = 30, onlyUsage = false) {
       await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,last_error=NULL WHERE id=?").bind(now(), result.message_id, row.id).run();
     } catch (e) {
       const message = String(e).slice(0, 250);
-      if (row.attempts >= 5 && row.template_key !== "usage_alert") {
+      if (row.attempts + 1 >= 5 && row.template_key !== "usage_alert") {
         await env.DB.prepare("UPDATE outbox SET state='failed',last_error=? WHERE id=?").bind(message, row.id).run();
         await notifyAdmin2(env, await renderTemplate(env, "notice_failed", env.ADMIN_TELEGRAM_CHAT_ID || "*", { queue_id: row.id, error_message: message }));
       } else {
@@ -741,7 +741,7 @@ async function flushOutbox(env, max = 30, onlyUsage = false) {
   }
 }
 async function recoverStuck(env) {
-  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND created_at<datetime('now','-10 minutes')").run();
+  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND due_at<datetime('now','-10 minutes')").run();
 }
 
 // src/wallet-remarks.ts
@@ -1552,6 +1552,7 @@ async function getOneDirection(env, address, direction, from, to) {
       blockNum: x.blockNum,
       value: x.value,
       category: x.category,
+      typeTraceAddress: x.typeTraceAddress,
       rawContract: { address: x.rawContract?.address, rawValue: x.rawContract?.value }
     }));
     await processActivity(env, { network: "ETH_MAINNET", event: { network: "ETH_MAINNET", activity: normalized } });
@@ -1560,19 +1561,19 @@ async function getOneDirection(env, address, direction, from, to) {
   } while (cursor);
   return transactions;
 }
-async function scanWalletGaps(env, maxWallets = 3) {
+async function scanWalletGaps(env, maxWallets = 8) {
   const head = await blockNumber(env);
   const { results: wallets } = await env.DB.prepare(
-    "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? ORDER BY c.last_block ASC LIMIT ?"
+    "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? AND (c.last_error IS NULL OR c.checked_at IS NULL OR c.checked_at<datetime('now','-5 minutes')) ORDER BY c.last_block ASC,c.checked_at ASC LIMIT ?"
   ).bind(head, maxWallets).all();
   for (const w of wallets || []) {
-    const from = Math.max(0, w.last_block - 5), to = Math.min(head, w.last_block + 120);
+    const from = Math.max(0, w.last_block - 5), to = Math.min(head, w.last_block + 600);
     try {
       await getOneDirection(env, w.address, "out", from, to);
       await getOneDirection(env, w.address, "in", from, to);
       await env.DB.prepare("UPDATE wallet_checkpoints SET last_block=?,checked_at=?,last_error=NULL WHERE address=?").bind(to, now(), w.address).run();
     } catch (e) {
-      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=? WHERE address=?").bind(String(e).slice(0, 300), w.address).run();
+      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=?,checked_at=? WHERE address=?").bind(String(e).slice(0, 300), now(), w.address).run();
       console.error("Wallet recovery failure", w.address, String(e));
     }
   }
@@ -2329,7 +2330,7 @@ async function cron(env) {
     console.error("Alchemy address reconciliation", String(e));
   }
   try {
-    await scanWalletGaps(env, 3);
+    await scanWalletGaps(env, 8);
   } catch (e) {
     console.error("Transfer recovery", String(e));
   }
