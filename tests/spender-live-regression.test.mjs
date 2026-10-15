@@ -113,3 +113,26 @@ test("backend exposes realtime authorization polling failures",async()=>{
  assert.match(admin,/spender_poll_status:/);
  assert.match(notification,/approvalAlert&&sub\.status==="pending"/);
 });
+
+test("Etherscan fallback rescues Alchemy HTTP 400 and preserves scanning progress",async()=>{
+ const {env,state}=prepareFixture({head:160,provider:async()=>{throw Error("Ethereum RPC HTTP 400")}});
+ env.ETHERSCAN_API_KEY="test-only";
+ const original=globalThis.fetch;
+ let requests=0;
+ globalThis.fetch=async url=>{
+   requests++;
+   const u=new URL(url);
+   assert.equal(u.searchParams.get("chainid"),"1");
+   assert.equal(u.searchParams.get("topic0_2_opr"),"and");
+   return {ok:true,json:async()=>({status:"0",message:"No records found",result:[]})};
+ };
+ try{
+   await pollSpenders(env);
+   assert.equal(state.rules[0].cursor_block,160);
+   assert.ok(requests>0);
+   assert.equal(state.map.get("spender_poll_provider:"+spender),"etherscan");
+   const status=JSON.parse(state.map.get("spender_poll_status:"+spender));
+   assert.equal(status.status,"ok");
+   assert.equal(status.provider,"etherscan");
+ }finally{globalThis.fetch=original;delete globalThis.__spenderFixture}
+});
