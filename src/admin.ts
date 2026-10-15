@@ -111,7 +111,18 @@ export async function handleAdmin(req,env,path){
     const args=status==="all"?[spender,50,page*50]:[spender,status,50,page*50];
     const rows=(await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?"+filter+" ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
     const total=status==="all"?counts.total:counts[status];
-    return json({job,counts,rows,page,total,total_pages:Math.ceil(total/50)});
+    const monitor=await env.DB.prepare(
+      "SELECT COUNT(*) total,"+
+      "COALESCE(SUM(CASE WHEN ww.state='active' THEN 1 ELSE 0 END),0) watched,"+
+      "COALESCE(SUM(CASE WHEN e.state='active' THEN 1 ELSE 0 END),0) connected,"+
+      "COALESCE(SUM(CASE WHEN e.state='retrying' THEN 1 ELSE 0 END),0) retrying "+
+      "FROM spender_history_addresses h "+
+      "LEFT JOIN wallet_watches ww ON ww.address=h.owner "+
+      "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
+      "WHERE h.spender=?"
+    ).bind(spender).first();
+    const cooldown=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='spender_enroll_retry_after'").first())?.value||null;
+    return json({job,counts,monitor,monitor_retry_at:cooldown?Number(cooldown):null,rows,page,total,total_pages:Math.ceil(total/50)});
   }
   if(method==="POST"&&path==="/api/spenders/history/refresh"){
     const d=await body(req),spender=addr(d.spender);
