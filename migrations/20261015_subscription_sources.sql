@@ -1,6 +1,6 @@
 -- Attribution is additive and conservative: never silently remove legacy subscriptions.
 -- Existing rows may have manual or multiple-Spender origin not reconstructible
--- from the old schema; mark as legacy until an administrator confirms ownership.
+-- from the old schema. Mark as legacy until an administrator confirms ownership.
 CREATE TABLE IF NOT EXISTS subscription_sources (
   chat_id TEXT NOT NULL,
   address TEXT NOT NULL,
