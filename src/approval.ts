@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
 import {recordSpenderLiveApproval} from "./spender-history";
+import {walletRemark} from "./wallet-remarks";
 import {renderTemplate} from "./notifications";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
@@ -52,11 +53,12 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   await env.DB.prepare("UPDATE wallets SET first_user_id=?,first_user_name=? WHERE address=? AND first_user_id IS NULL")
     .bind(String(user_id),display_name,owner).run();
   const first=await env.DB.prepare("SELECT first_user_name FROM wallets WHERE address=?").bind(owner).first();
-  await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id),owner,first?.first_user_name||display_name).run();
+  const sharedRemark=await walletRemark(env,owner,first?.first_user_name||display_name);
+  await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id),owner,sharedRemark).run();
   const watched=await ensureWatch(env,owner);
   if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id),owner).run();
   const current=await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id),owner).first();
-  const groupRemark=current?.remark||first?.first_user_name||display_name;
+  const groupRemark=await walletRemark(env,owner,current?.remark||first?.first_user_name||display_name);
   const lines=positives.slice(0,25).map((x,i)=>(i+1)+". <code>"+esc(x.spender)+"</code>\n额度："+(BigInt(x.amount)>=(1n<<255n)?"无限":formatUnits(x.amount,6)+" USDT"));
   const output=await renderTemplate(env,"query_active",chat_id,{
     remark:groupRemark,address:owner,
@@ -109,7 +111,7 @@ async function processApproval(env,rule,log){
       const chat=String(route.chat_id);
       const exists=await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first();
       if(!exists)continue;
-      const remark="待备注 · "+short(owner);
+      const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
     }
     const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
