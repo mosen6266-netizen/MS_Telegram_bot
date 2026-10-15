@@ -1302,15 +1302,7 @@ async function processApproval(env, rule, log) {
       const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, owner, remark).run();
     }
-    let watched = registered?.state === "active";
-    if (!watched) {
-      try {
-        watched = await ensureWatch(env, owner, Number(BigInt(log.blockNumber)));
-      } catch (watchError) {
-        console.warn("Approval Owner monitor pending", owner, String(watchError));
-      }
-    }
-    if (watched) await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
+    const watched = registered?.state === "active";
     for (const route of routes || []) await queueNotice(env, {
       dedup: evId + ":" + route.chat_id,
       chat_id: route.chat_id,
@@ -1318,6 +1310,7 @@ async function processApproval(env, rule, log) {
       template: "new_approval",
       payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount2, 6) + " USDT", tx_hash: log.transactionHash, watch_status: watched ? "active" : "pending" }
     });
+    if (!watched) await env.TASKS.send({ kind: "enroll_owner", owner, block: Number(BigInt(log.blockNumber)) });
     if (!registered) await increment(env, "discovered_wallets");
   } else if (type !== "unchanged") {
     const { results: routes } = await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
@@ -1685,8 +1678,22 @@ async function provisionRealtimeApprovals(env) {
     const raw = await list.json();
     const existing = (Array.isArray(raw?.data) ? raw.data : Array.isArray(raw) ? raw : []).filter((x) => x.webhook_url === url && x.network === "ETH_MAINNET" && x.webhook_type === "GRAPHQL");
     if (existing.length) {
-      await status2(env, { state: "needs_key", reason: "Custom webhook already exists; missing signing key", id: existing[0].id });
-      return { status: "needs_existing_signing_key" };
+      const wh = existing[0];
+      if (!wh.signing_key) throw Error("Custom webhook exists but signing key unavailable; configure it manually");
+      await persistSecret(env, "ALCHEMY_APPROVAL_SIGNING_KEY", wh.signing_key);
+      await persistSecret(env, "ALCHEMY_APPROVAL_WEBHOOK_ID", wh.id);
+      env.ALCHEMY_APPROVAL_SIGNING_KEY = wh.signing_key;
+      env.ALCHEMY_APPROVAL_WEBHOOK_ID = wh.id;
+      if (wh.is_active === false) {
+        const enable = await fetch("https://dashboard.alchemy.com/api/update-webhook", {
+          method: "PUT",
+          headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ webhook_id: wh.id, is_active: true })
+        });
+        if (!enable.ok) throw Error("Existing custom webhook enable HTTP " + enable.status);
+      }
+      await status2(env, { state: "active", id: wh.id, spender_count: spenders.length });
+      return { status: "reused", active: true };
     }
     const res = await fetch("https://dashboard.alchemy.com/api/create-webhook", {
       method: "POST",
@@ -1696,7 +1703,7 @@ async function provisionRealtimeApprovals(env) {
         webhook_type: "GRAPHQL",
         name: "MS007 USDT Spender Approval Seconds",
         webhook_url: url,
-        graphql_query: approvalQuery(spenders)
+        graphql_query: { query: approvalQuery(spenders), skip_empty_messages: true }
       })
     });
     const body2 = await res.json(), created = body2?.data || body2;
@@ -1706,13 +1713,16 @@ async function provisionRealtimeApprovals(env) {
     await persistSecret(env, "ALCHEMY_APPROVAL_WEBHOOK_ID", created.id);
     env.ALCHEMY_APPROVAL_WEBHOOK_ID = created.id;
     env.ALCHEMY_APPROVAL_SIGNING_KEY = created.signing_key;
-    await status2(env, {
-      state: created.is_active === false ? "created_inactive" : "active",
-      id: created.id,
-      spender_count: spenders.length,
-      active: created.is_active
-    });
-    return { status: "created", active: created.is_active };
+    if (created.is_active === false) {
+      const enabled = await fetch("https://dashboard.alchemy.com/api/update-webhook", {
+        method: "PUT",
+        headers: { "X-Alchemy-Token": env.ALCHEMY_NOTIFY_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({ webhook_id: created.id, is_active: true })
+      });
+      if (!enabled.ok) throw Error("Custom webhook created but activation HTTP " + enabled.status);
+    }
+    await status2(env, { state: "active", id: created.id, spender_count: spenders.length, active: true });
+    return { status: "created", active: true };
   } catch (e) {
     await status2(env, { state: "error", reason: String(e.message || e).slice(0, 210) });
     await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('approval_realtime_retry_after',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(String(Date.now() + 15 * 60 * 1e3)).run();
@@ -1757,6 +1767,40 @@ async function processRealtimeApprovalWebhook(env, payload) {
     n++;
   }
   return n;
+}
+var RETRY_PREFIX = "failed_approval_webhook:";
+async function failureKey(payload) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(payload?.id || JSON.stringify(payload)))));
+  return RETRY_PREFIX + [...digest].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+async function storeFailedRealtimeApproval(env, payload, error) {
+  const key2 = await failureKey(payload);
+  await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)").bind(key2, JSON.stringify({ payload, attempts: 0, next_at: 0, last_error: String(error?.message || error).slice(0, 180) })).run();
+  return key2;
+}
+async function retryFailedRealtimeApprovals(env, limit = 3) {
+  const { results: records } = await env.DB.prepare("SELECT key,value FROM runtime_state WHERE key LIKE 'failed_approval_webhook:%' ORDER BY updated_at ASC LIMIT 20").all();
+  let recovered = 0;
+  for (const row of records || []) {
+    if (recovered >= limit) break;
+    let state2;
+    try {
+      state2 = JSON.parse(row.value);
+    } catch {
+      continue;
+    }
+    if (!state2?.payload || Number(state2.next_at || 0) > Date.now()) continue;
+    try {
+      await processRealtimeApprovalWebhook(env, state2.payload);
+      await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(row.key).run();
+      recovered++;
+    } catch (e) {
+      const attempts = Number(state2.attempts || 0) + 1;
+      const delay = Math.min(36e5, 15e3 * Math.pow(2, Math.min(attempts, 8)));
+      await env.DB.prepare("UPDATE runtime_state SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key=?").bind(JSON.stringify({ ...state2, attempts, next_at: Date.now() + delay, last_error: String(e?.message || e).slice(0, 180) }), row.key).run();
+    }
+  }
+  return recovered;
 }
 
 // src/activity-replay.ts
@@ -2714,6 +2758,11 @@ async function cron(env) {
     console.error("Failed activity recovery", String(e));
   }
   try {
+    await retryFailedRealtimeApprovals(env, 3);
+  } catch (e) {
+    console.error("Failed realtime Approval recovery", String(e));
+  }
+  try {
     await flushOutbox(env, 40);
   } catch (e) {
     console.error("Telegram outbox delivery", String(e));
@@ -2797,7 +2846,15 @@ var index_default = {
           }
         } else if (item.kind === "activity") await processActivity(configured, item.payload);
         else if (item.kind === "approval_webhook") await processRealtimeApprovalWebhook(configured, item.payload);
-        else if (item.kind === "verify_admin") await verifyAdminOwner(configured, item.owner, item.chat_id);
+        else if (item.kind === "enroll_owner") {
+          const owner = item.owner;
+          const excluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
+          const wallet = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
+          if (!excluded && !wallet?.deleted_at) {
+            if (await ensureWatch(configured, owner, item.block))
+              await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
+          }
+        } else if (item.kind === "verify_admin") await verifyAdminOwner(configured, item.owner, item.chat_id);
         else throw Error("Unknown queue message kind");
         if (item.kind === "activity" || item.kind === "approval_webhook") {
           try {
@@ -2810,6 +2867,15 @@ var index_default = {
       } catch (e) {
         console.error("Queue job failed", item.kind, String(e));
         if (message.attempts >= 5) {
+          if (item.kind === "approval_webhook") {
+            try {
+              await storeFailedRealtimeApproval(env, item.payload, e);
+            } catch (saveError) {
+              console.error("Realtime approval retention failed", String(saveError));
+              message.retry({ delaySeconds: 120 });
+              continue;
+            }
+          }
           if (item.kind === "activity") {
             try {
               await retainFailedActivity(env, item.payload, e);
