@@ -4,6 +4,7 @@ import {handleTelegram} from "./telegram";
 import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history";
 import {enrollHistoricalOwners} from "./spender-enroll";
+import {reconcileAlchemyAddresses} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
@@ -21,6 +22,7 @@ async function cron(env){
   try{for(let i=0;i<4;i++){if(!await scanSpenderHistories(env))break;}}catch(e){console.error("Spender history scan",String(e))}
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
   try{await enrollHistoricalOwners(env,20);}catch(e){console.error("Historical monitoring enrollment",String(e))}
+  try{await reconcileAlchemyAddresses(env);}catch(e){console.error("Alchemy address reconciliation",String(e))}
   try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
   await flushOutbox(env,40);
