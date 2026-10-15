@@ -244,20 +244,14 @@ async function processApproval(env,rule,log){
       const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
     }
-    let watched=registered?.state==="active";
-    if(!watched){
-      try{watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));}
-      catch(watchError){
-        // The approval notification is independent from Alchemy enrollment.
-        // The pending-wallet cron will retry enrollment automatically.
-        console.warn("Approval Owner monitor pending",owner,String(watchError));
-      }
-    }
-    if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
+    const watched=registered?.state==="active";
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"new_approval",
       payload:{owner,spender:rule.spender,spender_remark:rule.remark,amount:formatUnits(amount,6)+" USDT",tx_hash:log.transactionHash,watch_status:watched?"active":"pending"}
     });
+    // Enrollment must never block first-confirmation notification latency.
+    // Queue it independently, with the existing cron as a fallback.
+    if(!watched)await env.TASKS.send({kind:"enroll_owner",owner,block: Number(BigInt(log.blockNumber))});
     if(!registered)await increment(env,"discovered_wallets");
   } else if(type!=="unchanged") {
     const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
