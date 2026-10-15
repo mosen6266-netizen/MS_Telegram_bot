@@ -122,14 +122,68 @@ export async function handleAdmin(req,env,path){
     return json({ok:true,note:"已安排重新核验当前授权额度，历史扫描从断点继续"});
   }
   if(method==="PATCH"&&path==="/api/spenders"){
-    const d=await body(req),a=addr(d.spender);if(!a)return bad("无效 Spender");
-    if(d.enabled!==undefined)await env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled?1:0,a).run();
+    const d=await body(req),a=addr(d.spender);
+    if(!a)return bad("无效 Spender 地址");
+    const rule=await env.DB.prepare("SELECT spender,remark,enabled FROM spender_rules WHERE spender=?").bind(a).first();
+    if(!rule)return bad("找不到该 Spender 规则",404);
+    let remark;
     if(d.remark!==undefined){
-      const remark=String(d.remark).trim();if(!remark||remark.length>80)return bad("备注长度为 1–80 字符");
-      await env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark,a).run();
+      remark=String(d.remark).trim();
+      if(!remark||Array.from(remark).length>80||/[\u0000-\u001f\u007f]/.test(remark))return bad("备注须为 1–80 个字符，不能包含控制字符");
     }
-    await audit(env,"admin","update_spender",a);
-    return json({ok:true});
+    let chats,oldGroups=[],removed=[],added=[];
+    if(d.chat_ids!==undefined){
+      if(!Array.isArray(d.chat_ids))return bad("通知群 ID 格式无效");
+      chats=[...new Set(d.chat_ids.map(x=>String(x).trim()))];
+      if(!chats.length||chats.some(x=>!/^-\d{5,20}$/.test(x)))return bad("请填写至少一个有效 Telegram 群 ID（例如 -100...）");
+      for(const chat of chats){
+        const c=await env.DB.prepare("SELECT chat_id,chat_type,active FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+        if(!c)return bad("群组尚未登记："+chat+"。请先将机器人加入该群，并在群内发送一条消息。");
+        if(!["group","supergroup"].includes(c.chat_type)||!c.active)return bad("通知目标不是已启用的 Telegram 群："+chat);
+      }
+      oldGroups=((await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(a).all()).results||[]).map(x=>String(x.chat_id));
+      removed=oldGroups.filter(x=>!chats.includes(x));
+      added=chats.filter(x=>!oldGroups.includes(x));
+    }
+    const changes=[];
+    if(d.enabled!==undefined)changes.push(env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled?1:0,a));
+    if(remark!==undefined)changes.push(env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark,a));
+    if(chats){
+      // Add all new destinations first. If any statement fails, the D1 batch
+      // rolls back rather than leaving a Spender without notification routes.
+      for(const chat of added)changes.push(env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(a,chat));
+      for(const chat of added){
+        changes.push(env.DB.prepare(
+          "INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) "+
+          "SELECT ?,h.owner,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=h.owner ORDER BY s.updated_at DESC LIMIT 1),'待备注 · '||substr(h.owner,1,12)),"+
+          "CASE WHEN ww.state='active' THEN 'active' ELSE 'pending' END "+
+          "FROM spender_history_addresses h "+
+          "LEFT JOIN wallet_global_remarks g ON g.address=h.owner "+
+          "LEFT JOIN wallet_watches ww ON ww.address=h.owner "+
+          "LEFT JOIN wallets w ON w.address=h.owner "+
+          "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
+          "WHERE h.spender=? AND x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL)"
+        ).bind(chat,a));
+      }
+      // Removed routes must stop receiving this Spender's future approval
+      // notifications. Only remove auto-created wallet subscriptions that do
+      // not belong to another Spender, manual query or admin-added wallet.
+      for(const chat of removed)changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a,chat));
+      for(const chat of removed){
+        changes.push(env.DB.prepare(
+          "UPDATE subscriptions SET status='removed',updated_at=CURRENT_TIMESTAMP "+
+          "WHERE chat_id=? AND status IN ('active','pending') "+
+          "AND address IN (SELECT owner FROM spender_history_addresses WHERE spender=?) "+
+          "AND NOT EXISTS(SELECT 1 FROM wallets w WHERE w.address=subscriptions.address "+
+            "AND (w.first_user_id IS NOT NULL OR w.discovery_source IN ('manual','admin'))) "+
+          "AND NOT EXISTS(SELECT 1 FROM spender_history_addresses h2 JOIN spender_routes r2 ON r2.spender=h2.spender "+
+            "WHERE h2.owner=subscriptions.address AND r2.chat_id=? AND h2.spender<>?)"
+        ).bind(chat,a,chat,a));
+      }
+    }
+    if(changes.length)await env.DB.batch(changes);
+    await audit(env,"admin","update_spender",a,{remark_changed:remark!==undefined,old_groups:oldGroups,new_groups:chats||undefined,removed,added});
+    return json({ok:true,remark:remark??rule.remark,groups:chats||oldGroups,added,removed,note:"Spender 备注和通知群规则已保存；旧群的手动订阅与其他 Spender 订阅保持不变。"});
   }
   if(method==="GET"&&path==="/api/subscriptions")return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
   if(method==="PATCH"&&path==="/api/subscriptions"){
