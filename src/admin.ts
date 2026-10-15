@@ -295,7 +295,23 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","retry_failed_outbox",String(result.task.id),{chat:result.task.chat_id,template:result.task.template_key});
     return json({ok:true,queued:true,note:"任务已重新排队。极少数远端实际发送成功、但回执记录失败的情况可能产生重复消息。"});
   }
-  if(method==="GET"&&path==="/api/outbox")return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/outbox"){
+    const q=new URL(req.url).searchParams;
+    const page=Math.max(0,Math.min(100000,Number.parseInt(q.get("page")||"0",10)||0));
+    const status=q.get("status")||"all",search=String(q.get("search")||"").trim().slice(0,40);
+    if(!["all","pending","sending","sent","failed","skipped"].includes(status))return bad("通知状态筛选无效");
+    if(search&&!/^-?[0-9]{1,20}$/.test(search))return bad("请输入有效任务编号或 Telegram 群 ID");
+    const id=search&&Number.isSafeInteger(Number(search))&&Number(search)>0?Number(search):null;
+    const where="1=1"+(status==="all"?"":" AND state=?")+(search?(id!==null?" AND (id=? OR chat_id=?)":" AND chat_id=?"):"");
+    const params=[...(status==="all"?[]:[status]),...(search?(id!==null?[id,search]:[search]):[])];
+    const [totalResult,rowsResult,statsResult]=await env.DB.batch([
+      env.DB.prepare("SELECT COUNT(*) AS n FROM outbox WHERE "+where).bind(...params),
+      env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at,due_at FROM outbox WHERE "+where+" ORDER BY id DESC LIMIT 50 OFFSET ?").bind(...params,page*50),
+      env.DB.prepare("SELECT state,COUNT(*) n FROM outbox GROUP BY state")
+    ]);
+    const total=totalResult.results?.[0]?.n||0;
+    return json({rows:rowsResult.results||[],summary:statsResult.results||[],total,page,total_pages:Math.ceil(total/50)});
+  }
   if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/usage"){
     const [settings,platforms]=await Promise.all([usageSettings(env),usageSnapshot(env)]);
