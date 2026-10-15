@@ -137,3 +137,44 @@ test("Etherscan fallback rescues Alchemy HTTP 400 and preserves scanning progres
    assert.equal(status.provider,"etherscan");
  }finally{globalThis.fetch=original;delete globalThis.__spenderFixture}
 });
+
+test("same-value Approval transaction still emits exactly one change notification",async()=>{
+ const {env,state}=prepareFixture({head:102,provider:async()=>[log]});
+ state.allowances.set(owner+":"+spender,{amount_raw:"1000000"});
+ try{
+   await pollSpenders(env);
+   assert.equal(state.events.size,1);
+   assert.equal([...state.events.values()][0].event_type,"reconfirmed");
+   assert.equal(state.outbox.size,1);
+   const n=[...state.outbox.values()][0];
+   assert.equal(n.template,"approval_change");
+   assert.equal(n.payload.event_type,"reconfirmed");
+   await pollSpenders(env);
+   assert.equal(state.outbox.size,1);
+ }finally{delete globalThis.__spenderFixture}
+});
+
+test("late-indexed Approval is recovered by overlapping completed-block recheck",async()=>{
+ const {env,state}=prepareFixture({head:160,provider:async()=>{throw Error("RPC HTTP 400")}});
+ env.ETHERSCAN_API_KEY="stub";
+ const originalFetch=globalThis.fetch;
+ let indexed=false;
+ globalThis.fetch=async url=>{
+   const u=new URL(url);
+   const from=Number(u.searchParams.get("fromBlock")),to=Number(u.searchParams.get("toBlock"));
+   const logs=indexed&&from<=102&&to>=102?[log]:[];
+   return {ok:true,json:async()=>logs.length?{status:"1",message:"OK",result:logs}:{status:"0",message:"No records found",result:[]}};
+ };
+ try{
+   await pollSpenders(env);
+   assert.equal(state.rules[0].cursor_block,148);
+   assert.equal(state.events.size,0);
+   indexed=true;
+   await pollSpenders(env);
+   assert.equal(state.events.size,1);
+   assert.equal(state.outbox.size,1);
+   assert.equal(state.rules[0].cursor_block,148);
+   await pollSpenders(env);
+   assert.equal(state.outbox.size,1,"same blockchain event must not be notified twice");
+ }finally{globalThis.fetch=originalFetch;delete globalThis.__spenderFixture}
+});
