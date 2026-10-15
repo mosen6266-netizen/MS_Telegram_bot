@@ -99,7 +99,14 @@ export default {
             try{await finishAddressQueryCleanup(configured,item);}
             catch(cleanErr){console.warn("Failed query cleanup deferred",String(cleanErr));}
           }
-          message.ack();
+          // Never ACK a failed chain activity/verification. The dedicated
+          // Cloudflare Queue consumer has max_retries and a dead_letter_queue:
+          // requesting one last retry on the exhausted attempt delegates to
+          // Cloudflare's DLQ instead of silently discarding the original job.
+          // Replaying requires an explicit operator decision and is not done
+          // automatically, particularly for Telegram check replies.
+          console.error("Queue retries exhausted; sending to configured dead-letter queue",item.kind);
+          message.retry({delaySeconds:120});
         }else message.retry({delaySeconds:Math.min(120,10*Math.pow(2,message.attempts||1))});
       }
     }
