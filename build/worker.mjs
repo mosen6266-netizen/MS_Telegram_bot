@@ -1253,6 +1253,17 @@ async function pollSpenders(env) {
         break;
       }
     }
+    const completedThrough = Math.min(cursor, preferBackup ? Math.max(0, head - 12) : head);
+    if (completedThrough >= Number(rule.start_block || 0) + 1 && preferBackup && cursor >= head - 160) {
+      const replayFrom = Math.max(Number(rule.start_block || 0) + 1, completedThrough - 127);
+      try {
+        const recent = await etherscanApprovalLogs(env, rule.spender, replayFrom, completedThrough);
+        for (const log of recent) if (!log.removed) await processApproval(env, rule, log);
+      } catch (e) {
+        console.error("Spender trailing log recheck failed", rule.spender, String(e));
+        await savePollState(env.DB, rule.spender, { status: "warning", stage: "trailing_recheck", cursor, head, message: String(e.message || e).slice(0, 220), at: now() });
+      }
+    }
   }
 }
 async function processApproval(env, rule, log) {
@@ -1262,7 +1273,6 @@ async function processApproval(env, rule, log) {
   if (ok === null) throw Error("Transaction receipt is not indexed yet; retry this block");
   if (ok === false) return;
   const amount2 = await allowance(env, owner, rule.spender);
-  await recordSpenderLiveApproval(env, rule.spender, log, amount2);
   const manuallyExcluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
   const walletRecord = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
   if (manuallyExcluded || walletRecord?.deleted_at) return;
@@ -1270,9 +1280,10 @@ async function processApproval(env, rule, log) {
   const before = BigInt(previous?.amount_raw || "0");
   const evId = "approval:" + log.transactionHash + ":" + log.logIndex;
   const eventRecord = await env.DB.prepare("SELECT event_type FROM approval_events WHERE event_id=?").bind(evId).first();
-  const type = eventRecord?.event_type || (amount2 === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount2 > before ? "increased" : amount2 < before ? "decreased" : "unchanged");
+  const type = eventRecord?.event_type === "unchanged" ? "reconfirmed" : eventRecord?.event_type || (amount2 === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount2 > before ? "increased" : amount2 < before ? "decreased" : "reconfirmed");
+  if (!eventRecord) await recordSpenderLiveApproval(env, rule.spender, log, amount2);
   await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)").bind(evId, owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), log.transactionHash, type).run();
-  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP").bind(owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), Number(BigInt(log.blockNumber))).run();
+  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=MAX(allowances.latest_block,excluded.latest_block),updated_at=CURRENT_TIMESTAMP").bind(owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), Number(BigInt(log.blockNumber))).run();
   const registered = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
   if (amount2 > 0n && (type === "new" || type === "reauthorized")) {
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
