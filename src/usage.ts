@@ -161,24 +161,44 @@ export async function collectUsage(env:Env,force=false){
   }finally{await env.DB.prepare("DELETE FROM runtime_state WHERE key='usage_collect_lock' AND value=?").bind(lockId).run();}
 }
 export async function usageSnapshot(env:Env):Promise<MeterView[]>{
-  const samples=(await env.DB.prepare("SELECT * FROM usage_samples").all<Sample>()).results;
-  const collectors=(await env.DB.prepare("SELECT * FROM usage_collectors").all<{provider:string;last_error:string|null}>()).results;
+  // Fetch current samples, collector health and GitHub visibility in one D1
+  // roundtrip. A second D1.batch gathers all historical baselines together
+  // (instead of one separate .first() call per meter). Preserve the exact
+  // original 15-minute to 24-hour historical comparison window.
+  const [sampleResult,collectorResult,repoResult]=await env.DB.batch([
+    env.DB.prepare("SELECT * FROM usage_samples"),
+    env.DB.prepare("SELECT * FROM usage_collectors"),
+    env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_visibility'")
+  ]);
+  const samples=(sampleResult.results||[]) as Sample[];
+  const collectors=(collectorResult.results||[]) as {provider:string;last_error:string|null}[];
+  const repo=(repoResult.results?.[0] as {value?:string}|undefined)?.value;
+  const sampleByMetric=new Map(samples.map(s=>[s.metric,s]));
+  const healthByProvider=new Map(collectors.map(c=>[c.provider,c]));
+
+  const historical=samples.length?await env.DB.batch(samples.map(sample=>
+    env.DB.prepare("SELECT * FROM usage_observations WHERE metric=? AND period_start=? AND source=? AND observed_at<=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1")
+      .bind(sample.metric,sample.period_start,sample.source,
+        new Date(Date.parse(sample.observed_at)-15*60000).toISOString(),
+        new Date(Date.parse(sample.observed_at)-86400000).toISOString())
+  )):[];
+  const previousByMetric=new Map<string,UsagePoint|null>(
+    samples.map((sample,i)=>[sample.metric,(historical[i]?.results?.[0] as UsagePoint|undefined)||null])
+  );
   const rows:MeterView[]=[];
   for(const meter of USAGE_METERS){
-    const sample=samples.find(x=>x.metric===meter.metric),health=collectors.find(x=>x.provider===meter.provider);
+    const sample=sampleByMetric.get(meter.metric),health=healthByProvider.get(meter.provider);
     if(!sample){rows.push({...meter,used:null,quota:null,percentage:null,status:"waiting",source:"not_connected",
       note:health?.last_error||"等待首次采集",threshold_alert:false,forecast_alert:false});continue;}
-    const previous=await env.DB.prepare("SELECT * FROM usage_observations WHERE metric=? AND period_start=? AND source=? AND observed_at<=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1")
-      .bind(meter.metric,sample.period_start,sample.source,new Date(Date.parse(sample.observed_at)-15*60000).toISOString(),new Date(Date.parse(sample.observed_at)-86400000).toISOString()).first<UsagePoint>();
-    const assessment=assessUsage(sample,previous,new Date()),extra=JSON.parse(sample.extra_json||"{}");
+    const assessment=assessUsage(sample,previousByMetric.get(meter.metric)||null,new Date());
+    const extra=JSON.parse(sample.extra_json||"{}");
     const valid=assessment.fresh&&!health?.last_error&&extra.complete!==false;
     rows.push({...meter,...sample,...assessment,extra,note:health?.last_error||extra.note||"",
       status:health?.last_error?"error":!assessment.fresh?"stale":extra.complete===false?"backfilling":"ok",
       threshold_alert:valid&&assessment.threshold_alert,forecast_alert:valid&&assessment.forecast_alert,
       accurate_official_usage:sample.source==="official_api"});
   }
-  const repo=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_github_visibility'").first<{value:string}>())?.value;
-  const githubError=collectors.find(x=>x.provider==="github")?.last_error;
+  const githubError=healthByProvider.get("github")?.last_error;
   rows.push({name:"GitHub",metric:"github_actions",detail:"代码仓库 / 标准 Actions",unit:"分钟",provider:"github",
     source:repo?"official_repository":"not_connected",status:githubError?"error":repo==="public"?"not_applicable":"waiting",
     used:null,quota:null,percentage:null,threshold_alert:false,forecast_alert:false,
