@@ -55,21 +55,24 @@ test("a stale pending result cannot bypass a newly scheduled Retry-After",async(
   globalThis.fetch=async()=>{calls++;return Response.json({ok:true,result:{message_id:1}})};
   // Mimic a parallel worker applying a future due_at just after this
   // invocation reads its initial pending list, but before it claims it.
+  let intercepts=0;
   const wrapper={
    prepare(sql){
-    const statement=DB.prepare(sql);
     if(sql.startsWith("SELECT * FROM outbox WHERE state='pending'")){
-      const originalAll=statement.all.bind(statement);
-      statement.all=async()=>{
-       const rows=await originalAll();
-       await DB.prepare("UPDATE outbox SET due_at=datetime('now','+120 seconds') WHERE id=1").run();
-       return rows;
-      };
+      return {bind:(...params)=>({
+       all:async()=>{
+        intercepts++;
+        const rows=await DB.prepare(sql).bind(...params).all();
+        await DB.prepare("UPDATE outbox SET due_at=datetime('now','+120 seconds') WHERE id=1").run();
+        return rows;
+       }
+      })};
     }
-    return statement;
+    return DB.prepare(sql);
    }
   };
   await flushOutbox({DB:wrapper,TELEGRAM_BOT_TOKEN:"synthetic"},1,true);
+  assert.equal(intercepts,1,"the concurrency test must actually intercept row selection");
   assert.equal(calls,0);
   const row=await DB.prepare("SELECT state,attempts FROM outbox WHERE id=1").first();
   assert.equal(row.state,"pending");assert.equal(row.attempts,0);
