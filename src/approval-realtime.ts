@@ -115,3 +115,36 @@ export async function processRealtimeApprovalWebhook(env,payload){
   }
   return n;
 }
+
+const RETRY_PREFIX="failed_approval_webhook:";
+async function failureKey(payload){
+  const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(String(payload?.id||JSON.stringify(payload)))));
+  return RETRY_PREFIX+[...digest].map(x=>x.toString(16).padStart(2,"0")).join("");
+}
+export async function storeFailedRealtimeApproval(env,payload,error){
+  const key=await failureKey(payload);
+  await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)")
+    .bind(key,JSON.stringify({payload,attempts:0,next_at:0,last_error:String(error?.message||error).slice(0,180)})).run();
+  return key;
+}
+export async function retryFailedRealtimeApprovals(env,limit=3){
+  const {results:records}=await env.DB.prepare("SELECT key,value FROM runtime_state WHERE key LIKE 'failed_approval_webhook:%' ORDER BY updated_at ASC LIMIT 20").all();
+  let recovered=0;
+  for(const row of (records||[])){
+    if(recovered>=limit)break;
+    let state;
+    try{state=JSON.parse(row.value)}catch{continue;}
+    if(!state?.payload||Number(state.next_at||0)>Date.now())continue;
+    try{
+      await processRealtimeApprovalWebhook(env,state.payload);
+      await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(row.key).run();
+      recovered++;
+    }catch(e){
+      const attempts=Number(state.attempts||0)+1;
+      const delay=Math.min(3600000,15000*Math.pow(2,Math.min(attempts,8)));
+      await env.DB.prepare("UPDATE runtime_state SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key=?")
+        .bind(JSON.stringify({...state,attempts,next_at:Date.now()+delay,last_error:String(e?.message||e).slice(0,180)}),row.key).run();
+    }
+  }
+  return recovered;
+}
