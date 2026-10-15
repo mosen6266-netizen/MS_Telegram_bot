@@ -4,7 +4,7 @@ import {addSpender} from "./approval";
 import {startSpenderHistory} from "./spender-history";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
-import {defaults} from "./notifications";
+import {defaults,templateCatalog} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
 import {isAdmin,configEnv} from "./setup";
 import {removeWatch} from "./core";
@@ -120,11 +120,27 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","update_subscription",a,{chat});
     return json({ok:true});
   }
-  if(method==="GET"&&path==="/api/templates")return json({defaults,overrides:(await env.DB.prepare("SELECT * FROM templates").all()).results});
-  if(method==="PUT"&&path==="/api/templates"){
+  if(method==="GET"&&path==="/api/templates"){
+    const overrides=(await env.DB.prepare("SELECT * FROM templates ORDER BY template_key,chat_id").all()).results;
+    const notes=(await env.DB.prepare("SELECT key,value FROM runtime_state WHERE key LIKE 'template_note:%'").all()).results;
+    return json({defaults,catalog:templateCatalog,overrides,notes:notes.map(x=>({id:x.key.slice("template_note:".length),note:x.value}))});
+  }
+  if((method==="PUT"||method==="DELETE")&&path==="/api/templates"){
     const d=await body(req),key=String(d.template_key||""),chat=String(d.chat_id||"*"),txt=String(d.body||"");
-    if(!Object.hasOwn(defaults,key)||!/^(\*|-?\d+)$/.test(chat)||!txt.trim()||txt.length>3500)return bad("模板类型、群组或长度不合法");
+    if(!Object.hasOwn(defaults,key)||!/^(\*|-?\d+)$/.test(chat))return bad("模板类型或群组 ID 不合法");
+    const noteKey="template_note:"+key+":"+chat;
+    if(method==="DELETE"){
+      await env.DB.prepare("DELETE FROM templates WHERE template_key=? AND chat_id=?").bind(key,chat).run();
+      await env.DB.prepare("DELETE FROM runtime_state WHERE key=?").bind(noteKey).run();
+      await audit(env,"admin","reset_template",key,{chat});
+      return json({ok:true});
+    }
+    const note=d.note===undefined?undefined:String(d.note);
+    if(!txt.trim()||txt.length>3500||note!==undefined&&Array.from(note).length>500)return bad("模板正文须为 1–3500 字符；管理员备注最多 500 字");
     await env.DB.prepare("INSERT INTO templates(template_key,chat_id,body) VALUES(?,?,?) ON CONFLICT(template_key,chat_id) DO UPDATE SET body=excluded.body,version=templates.version+1,updated_at=CURRENT_TIMESTAMP").bind(key,chat,txt).run();
+    if(note!==undefined){
+      await env.DB.prepare("INSERT INTO runtime_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(noteKey,note).run();
+    }
     await audit(env,"admin","update_template",key,{chat});
     return json({ok:true});
   }
