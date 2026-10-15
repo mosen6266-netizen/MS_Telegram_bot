@@ -1818,15 +1818,48 @@ async function handleAdmin(req, env, path) {
   }
   if (method === "PATCH" && path === "/api/spenders") {
     const d = await body(req), a = addr(d.spender);
-    if (!a) return bad("\u65E0\u6548 Spender");
-    if (d.enabled !== void 0) await env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled ? 1 : 0, a).run();
+    if (!a) return bad("\u65E0\u6548 Spender \u5730\u5740");
+    const rule = await env.DB.prepare("SELECT spender,remark,enabled FROM spender_rules WHERE spender=?").bind(a).first();
+    if (!rule) return bad("\u627E\u4E0D\u5230\u8BE5 Spender \u89C4\u5219", 404);
+    let remark;
     if (d.remark !== void 0) {
-      const remark = String(d.remark).trim();
-      if (!remark || remark.length > 80) return bad("\u5907\u6CE8\u957F\u5EA6\u4E3A 1\u201380 \u5B57\u7B26");
-      await env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark, a).run();
+      remark = String(d.remark).trim();
+      if (!remark || Array.from(remark).length > 80 || /[\u0000-\u001f\u007f]/.test(remark)) return bad("\u5907\u6CE8\u987B\u4E3A 1\u201380 \u4E2A\u5B57\u7B26\uFF0C\u4E0D\u80FD\u5305\u542B\u63A7\u5236\u5B57\u7B26");
     }
-    await audit(env, "admin", "update_spender", a);
-    return json({ ok: true });
+    let chats, oldGroups = [], removed = [], added = [];
+    if (d.chat_ids !== void 0) {
+      if (!Array.isArray(d.chat_ids)) return bad("\u901A\u77E5\u7FA4 ID \u683C\u5F0F\u65E0\u6548");
+      chats = [...new Set(d.chat_ids.map((x) => String(x).trim()))];
+      if (!chats.length || chats.some((x) => !/^-\d{5,20}$/.test(x))) return bad("\u8BF7\u586B\u5199\u81F3\u5C11\u4E00\u4E2A\u6709\u6548 Telegram \u7FA4 ID\uFF08\u4F8B\u5982 -100...\uFF09");
+      for (const chat of chats) {
+        const c = await env.DB.prepare("SELECT chat_id,chat_type,active FROM telegram_chats WHERE chat_id=?").bind(chat).first();
+        if (!c) return bad("\u7FA4\u7EC4\u5C1A\u672A\u767B\u8BB0\uFF1A" + chat + "\u3002\u8BF7\u5148\u5C06\u673A\u5668\u4EBA\u52A0\u5165\u8BE5\u7FA4\uFF0C\u5E76\u5728\u7FA4\u5185\u53D1\u9001\u4E00\u6761\u6D88\u606F\u3002");
+        if (!["group", "supergroup"].includes(c.chat_type) || !c.active) return bad("\u901A\u77E5\u76EE\u6807\u4E0D\u662F\u5DF2\u542F\u7528\u7684 Telegram \u7FA4\uFF1A" + chat);
+      }
+      oldGroups = ((await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(a).all()).results || []).map((x) => String(x.chat_id));
+      removed = oldGroups.filter((x) => !chats.includes(x));
+      added = chats.filter((x) => !oldGroups.includes(x));
+    }
+    const changes = [];
+    if (d.enabled !== void 0) changes.push(env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled ? 1 : 0, a));
+    if (remark !== void 0) changes.push(env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark, a));
+    if (chats) {
+      for (const chat of added) changes.push(env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(a, chat));
+      for (const chat of added) {
+        changes.push(env.DB.prepare(
+          "INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) SELECT ?,h.owner,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=h.owner ORDER BY s.updated_at DESC LIMIT 1),'\u5F85\u5907\u6CE8 \xB7 '||substr(h.owner,1,12)),CASE WHEN ww.state='active' THEN 'active' ELSE 'pending' END FROM spender_history_addresses h LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN wallet_watches ww ON ww.address=h.owner LEFT JOIN wallets w ON w.address=h.owner LEFT JOIN wallet_exclusions x ON x.address=h.owner WHERE h.spender=? AND x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL)"
+        ).bind(chat, a));
+      }
+      for (const chat of removed) changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a, chat));
+      for (const chat of removed) {
+        changes.push(env.DB.prepare(
+          "UPDATE subscriptions SET status='removed',updated_at=CURRENT_TIMESTAMP WHERE chat_id=? AND status IN ('active','pending') AND address IN (SELECT owner FROM spender_history_addresses WHERE spender=?) AND NOT EXISTS(SELECT 1 FROM wallets w WHERE w.address=subscriptions.address AND (w.first_user_id IS NOT NULL OR w.discovery_source IN ('manual','admin'))) AND NOT EXISTS(SELECT 1 FROM spender_history_addresses h2 JOIN spender_routes r2 ON r2.spender=h2.spender WHERE h2.owner=subscriptions.address AND r2.chat_id=? AND h2.spender<>?)"
+        ).bind(chat, a, chat, a));
+      }
+    }
+    if (changes.length) await env.DB.batch(changes);
+    await audit(env, "admin", "update_spender", a, { remark_changed: remark !== void 0, old_groups: oldGroups, new_groups: chats || void 0, removed, added });
+    return json({ ok: true, remark: remark ?? rule.remark, groups: chats || oldGroups, added, removed, note: "Spender \u5907\u6CE8\u548C\u901A\u77E5\u7FA4\u89C4\u5219\u5DF2\u4FDD\u5B58\uFF1B\u65E7\u7FA4\u7684\u624B\u52A8\u8BA2\u9605\u4E0E\u5176\u4ED6 Spender \u8BA2\u9605\u4FDD\u6301\u4E0D\u53D8\u3002" });
   }
   if (method === "GET" && path === "/api/subscriptions") return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
   if (method === "PATCH" && path === "/api/subscriptions") {
