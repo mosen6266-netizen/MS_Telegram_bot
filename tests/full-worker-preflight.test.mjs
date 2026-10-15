@@ -126,6 +126,26 @@ test("full Worker preflight: admin routes, authentication, pagination and privac
   const remarkAudit=await db.prepare("SELECT COUNT(*) n FROM admin_audit WHERE action='global_wallet_remark'").first();
   assert.equal(remarkAudit.n,1,"global edit must be audited");
 
+  // Verify the actual template API behind the new inline editor, including
+  // the associated private admin note and subsequent default reset.
+  const templatesBefore=await request("/api/templates",headers);
+  assert.equal(templatesBefore.status,200);
+  const templateKey=Object.keys(templatesBefore.content.defaults)[0];
+  assert.ok(templateKey);
+  const modified=await request("/api/templates",{...headers,origin:domain,"x-app-action":"1",
+    "content-type":"application/json"},"PUT",
+    {template_key:templateKey,chat_id:"*",body:"Staging template {{remark}}",note:"Private test note"});
+  assert.equal(modified.status,200);
+  const afterTemplate=await request("/api/templates",headers);
+  assert.ok(afterTemplate.content.overrides.some(x=>x.template_key===templateKey&&x.chat_id==="*"&&x.body==="Staging template {{remark}}"));
+  assert.ok(afterTemplate.content.notes.some(x=>x.id===templateKey+":*"&&x.note==="Private test note"));
+  const removedTemplate=await request("/api/templates",{...headers,origin:domain,"x-app-action":"1",
+    "content-type":"application/json"},"DELETE",{template_key:templateKey,chat_id:"*"});
+  assert.equal(removedTemplate.status,200);
+  const resetTemplate=await request("/api/templates",headers);
+  assert.ok(!resetTemplate.content.overrides.some(x=>x.template_key===templateKey&&x.chat_id==="*"));
+  assert.ok(!resetTemplate.content.notes.some(x=>x.id===templateKey+":*"));
+
   const validPost=await request("/api/subscriptions",{...headers,"origin":domain,"x-app-action":"1",
     "content-type":"application/json"},"PATCH",{chat_id:chat,address:owner,status:"paused"});
   assert.equal(validPost.status,200);
