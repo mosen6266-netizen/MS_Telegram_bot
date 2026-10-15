@@ -13,6 +13,21 @@ async function setEnrollmentCooldown(env,minutes){
   await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(BACKOFF_KEY,until).run();
 }
 
+export async function selectEnrollmentCandidates(db,limit=ENROLL_BATCH){
+  const query="SELECT h.spender,h.owner FROM spender_history_addresses h "+
+      "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
+      "LEFT JOIN wallets w ON w.address=h.owner "+
+      "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
+      "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
+      "WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) "+
+      "AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
+        "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END)) "+
+      "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) "+
+      // Never let the oldest failed 20 addresses starve all fresh discoveries.
+      "ORDER BY CASE WHEN e.spender IS NULL THEN 0 ELSE 1 END, e.updated_at ASC, h.first_seen_block ASC LIMIT ?";
+  return (await db.prepare(query).bind(Math.max(1,Math.min(ENROLL_BATCH,limit))).all()).results||[];
+}
+
 export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
   const db=env.DB;
   // A generic watcher retry can succeed between history attempts.
@@ -36,18 +51,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
     return {busy:true};
   }
   try{
-    const query="SELECT h.spender,h.owner FROM spender_history_addresses h "+
-      "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
-      "LEFT JOIN wallets w ON w.address=h.owner "+
-      "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
-      "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
-      "WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) "+
-      "AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
-        "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END)) "+
-      "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) "+
-      // Never let the oldest failed 20 addresses starve all fresh discoveries.
-      "ORDER BY CASE WHEN e.spender IS NULL THEN 0 ELSE 1 END, e.updated_at ASC, h.first_seen_block ASC LIMIT ?";
-    const rows=(await db.prepare(query).bind(Math.max(1,Math.min(ENROLL_BATCH,limit))).all()).results||[];
+    const rows=await selectEnrollmentCandidates(db,limit);
     if(!rows.length)return {processed:0};
 
     const toSync=[];
