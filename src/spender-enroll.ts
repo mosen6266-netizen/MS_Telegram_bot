@@ -42,9 +42,11 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
       "LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner "+
       "WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) "+
-      "AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now','-90 seconds')) "+
+      "AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
+        "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END)) "+
       "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) "+
-      "ORDER BY h.first_seen_block ASC LIMIT ?";
+      // Never let the oldest failed 20 addresses starve all fresh discoveries.
+      "ORDER BY CASE WHEN e.spender IS NULL THEN 0 ELSE 1 END, e.updated_at ASC, h.first_seen_block ASC LIMIT ?";
     const rows=(await db.prepare(query).bind(Math.max(1,Math.min(ENROLL_BATCH,limit))).all()).results||[];
     if(!rows.length)return {processed:0};
 
@@ -53,7 +55,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       const {spender,owner}=row;
       try{
         await db.prepare("INSERT OR IGNORE INTO spender_history_monitor_enrollments(spender,owner,state) VALUES(?,?,'pending')").bind(spender,owner).run();
-        const claimed=await db.prepare("UPDATE spender_history_monitor_enrollments SET state='running',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND (state='pending' OR (state='retrying' AND updated_at<datetime('now','-90 seconds')) OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(spender,owner).run();
+        const claimed=await db.prepare("UPDATE spender_history_monitor_enrollments SET state='running',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND (state='pending' OR (state='retrying' AND updated_at<datetime('now',CASE WHEN attempts>=5 THEN '-30 minutes' WHEN attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END)) OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(spender,owner).run();
         if(!claimed.meta?.changes)continue;
         const exclude=await db.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
         const archived=await db.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
