@@ -147,13 +147,17 @@ async function processApproval(env,rule,log){
   const previous=await env.DB.prepare("SELECT amount_raw FROM allowances WHERE owner=? AND spender=?").bind(owner,rule.spender).first();
   const before=BigInt(previous?.amount_raw||"0");
   const evId="approval:"+log.transactionHash+":"+log.logIndex;
-  const type=amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"unchanged";
+  // Replay the original classification when the event was recorded but the
+  // outbox insert failed. Recomputing against the updated allowances row
+  // would silently turn a genuine new approval into "unchanged".
+  const eventRecord=await env.DB.prepare("SELECT event_type FROM approval_events WHERE event_id=?").bind(evId).first();
+  const type=eventRecord?.event_type||(amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"unchanged");
   await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)")
    .bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type).run();
   await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP")
    .bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber))).run();
-  const registered=await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
-  if(amount>0n && (!registered || !previous)){
+  const registered=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
+  if(amount>0n && (type==="new"||type==="reauthorized")){
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
     const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for(const route of routes||[]){
@@ -163,14 +167,22 @@ async function processApproval(env,rule,log){
       const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
     }
-    const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
+    let watched=registered?.state==="active";
+    if(!watched){
+      try{watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));}
+      catch(watchError){
+        // The approval notification is independent from Alchemy enrollment.
+        // The pending-wallet cron will retry enrollment automatically.
+        console.warn("Approval Owner monitor pending",owner,String(watchError));
+      }
+    }
     if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"new_approval",
       payload:{owner,spender:rule.spender,spender_remark:rule.remark,amount:formatUnits(amount,6)+" USDT",tx_hash:log.transactionHash,watch_status:watched?"active":"pending"}
     });
-    await increment(env,"discovered_wallets");
-  } else if(type!=="unchanged" && previous) {
+    if(!registered)await increment(env,"discovered_wallets");
+  } else if(type!=="unchanged") {
     const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"approval_change",
