@@ -4,6 +4,7 @@ import {handleTelegram} from "./telegram";
 import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history";
 import {enrollHistoricalOwners} from "./spender-enroll";
+import {maybeReconcileAlchemy} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
@@ -105,6 +106,11 @@ export default {
       try{await collectUsage(configured);await runUsageAlerts(configured);await flushOutbox(configured,10,true);}
       catch(e){console.error("Usage maintenance failed",String(e));}
     })());
+    // A separate, rate-limited maintenance branch checks the provider's true
+    // address set daily. It is read-only and must not delay the normal scan,
+    // incoming activity or Telegram notification pipeline.
+    ctx.waitUntil((async()=>{try{await maybeReconcileAlchemy(configured);}
+      catch(e){console.warn("Read-only Alchemy reconciliation maintenance",String(e));}})());
     // Always expire abandoned remark prompts, even when finance monitoring is paused.
     ctx.waitUntil((async()=>{try{await flushMessageCleanup(configured,60);}
       catch(e){console.warn("Telegram message cleanup maintenance",String(e));}})());
