@@ -68,7 +68,7 @@ function prepareFixture({head=110,provider=async()=>[],notifyFail=false,watchFai
      throw Error("Unmocked write SQL: "+sql);
    }
  }}};
- return {env:{DB},state,fixture};
+ return {env:{DB,TASKS:{send:async item=>{state.enrollmentTasks??=[];state.enrollmentTasks.push(item)}}},state,fixture};
 }
 test("provider block-window limits reduce scan size without losing any blocks",async()=>{
  const {env,state}=prepareFixture({head:210,provider:async(from,to)=>{if(to-from>=16)throw Error("RPC block range limit");return []}});
