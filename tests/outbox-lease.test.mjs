@@ -35,7 +35,7 @@ test("an old message freshly claimed for sending must not be reclaimed; true sta
   await DB.prepare("UPDATE outbox SET sending_started_at=datetime('now','-15 minutes') WHERE dedup_key='old'").run();
   await recoverStuck({DB});
   row=await DB.prepare("SELECT state,sending_started_at FROM outbox WHERE dedup_key='old'").first();
-  assert.equal(row.state,"pending");
+  assert.equal(row.state,"delivery_unknown");
   assert.equal(row.sending_started_at,null);
  }finally{await mf.dispose()}
 });
