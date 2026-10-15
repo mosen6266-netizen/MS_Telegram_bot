@@ -6,7 +6,7 @@ import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history
 import {enrollHistoricalOwners} from "./spender-enroll";
 import {reconcileAlchemyAddresses} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
-import {provisionRealtimeApprovals,processRealtimeApprovalWebhook} from "./approval-realtime";
+import {provisionRealtimeApprovals,processRealtimeApprovalWebhook,storeFailedRealtimeApproval,retryFailedRealtimeApprovals} from "./approval-realtime";
 import {retainFailedActivity,replayFailedActivities} from "./activity-replay";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
@@ -36,6 +36,7 @@ async function cron(env){
   try{await scanWalletGaps(env,8);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
   try{await replayFailedActivities(env,3);}catch(e){console.error("Failed activity recovery",String(e))}
+  try{await retryFailedRealtimeApprovals(env,3);}catch(e){console.error("Failed realtime Approval recovery",String(e))}
   try{await flushOutbox(env,40);}catch(e){console.error("Telegram outbox delivery",String(e))}
   try{await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();}
   catch(e){console.error("Expired remark session cleanup",String(e))}
@@ -133,6 +134,10 @@ export default {
       }catch(e){
         console.error("Queue job failed",item.kind,String(e));
         if(message.attempts>=5){
+          if(item.kind==="approval_webhook"){
+            try{await storeFailedRealtimeApproval(env,item.payload,e)}
+            catch(saveError){console.error("Realtime approval retention failed",String(saveError));message.retry({delaySeconds:120});continue}
+          }
           if(item.kind==="activity"){
             // Never ACK a failed real chain event until its replay payload
             // has been durably stored in D1.
