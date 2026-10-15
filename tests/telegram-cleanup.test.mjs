@@ -5,7 +5,7 @@ import {readFileSync} from "node:fs";
 test("address query preserves final result and schedules deletion of input + progress",()=>{
   const source=readFileSync("src/telegram.ts","utf8");
   const worker=readFileSync("src/index.ts","utf8");
-  assert.match(source,/const progress=await send\(env,chatId,"🔎 已收到地址查询/);
+  assert.match(source,/const progress=await send\(env,chatId,await renderTemplate\(env,"query_progress",chatId,\{address:owner\}\)\)/);
   assert.match(source,/scheduleMessageDeletion\(env,chatId,m\.message_id,"query_address_stale",1800\)/);
   assert.match(source,/scheduleMessageDeletion\(env,chatId,progress\.message_id,"query_progress_stale",1800\)/);
   assert.match(source,/user_message_id:m\.message_id,progress_message_id:progress\.message_id/);
@@ -16,7 +16,7 @@ test("remark completion removes only the temporary prompt and member reply",()=>
   const source=readFileSync("src/telegram.ts","utf8");
   const cleanup=readFileSync("src/cleanup.ts","utf8");
   assert.match(source,/scheduleMessageDeletion\(env,String\(chat\.id\),prompt\.message_id,"remark_prompt_expired",600\)/);
-  assert.match(source,/await send\(env,chatId,"✅ 地址备注已更新/);
+  assert.match(source,/await send\(env,chatId,await renderTemplate\(env,"remark_saved",chatId,\{remark,address:session\.address\}\),buttons\(session\.address\)\)/);
   assert.match(source,/await finishRemarkCleanup\(env,chatId,m\.reply_to_message\.message_id,m\.message_id\)/);
   assert.doesNotMatch(source,/修改者：/);
   assert.match(cleanup,/scheduleMessageDeletion\(env,chatId,promptMessageId,"remark_prompt"\)/);
@@ -31,4 +31,18 @@ test("deletion is durable, repeated safely, and never targets final result messa
   assert.match(cleanup,/state='blocked'/);
   assert.doesNotMatch(cleanup,/result_message_id/);
   assert.match(worker,/await flushMessageCleanup\(configured,60\)/);
+});
+
+test("all passive and active Telegram messages are listed and editable with Chinese metadata",()=>{
+  const templates=readFileSync("src/notifications.ts","utf8");
+  const admin=readFileSync("src/admin.ts","utf8");
+  const ui=readFileSync("src/admin-ui.ts","utf8");
+  for(const key of ["query_progress","query_active","query_inactive","query_failed","remark_prompt","remark_invalid","remark_unwatched","remark_conflict","remark_saved","start_welcome","new_approval","approval_change","transfer","reorg_correction","usage_alert","notice_failed"]){
+    assert.match(templates,new RegExp('\\\\b'+key+'\\\\b'));
+  }
+  assert.match(templates,/export const templateCatalog/);
+  assert.match(templates,/HTML-escaped/);
+  assert.match(admin,/template_note:/);
+  assert.match(ui,/统一消息模板管理/);
+  assert.match(ui,/模板备注/);
 });
