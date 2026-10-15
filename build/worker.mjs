@@ -2182,7 +2182,7 @@ async function handleAdmin(req, env, path) {
     await audit(env, "admin", "restore_wallet", wallet);
     return json({ ok: true, watch_status: "not_automatically_resumed", note: "\u5DF2\u6062\u590D\u6863\u6848\u3002\u9700\u8981\u91CD\u65B0\u8FDB\u884C\u6709\u6548 USDT \u6388\u6743\u6838\u9A8C\u5E76\u5EFA\u7ACB\u7FA4\u7EC4\u8BA2\u9605\u3002" });
   }
-  if (method === "GET" && path === "/api/spenders") return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
+  if (method === "GET" && path === "/api/spenders") return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups,(SELECT value FROM runtime_state st WHERE st.key='spender_poll_status:'||s.spender) poll_status FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
   if (method === "POST" && path === "/api/spenders") {
     const d = await body(req), a = addr(d.spender);
     if (!a) return bad("Spender \u5730\u5740\u65E0\u6548");
