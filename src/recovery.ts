@@ -25,11 +25,19 @@ async function getOneDirection(env,address,direction,from,to){
   }while(cursor);
   return transactions;
 }
+export async function selectGapScanCandidates(db,head,maxWallets=3){
+  return (await db.prepare(
+    "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address "+
+    "WHERE w.state='active' AND c.last_block<? "+
+    // checked_at is ISO8601 with T/Z while SQLite datetime is spaced; always
+    // normalize before comparing or retries would be delayed for a full day.
+    "AND (c.last_error IS NULL OR c.checked_at IS NULL OR datetime(c.checked_at)<=datetime('now','-5 minutes')) "+
+    "ORDER BY c.last_block ASC,c.address ASC LIMIT ?"
+  ).bind(head,Math.max(1,Math.min(12,maxWallets))).all()).results||[];
+}
 export async function scanWalletGaps(env,maxWallets=3){
   const head=await blockNumber(env);
-  const {results:wallets}=await env.DB.prepare(
-   "SELECT c.address,c.last_block FROM wallet_checkpoints c JOIN wallet_watches w ON c.address=w.address WHERE w.state='active' AND c.last_block<? ORDER BY c.last_block ASC LIMIT ?"
-  ).bind(head,maxWallets).all();
+  const wallets=await selectGapScanCandidates(env.DB,head,maxWallets);
   for(const w of wallets||[]){
     const from=Math.max(0,w.last_block-5),to=Math.min(head,w.last_block+120);
     try {
@@ -37,7 +45,10 @@ export async function scanWalletGaps(env,maxWallets=3){
       await getOneDirection(env,w.address,"in",from,to);
       await env.DB.prepare("UPDATE wallet_checkpoints SET last_block=?,checked_at=?,last_error=NULL WHERE address=?").bind(to,now(),w.address).run();
     }catch(e){
-      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=? WHERE address=?").bind(String(e).slice(0,300),w.address).run();
+      // Preserve last_block so the exact failed range is retried later;
+      // checked_at provides a bounded cooldown to unblock other wallets.
+      await env.DB.prepare("UPDATE wallet_checkpoints SET last_error=?,checked_at=? WHERE address=?")
+        .bind(String(e).slice(0,300),now(),w.address).run();
       console.error("Wallet recovery failure",w.address,String(e));
     }
   }
