@@ -24,6 +24,7 @@
   - `20261015_outbox_pagination_index.sql`
   - `20261016_spender_generation_fence.sql`（必须在 `20261015_spender_history.sql` 和 `20261015_spender_history_times.sql` 之后执行）
   - `20261017_admin_list_indexes.sql`（钱包、群组订阅及链上交易分页索引）
+  - `20261018_queue_dead_letters.sql`（Cloudflare 死信任务 D1 归档和状态索引）
 - [ ] 使用实际 D1 `PRAGMA table_info`、`PRAGMA foreign_key_check`、`SELECT count(*)` 检查迁移结果。
 - [ ] 运行 `tests/in-place-upgrade-rehearsal.test.mjs`：基于旧架构的非空模拟 D1，升级后比较监控、旧订阅、通知队列、审计和 Spender 断点；验证索引和外键。
 - [ ] 运行 `tests/admin-listing.test.mjs`：验证超过 200 条的钱包、订阅、链上交易和审计记录可分页/搜索，保留旧数据。
@@ -91,6 +92,15 @@
 - [ ] 钱包资金缺口恢复：最旧的钱包反复 RPC 失败时，用 `checked_at` 进行至少五分钟的退避，但保留 `last_block`，其余活跃钱包继续扫描；冷却到期后可以重新选择。
 - [ ] 运行 `tests/spender-enrollment-fairness.test.mjs`、`tests/spender-history-scheduler.test.mjs`、`tests/wallet-gap-recovery-fairness.test.mjs`，确认完整 Worker 包含上述功能。
 - [ ] **仍需单独的云端长时间负载测试**：模拟 D1/RPC 的通过结果不代表 100–200 钱包在实际 Alchemy/Etherscan 配额下能够保持同步。必须采集真实滞后区块、Cron 耗时、Provider 429 和通知延迟。
+
+## 队列死信保留与区块哈希完整性（发布前强制验证）
+
+- [ ] Cloudflare 主队列 `max_retries:5` 配置了独立 DLQ；**不要**在第 5 次失败时对原始消息调用 `ack()`，必须让 Cloudflare 执行达到上限后的 DLQ 转移。
+- [ ] **Cloudflare 未消费的 DLQ 通常仅保留 4 天**。确认已配置独立的 DLQ consumer，且使用同一 Worker 将消息写入 `queue_dead_letters`，仅在 D1 成功提交后 `ack()`；D1 异常时必须 `retry()`。DLQ 自身重试上限也可能导致消息最终过期，生产必须另设积压及消费失败告警。
+- [ ] 后台通知队列新增“Cloudflare 异常任务归档”只显示分页摘要；原始事件内容不向列表泄露。只有已登录管理员可核查，记录审计；**核查完成不等于链上任务成功**，不允许自动重新执行可能已产生副作用的原始任务。
+- [ ] 运行 `tests/queue-dead-letter.test.mjs` 和 `tests/queue-dead-letter-archive.test.mjs`；在隔离 Cloudflare 环境演练 D1 不可用、失败任务进 DLQ 和归档恢复。真实队列的投递次数与 DLQ 消费不能仅凭本地测试证明。
+- [ ] 转账事件区块哈希以真实已确认的 `eth_getTransactionReceipt` 为依据；若有历史 `block_hash IS NULL`，仅在交易回执哈希与对应区块高度一致时补全，每六小时限量检查。不要覆盖非空哈希或把未确认回执伪装成确认。
+- [ ] 运行 `tests/transfer-atomicity.test.mjs`、`tests/transfer-blockhash-backfill.test.mjs`，验证重播不重复产生通知、历史空哈希可补齐、区块高度不一致不写入。真实链重组需要预发布 RPC 联调。
 
 ## 4. 发布后明确验收条件
 
