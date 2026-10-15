@@ -43,9 +43,12 @@ export async function handleAdmin(req,env,path){
       " ORDER BY ww.updated_at DESC LIMIT 50 OFFSET ?"
     ).bind(...args,page*50);
     const summaryQuery=env.DB.prepare("SELECT state,COUNT(*) n FROM wallet_watches WHERE state IN ('active','pending','removal_pending') GROUP BY state");
-    const [countResult,rowsResult,summaryResult]=await env.DB.batch([countQuery,rowsQuery,summaryQuery]);
+    const alchemyQuery=env.DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_address_reconcile_result'");
+    const [countResult,rowsResult,summaryResult,alchemyResult]=await env.DB.batch([countQuery,rowsQuery,summaryQuery,alchemyQuery]);
     const total=countResult.results?.[0]?.n||0,rows=rowsResult.results||[],summary=summaryResult.results||[];
-    return json({rows,total,page,total_pages:Math.ceil(total/50),summary});
+    let alchemy=null;
+    try{alchemy=JSON.parse(alchemyResult.results?.[0]?.value||"null")}catch{}
+    return json({rows,total,page,total_pages:Math.ceil(total/50),summary,alchemy_reconciliation:alchemy});
   }
   if(method==="POST"&&path==="/api/monitoring/remark"){
     const d=await body(req),address=addr(d.address);
