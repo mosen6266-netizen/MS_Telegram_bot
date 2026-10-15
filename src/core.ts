@@ -41,8 +41,8 @@ export async function confirmedReceipt(env,hash){
   return receipt?.status==="0x1"?receipt:null;
 }
 export async function receiptSuccess(env,hash){
-  const receipt=await confirmedReceipt(env,hash);
-  return receipt?true:null;
+  const receipt=await rpc(env,"eth_getTransactionReceipt",[hash]);
+  return receipt?receipt.status==="0x1":null;
 }
 export async function telegram(env,method,body){
   if(!env.TELEGRAM_BOT_TOKEN)throw Error("TELEGRAM_BOT_TOKEN is missing");
