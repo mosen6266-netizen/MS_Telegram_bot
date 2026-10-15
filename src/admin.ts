@@ -27,11 +27,11 @@ export async function handleAdmin(req,env,path){
   if(!await isAdmin(req,env))return bad("管理员验证失败或请求来源无效",401);
   const method=req.method;
   if(method==="GET"&&path==="/api/summary"){
-    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')","SELECT count(*) n FROM telegram_message_cleanup WHERE state='blocked'","SELECT count(*) n FROM telegram_message_cleanup WHERE state='pending'"];
+    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')","SELECT count(*) n FROM telegram_message_cleanup WHERE state='blocked'","SELECT count(*) n FROM telegram_message_cleanup WHERE state='pending'","SELECT COUNT(*) n FROM runtime_state WHERE key LIKE 'failed_activity:%'"];
     // One D1 roundtrip instead of seven consecutive count queries.
     const results=await env.DB.batch(qs.map(q=>env.DB.prepare(q)));
     const v=results.map(result=>result.results?.[0]?.n||0);
-    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6]});
+    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6],activity_replay_pending:v[7]});
   }
   if(method==="GET"&&path==="/api/chats")return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
   if(method==="GET"&&path==="/api/monitoring"){
