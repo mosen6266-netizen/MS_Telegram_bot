@@ -42,7 +42,8 @@ class FakeDb{
   async batch(statements){for(const s of statements)await s.run();}
 }
 const wallet=i=>"0x"+i.toString(16).padStart(40,"0");
-const env=addresses=>({DB:new FakeDb(addresses),ALCHEMY_ACTIVITY_WEBHOOK_ID:"test-webhook",ALCHEMY_NOTIFY_TOKEN:"test-token"});
+const env=addresses=>({DB:new FakeDb(addresses),ALCHEMY_ACTIVITY_WEBHOOK_ID:"test-webhook",ALCHEMY_NOTIFY_TOKEN:"test-token",PUBLIC_BASE_URL:"https://bot.example"});
+const meta=()=>({ok:true,json:async()=>({data:[{id:"test-webhook",is_active:true,network:"ETH_MAINNET",webhook_type:"ADDRESS_ACTIVITY",webhook_url:"https://bot.example/webhooks/alchemy"}]})});
 
 test("Alchemy reconciliation detects missing addresses, PATCHes only those, and verifies again",async()=>{
   const addresses=[wallet(1),wallet(2),wallet(3)],local=env(addresses);
@@ -50,6 +51,7 @@ test("Alchemy reconciliation detects missing addresses, PATCHes only those, and 
   const calls=[];const original=globalThis.fetch;
   globalThis.fetch=async (url,options={})=>{
     const method=options.method||"GET";calls.push({method,url:String(url),body:options.body});
+    if(String(url).includes("/api/team-webhooks"))return meta();
     if(method==="GET")return {ok:true,json:async()=>({data:[...remote],pagination:{total_count:remote.size,cursors:{}}})};
     const body=JSON.parse(options.body);
     for(const address of body.addresses_to_add)remote.add(address);
@@ -81,7 +83,7 @@ test("uncertain Alchemy API errors do not switch currently monitored wallets off
 
 test("fully verified but persistently absent Alchemy addresses are queued for retry",async()=>{
   const local=env([wallet(1)]),old=globalThis.fetch;
-  globalThis.fetch=async (_url,options={})=>options.method==="PATCH"
+  globalThis.fetch=async (url,options={})=>String(url).includes("/api/team-webhooks")?meta():options.method==="PATCH"
     ? {ok:true}
     : {ok:true,json:async()=>({data:[],pagination:{total_count:0,cursors:{}}})};
   try{
