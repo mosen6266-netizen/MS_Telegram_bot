@@ -3,7 +3,7 @@ import {USDT,APPROVAL_TOPIC,toTopic,fromTopic,addr,blockNumber,allowance,recordU
 
 // A complete scan is reported only after every historical block range has been processed.
 // Historical discoveries are archival; only new on-chain approvals trigger live monitoring.
-const HISTORY_WINDOW=200000;
+const HISTORY_WINDOW=1000000;
 const HISTORY_PAGE_SIZE=200;
 
 export async function startSpenderHistory(env,spender){
@@ -55,14 +55,14 @@ async function fetchHistoryRange(env,spender,from,to){
 export async function scanSpenderHistories(env){
   // Reclaim tasks abandoned after a Worker shutdown, but never overlap live runs.
   const job=await env.DB.prepare("SELECT j.* FROM spender_history_jobs j JOIN spender_rules r ON r.spender=j.spender WHERE r.enabled=1 AND (j.state IN ('scanning','retrying') OR (j.state='running' AND j.updated_at<datetime('now','-5 minutes'))) ORDER BY j.updated_at ASC LIMIT 1").first();
-  if(!job)return;
+  if(!job)return false;
   const locked=await env.DB.prepare("UPDATE spender_history_jobs SET state='running',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND (state IN ('scanning','retrying') OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(job.spender).run();
-  if(!(locked.meta?.changes>0))return;
+  if(!(locked.meta?.changes>0))return false;
   try{
     const begin=Number(job.next_block),cutoff=Number(job.cutoff_block);
     if(begin>cutoff){
       await env.DB.prepare("UPDATE spender_history_jobs SET state='completed',last_error=NULL,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(job.spender).run();
-      return;
+      return false;
     }
     const window=Math.max(1,Math.min(HISTORY_WINDOW,Number(job.window_size)||HISTORY_WINDOW));
     const end=Math.min(cutoff,begin+window-1);
@@ -71,7 +71,7 @@ export async function scanSpenderHistories(env){
       if(end===begin)throw Error("单个区块授权事件超出接口返回上限；需要分页检索，不会跳过此区块");
       await env.DB.prepare("UPDATE spender_history_jobs SET state='scanning',window_size=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
         .bind(Math.max(1,Math.floor(window/2)),job.spender).run();
-      return;
+      return true; // Smaller range will be picked up in the same scheduled run.
     }
     const latest=new Map();
     for(const log of logs){
@@ -104,16 +104,18 @@ export async function scanSpenderHistories(env){
     const next=end+1;
     await env.DB.prepare("UPDATE spender_history_jobs SET next_block=?,window_size=?,state=?,events_found=events_found+?,last_error=NULL,retry_count=0,updated_at=CURRENT_TIMESTAMP,finished_at=CASE WHEN ?>cutoff_block THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE spender=?")
       .bind(next,Math.min(HISTORY_WINDOW,Math.max(5000,window*2)),next>cutoff?"completed":"scanning",logs.length,next,job.spender).run();
+    return next<=cutoff;
   }catch(e){
     console.error("Spender history scan",job.spender,String(e));
     const message=String(e.message||e).slice(0,240);
     if(/block range|query timeout|too large|response size|exceed|more than|too many records|window limit/i.test(message)&&Number(job.window_size)>1){
       await env.DB.prepare("UPDATE spender_history_jobs SET window_size=?,state='scanning',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
        .bind(Math.max(1,Math.floor(Number(job.window_size)/2)),"请求范围过大，正在自动缩小区块范围",job.spender).run();
-      return;
+      return true;
     }
     await env.DB.prepare("UPDATE spender_history_jobs SET state='retrying',last_error=?,retry_count=retry_count+1,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
       .bind(String(e.message||e).slice(0,240),job.spender).run();
+    return false; // Do not repeat rate-limited/failing API calls immediately.
   }
 }
 
