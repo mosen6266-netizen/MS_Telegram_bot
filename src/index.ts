@@ -6,6 +6,7 @@ import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history
 import {enrollHistoricalOwners} from "./spender-enroll";
 import {reconcileAlchemyAddresses} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
+import {provisionRealtimeApprovals,processRealtimeApprovalWebhook} from "./approval-realtime";
 import {retainFailedActivity,replayFailedActivities} from "./activity-replay";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
@@ -26,6 +27,7 @@ async function cron(env){
       }catch(e){console.error("Pending wallet subscription retry",p.address,String(e))}
     }
   }catch(e){console.error("Pending wallet discovery",String(e))}
+  try{await provisionRealtimeApprovals(env);}catch(e){console.error("Realtime Approval provisioning",String(e))}
   try{await pollSpenders(env);}catch(e){console.error("Spender scan",String(e))}
   try{for(let i=0;i<4;i++){if(!await scanSpenderHistories(env))break;}}catch(e){console.error("Spender history scan",String(e))}
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
@@ -67,6 +69,20 @@ export default {
         await env.DB.prepare("INSERT OR IGNORE INTO telegram_updates(update_id) VALUES(?)").bind(upd.update_id).run();
         return json({ok:true});
       }
+      if(req.method==="POST"&&path==="/webhooks/alchemy-approvals"){
+        if(!active)return json({error:"Monitor is not enabled"},503);
+        if(!configured.ALCHEMY_APPROVAL_WEBHOOK_ID||!configured.ALCHEMY_APPROVAL_SIGNING_KEY)
+          return json({error:"Realtime Approval webhook not configured"},503);
+        const raw=await req.text();
+        const approvalEnv={...configured,ALCHEMY_SIGNING_KEY:configured.ALCHEMY_APPROVAL_SIGNING_KEY};
+        if(!await verifyAlchemy(approvalEnv,raw,req.headers.get("x-alchemy-signature")))
+          return json({error:"Invalid approval webhook signature"},401);
+        const d=JSON.parse(raw);
+        if(d.type!=="GRAPHQL"||d.webhookId!==configured.ALCHEMY_APPROVAL_WEBHOOK_ID)
+          return json({error:"Unexpected approval source"},400);
+        await env.TASKS.send({kind:"approval_webhook",payload:d,received_at:Date.now()});
+        return json({ok:true});
+      }
       if(req.method==="POST"&&path==="/webhooks/alchemy"){
         if(!active)return json({error:"Monitor is not enabled"},503);
         const raw=await req.text();
@@ -96,8 +112,14 @@ export default {
           catch(cleanErr){console.warn("Address query cleanup deferred",String(cleanErr));}
         }
         else if(item.kind==="activity")await processActivity(configured,item.payload);
+        else if(item.kind==="approval_webhook")await processRealtimeApprovalWebhook(configured,item.payload);
         else if(item.kind==="verify_admin")await verifyAdminOwner(configured,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
+        // The queue should send Telegram notices immediately after ingest,
+        // without waiting for the two-minute scheduled maintenance task.
+        if(item.kind==="activity"||item.kind==="approval_webhook"){
+          try{await flushOutbox(configured,20)}catch(e){console.error("Immediate Telegram dispatch",String(e))}
+        }
         message.ack();
       }catch(e){
         console.error("Queue job failed",item.kind,String(e));
