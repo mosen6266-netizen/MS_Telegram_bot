@@ -1985,6 +1985,7 @@ var body = async (req) => {
     return {};
   }
 };
+var literalSearch = (s) => "%" + String(s).replace(/[~%_]/g, (x) => "~" + x) + "%";
 async function pagedRows(env, req, countSql, rowsSql) {
   const q = new URL(req.url).searchParams;
   const page = Math.min(1e5, Math.max(0, parseInt(q.get("page") || "0", 10) || 0));
@@ -2010,8 +2011,8 @@ async function handleAdmin(req, env, path) {
     const page = Math.min(1e5, Math.max(0, parseInt(q.get("page") || "0", 10) || 0));
     const status2 = q.get("status") || "all", search = String(q.get("search") || "").trim().slice(0, 90);
     if (!["all", "active", "pending", "removal_pending"].includes(status2)) return bad("\u76D1\u63A7\u72B6\u6001\u7B5B\u9009\u65E0\u6548");
-    const where = "ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)" + (status2 === "all" ? "" : " AND ww.state=?") + (search ? " AND (ww.address LIKE ? OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ?)" : "");
-    const args = [...status2 === "all" ? [] : [status2], ...search ? ["%" + search + "%", "%" + search + "%"] : []];
+    const where = "ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)" + (status2 === "all" ? "" : " AND ww.state=?") + (search ? " AND (ww.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ? ESCAPE '~')" : "");
+    const args = [...status2 === "all" ? [] : [status2], ...search ? [literalSearch(search), literalSearch(search)] : []];
     const countQuery = env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where).bind(...args);
     const rowsQuery = env.DB.prepare(
       "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'\u5F85\u5907\u6CE8') AS remark,(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where + " ORDER BY ww.updated_at DESC,ww.address ASC LIMIT 50 OFFSET ?"
@@ -2048,8 +2049,8 @@ async function handleAdmin(req, env, path) {
     if (q.get("paged") !== "1") return json((await env.DB.prepare(select + "ORDER BY w.created_at DESC LIMIT 200").all()).results);
     const page = Math.min(1e5, Math.max(0, Number.parseInt(q.get("page") || "0", 10) || 0));
     const search = String(q.get("search") || "").trim().slice(0, 90);
-    const where = search ? "WHERE w.address LIKE ? OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? " : "";
-    const args = search ? ["%" + search + "%", "%" + search + "%"] : [];
+    const where = search ? "WHERE w.address LIKE ? ESCAPE '~' OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? ESCAPE '~' " : "";
+    const args = search ? [literalSearch(search), literalSearch(search)] : [];
     const count = env.DB.prepare("SELECT COUNT(*) n FROM wallets w LEFT JOIN wallet_global_remarks g ON g.address=w.address " + where).bind(...args);
     const rows = env.DB.prepare(select + where + "ORDER BY w.created_at DESC,w.address ASC LIMIT 50 OFFSET ?").bind(...args, page * 50);
     const [countResult, rowsResult] = await env.DB.batch([count, rows]);
