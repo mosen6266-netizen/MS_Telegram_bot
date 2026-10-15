@@ -74,16 +74,39 @@ async function fetchHistoryRange(env,spender,from,to){
 }
 
 export async function scanSpenderHistories(env){
-  // Reclaim tasks abandoned after a Worker shutdown, but never overlap live runs.
-  const job=await env.DB.prepare("SELECT j.* FROM spender_history_jobs j JOIN spender_rules r ON r.spender=j.spender AND r.generation=j.generation WHERE r.enabled=1 AND (j.state IN ('scanning','retrying') OR (j.state='running' AND j.updated_at<datetime('now','-5 minutes'))) ORDER BY j.updated_at ASC LIMIT 1").first();
+  // Time-bound retry backoff prevents a failing Spender from blocking other
+  // historical scans; the persisted cursor breaks ties at second precision.
+  const due="(j.state='scanning' OR "+
+    "(j.state='retrying' AND j.updated_at<datetime('now',CASE "+
+    "WHEN j.retry_count>=6 THEN '-60 minutes' "+
+    "WHEN j.retry_count>=3 THEN '-10 minutes' ELSE '-2 minutes' END)) OR "+
+    "(j.state='running' AND j.updated_at<datetime('now','-5 minutes')))";
+  const cooldown=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='spender_history_provider_backoff'").first())?.value;
+  if(Number(cooldown||0)>Date.now())return false;
+  const cursor=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='spender_history_rr_cursor'").first())?.value||"";
+  const job=await env.DB.prepare(
+    "SELECT j.* FROM spender_history_jobs j JOIN spender_rules r ON r.spender=j.spender AND r.generation=j.generation "+
+    "WHERE r.enabled=1 AND "+due+
+    " ORDER BY j.updated_at ASC,CASE WHEN j.spender>? THEN 0 ELSE 1 END,j.spender ASC LIMIT 1"
+  ).bind(cursor).first();
   if(!job)return false;
-  const locked=await env.DB.prepare("UPDATE spender_history_jobs SET state='running',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND generation=? AND EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1) AND (state IN ('scanning','retrying') OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(job.spender,job.generation,job.spender,job.generation).run();
-  if(!(locked.meta?.changes>0))return false;
+  const canClaim="(state='scanning' OR "+
+    "(state='retrying' AND updated_at<datetime('now',CASE "+
+    "WHEN retry_count>=6 THEN '-60 minutes' "+
+    "WHEN retry_count>=3 THEN '-10 minutes' ELSE '-2 minutes' END)) OR "+
+    "(state='running' AND updated_at<datetime('now','-5 minutes')))";
+  const locked=await env.DB.prepare(
+    "UPDATE spender_history_jobs SET state='running',updated_at=CURRENT_TIMESTAMP "+
+    "WHERE spender=? AND generation=? AND EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1) AND "+canClaim
+  ).bind(job.spender,job.generation,job.spender,job.generation).run();
+  if(!(locked.meta?.changes>0))return true; // Race with another scan: try another job.
+  await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_history_rr_cursor',?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(job.spender).run();
   try{
     const begin=Number(job.next_block),cutoff=Number(job.cutoff_block);
     if(begin>cutoff){
       await env.DB.prepare("UPDATE spender_history_jobs SET state='completed',last_error=NULL,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND generation=?").bind(job.spender,job.generation).run();
-      return false;
+      return true; // Continue to a different eligible Spender in this Cron cycle.
     }
     const window=Math.max(1,Math.min(HISTORY_WINDOW,Number(job.window_size)||HISTORY_WINDOW));
     const end=Math.min(cutoff,begin+window-1);
@@ -123,7 +146,7 @@ export async function scanSpenderHistories(env){
     const next=end+1;
     await env.DB.prepare("UPDATE spender_history_jobs SET next_block=?,window_size=?,state=?,events_found=events_found+?,last_error=NULL,retry_count=0,updated_at=CURRENT_TIMESTAMP,finished_at=CASE WHEN ?>cutoff_block THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE spender=? AND generation=? AND next_block=? AND EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1)")
       .bind(next,Math.min(HISTORY_WINDOW,Math.max(5000,window*2)),next>cutoff?"completed":"scanning",logs.length,next,job.spender,job.generation,job.next_block,job.spender,job.generation).run();
-    return next<=cutoff;
+    return true; // A completed Spender should not stop the other scheduled jobs.
   }catch(e){
     console.error("Spender history scan",job.spender,String(e));
     const message=String(e.message||e).slice(0,240);
@@ -134,7 +157,14 @@ export async function scanSpenderHistories(env){
     }
     await env.DB.prepare("UPDATE spender_history_jobs SET state='retrying',last_error=?,retry_count=retry_count+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND generation=?")
       .bind(String(e.message||e).slice(0,240),job.spender,job.generation).run();
-    return false; // Do not repeat rate-limited/failing API calls immediately.
+    if(/Etherscan HTTP 429|error code:\\s*1015|rate limit/i.test(message)){
+      // Global provider rate limit: pause all history scans for a short time.
+      await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_history_provider_backoff',?,CURRENT_TIMESTAMP) "+
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+        .bind(String(Date.now()+120000)).run();
+      return false;
+    }
+    return true; // Retry this Spender later; allow other jobs to progress.
   }
 }
 
