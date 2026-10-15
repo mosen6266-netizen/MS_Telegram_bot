@@ -1512,6 +1512,7 @@ async function processActivity(env, payload) {
       if (!watch) continue;
       const eventId = baseId + ":" + o.address + ":" + o.direction;
       const inserted = await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(eventId, o.address, asset.asset, o.direction, value, from, to, hash, block, a.blockHash || a.log?.blockHash || null).run();
+      if (inserted.meta?.changes) await increment(env, "transfer_events");
       const { results: subs } = await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
       for (const s of subs || []) await queueNotice(env, {
         dedup: eventId + ":" + s.chat_id,
@@ -1520,7 +1521,6 @@ async function processActivity(env, payload) {
         template: "transfer",
         payload: { asset: asset.asset, direction: o.direction, amount: value, from_address: from, to_address: to, tx_hash: hash, block_number: block }
       });
-      if (inserted.meta?.changes) await increment(env, "transfer_events");
     }
   }
 }
