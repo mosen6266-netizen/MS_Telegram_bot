@@ -37,11 +37,11 @@ export async function recordSpenderLiveApproval(env,spender,log,amount){
     .bind(amount.toString(),amount>0n?"active":"revoked",spender,owner,block).run();
 }
 
-async function fetchHistoryRange(env,spender,from,to){
+async function fetchHistoryRange(env,spender,from,to,page=1){
   if(!env.ETHERSCAN_API_KEY)throw Error("Etherscan V2 API Key 未配置");
   const q=new URLSearchParams({chainid:"1",module:"logs",action:"getLogs",address:USDT,
     fromBlock:String(from),toBlock:String(to),topic0:APPROVAL_TOPIC,topic2:toTopic(spender),
-    topic0_2_opr:"and",page:"1",offset:String(HISTORY_PAGE_SIZE),apikey:env.ETHERSCAN_API_KEY});
+    topic0_2_opr:"and",page:String(page),offset:String(HISTORY_PAGE_SIZE),apikey:env.ETHERSCAN_API_KEY});
   await recordUsage(env,"etherscan_requests");
   const response=await fetch("https://api.etherscan.io/v2/api?"+q.toString());
   if(!response.ok)throw Error("Etherscan HTTP "+response.status);
@@ -67,8 +67,17 @@ export async function scanSpenderHistories(env){
     const window=Math.max(1,Math.min(HISTORY_WINDOW,Number(job.window_size)||HISTORY_WINDOW));
     const end=Math.min(cutoff,begin+window-1);
     const logs=await fetchHistoryRange(env,job.spender,begin,end);
-    if(logs.length>=HISTORY_PAGE_SIZE){
-      if(end===begin)throw Error("单个区块授权事件超出接口返回上限；需要分页检索，不会跳过此区块");
+    if(end===begin && logs.length>=HISTORY_PAGE_SIZE){
+      // A dense single block cannot be halved further. Read subsequent API
+      // pages instead of retrying this block forever or silently omitting logs.
+      for(let page=2;page<=20;page++){
+        const extra=await fetchHistoryRange(env,job.spender,begin,end,page);
+        logs.push(...extra);
+        if(extra.length<HISTORY_PAGE_SIZE)break;
+        if(page===20)throw Error("单区块授权记录超过安全分页上限；等待人工检查，不跳过区块");
+      }
+    }
+    if(end!==begin && logs.length>=HISTORY_PAGE_SIZE){
       await env.DB.prepare("UPDATE spender_history_jobs SET state='scanning',window_size=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
         .bind(Math.max(1,Math.floor(window/2)),job.spender).run();
       return true; // Smaller range will be picked up in the same scheduled run.
