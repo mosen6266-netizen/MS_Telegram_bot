@@ -69,13 +69,16 @@ export async function authRoute(req,env,path){
     // A short-lived, single-use code replaces the fragile Cloudflare API self-modification.
     if(!env.APP_ENCRYPTION_KEY)return json({error:"Service encryption secret not configured. Contact the deployment administrator."},503);
     const digest=await sha256(code);
-    const invite=await env.DB.prepare("SELECT 1 FROM setup_invites WHERE code_hash=? AND used_at IS NULL AND expires_at>?").bind(digest,now()).first();
-    if(!invite){await fail(env,"setup");return json({error:"一次性初始化码无效或已经过期，请联系部署管理员获取新码。"},403);}
+    const provisioned=typeof env.INIT_SETUP_CODE==="string"&&env.INIT_SETUP_CODE.length>=24;
+    const invite=provisioned
+      ? equal(digest,await sha256(env.INIT_SETUP_CODE))
+      : !!(await env.DB.prepare("SELECT 1 FROM setup_invites WHERE code_hash=? AND used_at IS NULL AND expires_at>?").bind(digest,now()).first());
+    if(!invite){await fail(env,"setup");return json({error:"一次性初始化码无效或已经过期。请检查 Cloudflare Worker 中的 INIT_SETUP_CODE Secret。"},403);}
     const salt=b64(random(24)),hash=await passwordHash(password,salt);
     // Database uniqueness prevents two simultaneous first-run initializations.
     const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,200000)").bind(salt,hash).run();
     if(!result.meta?.changes)return json({error:"Already initialized"},409);
-    await env.DB.prepare("UPDATE setup_invites SET used_at=? WHERE code_hash=? AND used_at IS NULL").bind(now(),digest).run();
+    if(!provisioned) await env.DB.prepare("UPDATE setup_invites SET used_at=? WHERE code_hash=? AND used_at IS NULL").bind(now(),digest).run();
     await clearFail(env,"setup");
     return new Response(JSON.stringify({ok:true}),{headers:{"content-type":"application/json","set-cookie":await session(env)}});
   }
