@@ -201,3 +201,19 @@
 - **发布操作规范**：`docs/RELEASE_AND_ROLLBACK.md` 强制加入模板保存、订阅修改、刷新失败保留表单、双击测试以及真实浏览器不同视口下的导航和滚动验收。
 - **仍未做的事**：未部署独立 Cloudflare 预发布环境，没有在真实浏览器点击实测，也没有验证线上性能提升多少毫秒。正式 Worker、生产 D1/Queues 和 `main` 未修改。
 - **第十三轮建议**：扫描与通知队列并发/高负载压力测试、历史回扫公平调度、限流恢复路径；若需要真正的外部联调，先按 `docs/ISOLATED_STAGING.md` 单独创建隔离测试资源并确认权限。
+
+## 2026-10-15 第十三轮：历史 Owner 接入公平调度、Alchemy 限流恢复及通知并发保护
+
+- **起点验证**：第十二轮最后一次提交 `386af8b1611a96a4d6d287d954e6914ba9f7be2b` 的两组 CI 已成功。继续只操作 `stabilization/2026-10-15-p0`。
+- `src/spender-enroll.ts`：`selectEnrollmentCandidates` 将每轮 20 个处理名额划分为约 15 个最新发现地址、5 个到期重试地址；不足时由另一个池补足。消除新地址持续涌入导致已到期失败任务一直排不到的风险，但尚未实现不同 Spender 之间的严格轮询公平。
+- **批量任务可靠租约**：`withEnrollmentLease` 在现有 D1 `runtime_state` 上使用原子、有过期时间和独立随机令牌的锁；旧任务不能释放已被其他执行领取的锁，取代旧版“用过期时间判断后不分令牌删除锁”的竞争路径。
+- **429/1015 限流恢复**：Alchemy PATCH 不成功时识别 HTTP 429 及 `Retry-After`（秒数或 HTTP 日期），优先遵守服务端延时；没有给出延时时按重复限流次数做有上限的指数退避，返回冷却之前不重复发送。成功入队后重置限流计数。
+- `tests/spender-enrollment-fairness.test.mjs`：在隔离 Miniflare/D1 构造 80 个历史 Owner 与长期重试地址，验证 15/5 配额及下一轮不会无限重复挑选同一批；验证锁重叠、过期接管、旧执行释放不会删新锁及 Retry-After 解析。
+- `tests/spender-enrollment-provider-429.test.mjs`：真实 D1 配合模拟 Alchemy 429；验证 120 秒 `Retry-After`、冷却期间 Cron 再次执行不会调用 Alchemy、第二次没有服务端头时延长到约 30 分钟。
+- `src/notifications.ts`：领取 pending 通知时在数据库 CAS 上同时检验 `due_at<=CURRENT_TIMESTAMP`，杜绝旧执行列表绕过别的执行器刚设置的限流延期；“通知最终失败”时给管理员发消息的失败不会打断剩余队列批次。
+- `tests/outbox-concurrency-load.test.mjs`：并发两路通知消费执行器处理 48 条模拟 Telegram 消息，每条记录至多领取发送一次；模拟旧列表读完后 `due_at` 被其他任务延后，应被原子条件拒绝。首个故障测试拦截对象错误已被 CI 发现，并修复测试夹具后通过。
+- `scripts/verify-worker-bundle.mjs`：要求最终完整 Worker 包含公平接入、令牌租约、Retry-After 解析函数。
+- `docs/RELEASE_AND_ROLLBACK.md` 新增强制验收清单，包括延时重试、Cron 并发及 Telegram 不重复发送。
+- **已验证 CI**：核心功能与所有新增测试提交 `fe13732fbd97b8b4190a31b190d88662306ab386` 两组 CI 成功；最终捆绑检查提交 `c3f369206c4aa00a254be1f80930fd31a5ddef44` 两组 CI 成功。最后的文档提交需继续确认 CI。
+- **仍未完成**：各 Spender 之间的严格配额公平性、真实高负载云端压测和 Queue/Cron 的长时间故障恢复、Alchemy 在实际配额下的稳定性、正式云端预发布 D1/Queue/Worker 的部署和最终回滚验收。此次仍未触碰生产 Worker、正式 D1/Queue、主分支或 Telegram Bot。
+- **下轮建议**：继续补充多 Spender 公平调度和跨服务长时间故障测试，以及安全的云端预发布环境验收；不要把模拟 CI 成功表述为已通过正式生产验收。
