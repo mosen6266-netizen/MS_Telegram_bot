@@ -13,7 +13,7 @@
 - [x] 确认 2026-10-15 正式代码提交并建立独立开发分支
 - [x] 审查最近一期 30 项问题；生产数据库只读检查
 - [x] P0-A：资金事件与通知队列改为 D1 原子写入；重复通知去重与旧缺项回放修复；新增实际 D1 集成测试
-- [ ] P0-B：Alchemy 监控真实地址清单与本地 D1 对账
+- [x] P0-B（开发与自动化测试）：通过 Alchemy 官方地址列表 API 完整分页、只读对账；后台可查看上次完整对账结果、遗漏数量和限流失败；按成功24小时/失败1小时的规则自动重试。尚未在真实 Alchemy 生产配置下运行验证，仍待发布验收。
 - [~] P0-C：已优先处理从未尝试的钱包，失败地址按尝试次数延迟重试；还需做真实 Alchemy 限流与公平吞吐验证
 - [~] P0-D：CI 和 Worker 打包工作流已强制验证 18 个关键模块；仍需封闭手工拼接发布途径和构建产物签名/回滚
 - [~] P0-E：ensureWatch 已对 active 钱包幂等，失败写入不再将 active 降级；仍需远端对账与删改竞态测试
@@ -46,5 +46,18 @@
 - **数据库迁移**：`migrations/20261015_outbox_sending_lease.sql`。在正式发布前需先在隔离环境运行和核验迁移；**尚未对正式 D1 执行**。
 - **新增测试**：`tests/transfer-atomicity.test.mjs`、`tests/watch-onboarding.test.mjs`、`tests/outbox-lease.test.mjs`；真实 D1/Miniflare 集成测试通过。
 - **最新已验证 CI**：提交 `f5d78b5ddc7d346955769846c34db956aedaa527`，GitHub Actions CI / Smoke Test 均成功；构建模块完整性检查也通过。
-- **已知剩余风险**：实际 Alchemy 远端地址对账缺失；通知最终失败补偿缺失；迁移上线与 Worker 代码需要按顺序；不建议现在合并和部署。
+- **已知剩余风险**：Alchemy 远端对账已完成开发但尚未使用正式凭据验证；通知最终失败补偿缺失；迁移上线与 Worker 代码需要按顺序；不建议现在合并和部署。
 - **下一步 P0**：建立 Alchemy 远端地址只读核验及每日对账，修复队列跳过已订阅地址的风险，补部署前迁移核验与真实回滚方案。
+
+## 2026-10-15 第二轮进度：远端 Alchemy 钱包监控对账
+
+- 新增 `src/alchemy-reconcile.ts`：使用官方只读 `GET /api/webhook-addresses`，必须校验所有游标分页、地址格式、数据去重、总数一致性。
+- 新增 `tests/alchemy-reconcile.test.mjs`：测试完整分页、429、格式错误、循环游标、数字不一致、D1 状态对比及失败不覆盖成功快照。
+- 后台监控页添加 **Alchemy 实际监控地址核验** 区域；`GET /api/monitoring/reconciliation` 只返回管理员可读的最近完整快照。
+- Worker 每次定时任务只检查对账是否到期；上次成功后 24 小时内不再请求 Alchemy，失败间隔至少 1 小时；对账任务独立运行，不能阻塞 Telegram 通知。
+- **安全约束**：发现本地/远端差异只报告，不擅自改变钱包状态、不删除远端钱包，避免任何不完整快照引发误删。
+- **最近验证**：开发提交 `c9f88ea740ac3e631607985a6a214c303d1aef92` CI 和 Deployment Smoke Test 均成功。
+- 官方分页接口文档：https://www.alchemy.com/docs/data/webhooks/webhooks-api-endpoints/notify-api-endpoints/webhook-addresses
+- 仍未执行真实 Alchemy 生产环境对账，且正式 Cloudflare Worker/D1 未修改；部署前还需要预演和验证。
+- 草稿 PR：https://github.com/mosen6266-netizen/MS_Telegram_bot/pull/1
+- **下一步**：重点是通知最终失败的可追踪补偿和重试、监控移除待处理状态的自动清理、跨 Spender 的群组订阅来源保护，以及测试环境部署演练。
