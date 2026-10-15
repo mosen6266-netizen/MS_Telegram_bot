@@ -53,6 +53,38 @@ export async function scanWalletGaps(env,maxWallets=3){
     }
   }
 }
+// Repair legacy confirmed events missing a block hash, using the real
+// transaction receipt. Never infer or invent a hash from block height alone.
+// Throttle repeated failures: older RPC receipts may be unavailable.
+export async function backfillMissingTransferBlockHashes(env,limit=3){
+  const key="transfer_blockhash_backfill_after";
+  const stamp=Date.now();
+  const next=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(key).first())?.value;
+  if(Number(next||0)>stamp)return {cooldown:true};
+  await env.DB.prepare(
+    "INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP"
+  ).bind(key,String(stamp+6*60*60*1000)).run();
+  const rows=(await env.DB.prepare(
+    "SELECT event_id,tx_hash,block_number FROM transfer_events "+
+    "WHERE state='confirmed' AND block_hash IS NULL ORDER BY block_number DESC LIMIT ?"
+  ).bind(Math.max(1,Math.min(limit,5))).all()).results||[];
+  let repaired=0;
+  for(const row of rows){
+    try{
+      const receipt=await rpc(env,"eth_getTransactionReceipt",[row.tx_hash]);
+      const hash=String(receipt?.blockHash||"").toLowerCase();
+      if(receipt?.status!=="0x1"||!/^0x[0-9a-f]{64}$/.test(hash))continue;
+      if(Number(BigInt(receipt.blockNumber||"0x0"))!==Number(row.block_number))continue;
+      const changed=await env.DB.prepare(
+        "UPDATE transfer_events SET block_hash=? WHERE event_id=? AND block_hash IS NULL "+
+        "AND block_number=? AND state='confirmed'"
+      ).bind(hash,row.event_id,row.block_number).run();
+      repaired+=changed.meta?.changes||0;
+    }catch(error){console.warn("Legacy block hash backfill failed",row.event_id,String(error));}
+  }
+  return {attempted:rows.length,repaired};
+}
 export async function reconcileRecentReorgs(env){
   const head=await blockNumber(env);
   const {results:rows}=await env.DB.prepare(
