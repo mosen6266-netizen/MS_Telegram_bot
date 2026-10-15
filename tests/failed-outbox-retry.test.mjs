@@ -16,8 +16,8 @@ test("only a terminal failure can be explicitly requeued, and the operation is i
   await DB.prepare("INSERT INTO outbox(id,chat_id,template_key,state,attempts,last_error) VALUES(1,'-1001','transfer','failed',5,'HTTP 429'),(2,'-1001','transfer','sent',1,NULL),(3,'-1002','transfer','pending',0,NULL)").run();
   assert.deepEqual(await requeueFailedOutbox(DB,-3),{error:"invalid_id",status:400});
   assert.deepEqual(await requeueFailedOutbox(DB,99),{error:"not_found",status:404});
-  assert.deepEqual(await requeueFailedOutbox(DB,2),{error:"not_failed",status:409});
-  assert.deepEqual(await requeueFailedOutbox(DB,3),{error:"not_failed",status:409});
+  assert.deepEqual(await requeueFailedOutbox(DB,2),{error:"not_retryable",status:409});
+  assert.deepEqual(await requeueFailedOutbox(DB,3),{error:"not_retryable",status:409});
   const ok=await requeueFailedOutbox(DB,1);
   assert.equal(ok.ok,true);
   assert.equal(ok.task.template_key,"transfer");
@@ -27,7 +27,7 @@ test("only a terminal failure can be explicitly requeued, and the operation is i
   assert.ok(row.due_at);
   assert.equal(row.last_error,null);
   assert.equal(row.sending_started_at,null);
-  assert.deepEqual(await requeueFailedOutbox(DB,1),{error:"not_failed",status:409});
+  assert.deepEqual(await requeueFailedOutbox(DB,1),{error:"not_retryable",status:409});
   assert.equal((await DB.prepare("SELECT state FROM outbox WHERE id=2").first()).state,"sent");
  }finally{await mf.dispose()}
 });
