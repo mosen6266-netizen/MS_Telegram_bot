@@ -35,7 +35,7 @@ test("transfer event and all active-recipient notices commit atomically, replay 
       assert.equal(String(url),"https://rpc.test.invalid");
       const request=JSON.parse(options.body);
       assert.equal(request.method,"eth_getTransactionReceipt");
-      return Response.json({jsonrpc:"2.0",id:1,result:{status:"0x1"}});
+      return Response.json({jsonrpc:"2.0",id:1,result:{status:"0x1",blockNumber:"0x100000",blockHash:"0x"+"ef".repeat(32)}});
     };
     const env={DB,ALCHEMY_RPC_URL:"https://rpc.test.invalid"};
     const activity={network:"ETH_MAINNET",event:{network:"ETH_MAINNET",activity:[{
@@ -53,6 +53,22 @@ test("transfer event and all active-recipient notices commit atomically, replay 
     assert.equal((await DB.prepare("SELECT count(*) n FROM transfer_events").first()).n,1);
     assert.equal((await DB.prepare("SELECT count(*) n FROM outbox").first()).n,2);
     assert.equal((await DB.prepare("SELECT count(*) n FROM outbox WHERE template_key='transfer'").first()).n,2);
+    const initial=await DB.prepare("SELECT event_id,block_hash FROM transfer_events LIMIT 1").first();
+    assert.equal(initial.block_hash,"0x"+"ef".repeat(32),
+      "verified receipt hash, not an untrusted activity field, must be persisted");
+
+    await DB.prepare("UPDATE transfer_events SET block_hash=NULL WHERE event_id=?").bind(initial.event_id).run();
+    await processActivity(env,activity);
+    assert.equal((await DB.prepare("SELECT block_hash FROM transfer_events WHERE event_id=?").bind(initial.event_id).first()).block_hash,
+      "0x"+"ef".repeat(32),"replay restores the missing verified hash");
+    assert.equal((await DB.prepare("SELECT COUNT(*) n FROM outbox").first()).n,2,
+      "healing a missing block hash must not duplicate notices");
+
+    await DB.prepare("UPDATE transfer_events SET block_hash=? WHERE event_id=?").bind("0x"+"aa".repeat(32),initial.event_id).run();
+    await processActivity(env,activity);
+    assert.equal((await DB.prepare("SELECT block_hash FROM transfer_events WHERE event_id=?").bind(initial.event_id).first()).block_hash,
+      "0x"+"aa".repeat(32),"a replay must not silently rewrite a previously recorded hash");
+
 
     await processActivity(env,activity);
     assert.equal((await DB.prepare("SELECT count(*) n FROM transfer_events").first()).n,1);
