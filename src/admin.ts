@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
+import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
@@ -20,14 +21,47 @@ export async function handleAdmin(req,env,path){
     return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6]});
   }
   if(method==="GET"&&path==="/api/chats")return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
-  if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state FROM wallets w LEFT JOIN wallet_watches ww USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/monitoring"){
+    const q=new URL(req.url).searchParams;
+    const page=Math.min(100000,Math.max(0,parseInt(q.get("page")||"0",10)||0));
+    const status=q.get("status")||"all",search=String(q.get("search")||"").trim().slice(0,90);
+    if(!["all","active","pending","removal_pending"].includes(status))return bad("监控状态筛选无效");
+    const where="ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)"
+      +(status==="all"?"":" AND ww.state=?")
+      +(search?" AND (ww.address LIKE ? OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ?)":"");
+    const args=[...(status==="all"?[]:[status]),...(search?["%"+search+"%","%"+search+"%"]:[])];
+    const total=(await env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE "+where).bind(...args).first())?.n||0;
+    const rows=(await env.DB.prepare(
+      "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,"+
+      "COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'待备注') AS remark,"+
+      "(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,"+
+      "(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,"+
+      "(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders "+
+      "FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE "+where+
+      " ORDER BY ww.updated_at DESC LIMIT 50 OFFSET ?"
+    ).bind(...args,page*50).all()).results||[];
+    const summary=(await env.DB.prepare("SELECT state,COUNT(*) n FROM wallet_watches WHERE state IN ('active','pending','removal_pending') GROUP BY state").all()).results||[];
+    return json({rows,total,page,total_pages:Math.ceil(total/50),summary});
+  }
+  if(method==="POST"&&path==="/api/monitoring/remark"){
+    const d=await body(req),address=addr(d.address);
+    if(!address)return bad("钱包地址无效");
+    const watch=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+    if(!watch||watch.state==="removed")return bad("此地址当前不在监控列表中",404);
+    const previous=await walletRemark(env,address,"");
+    let remark;
+    try{remark=await saveWalletRemark(env,address,d.remark)}catch(e){return bad(String(e.message||e))}
+    await audit(env,"admin","global_wallet_remark",address,{previous,remark});
+    return json({ok:true,remark,note:"此地址备注已同步所有群组、后台列表与后续消息"});
+  }
+  if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
   if(method==="POST"&&path==="/api/wallets"){
     const d=await body(req),a=addr(d.address);if(!a)return bad("无效的 Ethereum 地址");
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
     if(d.chat_id){
       const chat=String(d.chat_id);
       if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("机器人必须先加入这个 Telegram 群组");
-      const remark=String(d.remark||"待核验 · "+short(a)).trim().slice(0,80);
+      const remark=await walletRemark(env,a,String(d.remark||"待核验 · "+short(a)).trim().slice(0,80));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,a,remark).run();
       await env.TASKS.send({kind:"verify_admin",owner:a,chat_id:chat});
     }
@@ -40,6 +74,7 @@ export async function handleAdmin(req,env,path){
     await env.DB.prepare("INSERT OR IGNORE INTO wallet_exclusions(address) VALUES(?)").bind(wallet).run();
     await env.DB.prepare("UPDATE subscriptions SET status='removed',updated_at=? WHERE address=?").bind(now(),wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=? WHERE address=?").bind(now(),wallet).run();
+    await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='excluded',last_error='管理员手动移除',updated_at=CURRENT_TIMESTAMP WHERE owner=?").bind(wallet).run();
     const removed=await removeWatch(await configEnv(env),wallet);
     await audit(env,"admin","global_remove_wallet",wallet,{alchemy_removed:removed});
     return json({ok:true,alchemy_removed:removed,archived:true});
@@ -48,6 +83,7 @@ export async function handleAdmin(req,env,path){
     const d=await body(req),wallet=addr(d.address);if(!wallet)return bad("无效钱包地址");
     await env.DB.prepare("DELETE FROM wallet_exclusions WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=NULL WHERE address=?").bind(wallet).run();
+    await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='pending',last_error=NULL,updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='excluded'").bind(wallet).run();
     await audit(env,"admin","restore_wallet",wallet);
     return json({ok:true,watch_status:"not_automatically_resumed",note:"已恢复档案。需要重新进行有效 USDT 授权核验并建立群组订阅。"});
   }
@@ -60,7 +96,7 @@ export async function handleAdmin(req,env,path){
     await addSpender(await configEnv(env),a,String(d.remark||"Spender "+short(a)).slice(0,80),groups);
     await startSpenderHistory(env,a);
     await audit(env,"admin","create_spender",a,{groups});
-    return json({ok:true,mode:"new_approvals_only",note:"只监控新授权 Owner 的资金，不自动监控 Spender 自身。"});
+    return json({ok:true,mode:"history_and_new_approvals",note:"历史上授权过此 Spender 的 Owner 将逐步加入监控；不自动监控 Spender 自身。"});
   }
   if(method==="GET"&&path==="/api/spenders/history"){
     const q=new URL(req.url).searchParams,spender=addr(q.get("spender"));
@@ -73,7 +109,7 @@ export async function handleAdmin(req,env,path){
     const counts=await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender).first();
     const filter=status==="all"?"":" AND h.verify_status=?";
     const args=status==="all"?[spender,50,page*50]:[spender,status,50,page*50];
-    const rows=(await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner WHERE h.spender=?"+filter+" ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
+    const rows=(await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?"+filter+" ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results||[];
     const total=status==="all"?counts.total:counts[status];
     return json({job,counts,rows,page,total,total_pages:Math.ceil(total/50)});
   }
@@ -101,7 +137,7 @@ export async function handleAdmin(req,env,path){
     const old=await env.DB.prepare("SELECT * FROM subscriptions WHERE address=? AND chat_id=?").bind(a,chat).first();if(!old)return bad("订阅不存在",404);
     if(d.remark!==undefined){
       const text=String(d.remark).trim();if(!text||Array.from(text).length>80)return bad("备注长度为 1–80 字符");
-      await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=?").bind(text,now(),chat,a).run();
+      await saveWalletRemark(env,a,text);
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat,a,"admin",old.remark,text).run();
     }
     if(d.status!==undefined){
