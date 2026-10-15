@@ -240,6 +240,17 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
     if(!locked.meta?.changes)continue;
     try {
       const payload=JSON.parse(row.payload_json||"{}");
+      // A changed Spender destination must not receive delayed approval notices
+      // through routes that have already been removed.
+      if(payload.spender && (row.template_key==="new_approval"||row.template_key==="approval_change")){
+        const linked=await env.DB.prepare("SELECT r.chat_id,s.remark FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND r.chat_id=?")
+          .bind(String(payload.spender).toLowerCase(),String(row.chat_id)).first();
+        if(!linked){
+          await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Spender 通知群已更换' WHERE id=?").bind(row.id).run();
+          continue;
+        }
+        payload.spender_remark=linked.remark;
+      }
       if(row.template_key==="usage_alert"&&payload.expires_at&&Date.parse(payload.expires_at)<=Date.now()){
         await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Usage period has reset' WHERE id=?").bind(row.id).run();
         continue;
