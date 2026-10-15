@@ -108,7 +108,8 @@ export async function reconcileAlchemyAddresses(env){
   }catch(e){
     // A complete external listing is required before concluding an address is
     // absent. A transient listing error never wipes or downgrades local watches.
-    if(missing.length)await markUnsynced(db,missing);
+    // When a PATCH or follow-up GET fails, the remote state may already have
+    // changed. Do not demote any wallet without a complete confirming read.
     const report={status:"error",missing_identified:missing.length,reason:String(e.message||e).slice(0,180),checked_at:new Date().toISOString()};
     await save(db,RESULT,JSON.stringify(report));
     await save(db,NEXT,Date.now()+ERROR_DELAY);
