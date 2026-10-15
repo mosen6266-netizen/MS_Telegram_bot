@@ -3,6 +3,7 @@ import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
+import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources} from "./subscription-sources";
 import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
@@ -73,6 +74,7 @@ export async function handleAdmin(req,env,path){
       if(!(await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()))return bad("机器人必须先加入这个 Telegram 群组");
       const remark=await walletRemark(env,a,String(d.remark||"待核验 · "+short(a)).trim().slice(0,80));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,a,remark).run();
+      await sourceInsert(env.DB,chat,a,"admin","admin").run();
       await env.TASKS.send({kind:"verify_admin",owner:a,chat_id:chat});
     }
     await audit(env,"admin","create_wallet",a);
@@ -158,6 +160,7 @@ export async function handleAdmin(req,env,path){
     // subscriptions and transaction/audit archives to avoid accidental loss
     // of unrelated monitoring. Re-adding starts a clean history scan.
     await env.DB.batch([
+      ...retainDeletedSpenderSources(env.DB,a),
       env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
       env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
       env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
@@ -212,21 +215,14 @@ export async function handleAdmin(req,env,path){
           "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
           "WHERE h.spender=? AND x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL)"
         ).bind(chat,a));
+        changes.push(assignSpenderSourcesForRoute(env.DB,a,chat));
       }
       // Removed routes must stop receiving this Spender's future approval
       // notifications. Only remove auto-created wallet subscriptions that do
       // not belong to another Spender, manual query or admin-added wallet.
-      for(const chat of removed)changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a,chat));
       for(const chat of removed){
-        changes.push(env.DB.prepare(
-          "UPDATE subscriptions SET status='removed',updated_at=CURRENT_TIMESTAMP "+
-          "WHERE chat_id=? AND status IN ('active','pending') "+
-          "AND address IN (SELECT owner FROM spender_history_addresses WHERE spender=?) "+
-          "AND NOT EXISTS(SELECT 1 FROM wallets w WHERE w.address=subscriptions.address "+
-            "AND (w.first_user_id IS NOT NULL OR w.discovery_source IN ('manual','admin'))) "+
-          "AND NOT EXISTS(SELECT 1 FROM spender_history_addresses h2 JOIN spender_routes r2 ON r2.spender=h2.spender "+
-            "WHERE h2.owner=subscriptions.address AND r2.chat_id=? AND h2.spender<>?)"
-        ).bind(chat,a,chat,a));
+        changes.push(env.DB.prepare("DELETE FROM spender_routes WHERE spender=? AND chat_id=?").bind(a,chat));
+        changes.push(...removeSpenderRouteSourceStatements(env.DB,a,chat));
       }
     }
     if(changes.length)await env.DB.batch(changes);
