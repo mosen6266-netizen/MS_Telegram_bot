@@ -16,7 +16,7 @@
 - [x] P0-B（开发与自动化测试）：通过 Alchemy 官方地址列表 API 完整分页、只读对账；后台可查看上次完整对账结果、遗漏数量和限流失败；按成功24小时/失败1小时的规则自动重试。尚未在真实 Alchemy 生产配置下运行验证，仍待发布验收。
 - [~] P0-C：已优先处理从未尝试的钱包，失败地址按尝试次数延迟重试；还需做真实 Alchemy 限流与公平吞吐验证
 - [~] P0-D：CI 和 Worker 打包工作流已强制验证 18 个关键模块；仍需封闭手工拼接发布途径和构建产物签名/回滚
-- [~] P0-E：ensureWatch 已对 active 钱包幂等，失败写入不再将 active 降级；仍需远端对账与删改竞态测试
+- [~] P0-E：ensureWatch 对 active 钱包幂等，失败不降级；远端只读对账已实现和测试，尚待生产真实结果验证及自动修复策略
 - [~] P1：已修复发送恢复时间（使用 sending_started_at 新迁移）并增加老消息场景测试；重复发送与最终失败补偿尚未完成
 - [ ] P1：补扫公平队列、授权区块时间一致性、区块重组核对
 - [ ] P1：群组和 Spender 订阅来源关系与删除行为
@@ -61,3 +61,14 @@
 - 仍未执行真实 Alchemy 生产环境对账，且正式 Cloudflare Worker/D1 未修改；部署前还需要预演和验证。
 - 草稿 PR：https://github.com/mosen6266-netizen/MS_Telegram_bot/pull/1
 - **下一步**：重点是通知最终失败的可追踪补偿和重试、监控移除待处理状态的自动清理、跨 Spender 的群组订阅来源保护，以及测试环境部署演练。
+
+## 2026-10-15 第三轮：移除重试及队列错误处理
+
+- 新增 `src/watch-maintenance.ts`：对 `removal_pending` 地址以每轮最多 2 个、失败至少等待 30 分钟的方式重试 Alchemy 地址移除。始终要求有完整 Alchemy 身份配置，若存在活跃订阅则跳过，尊重新增地址接入的限流冷却期。
+- 新增 `tests/watch-removal-retry.test.mjs`：验证活跃订阅保护、新旧任务选择、限流跳过和 429 失败时仍保留待移除状态。
+- 修正 `src/index.ts` 中 Telegram Queue 异常处理时变量 `configured` 作用域错误；失败通知和临时消息清理不再因引用未定义变量失效。
+- 修正 `src/notifications.ts` 中 `attempts` 当前尝试未计入达到 5 次上限的判断（历史上可能多尝试一次）。
+- 新增 `tests/queue-failure-regression.test.mjs` 防止异常分支作用域和重试判断回退。
+- 本阶段 CI 基准：`b39f00430edb5bdd6e27f25fe70e551caa62a6be`；须检查该提交在 GitHub Actions 上的最终结果。
+- **仍然没有动生产 Worker 或正式 D1**。所有改动只在 `stabilization/2026-10-15-p0`，草稿 PR #1 继续保持未合并。
+- **下一步重点**：实现完整的订阅归属来源关系和跨 Spender 编辑/删除竞态测试；加强通知失败后补偿以及可靠的正式部署和回滚流程；随后才是性能与界面优化。
