@@ -132,7 +132,7 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","restore_wallet",wallet);
     return json({ok:true,watch_status:"not_automatically_resumed",note:"已恢复档案。需要重新进行有效 USDT 授权核验并建立群组订阅。"});
   }
-  if(method==="GET"&&path==="/api/spenders")return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/spenders")return json((await env.DB.prepare("SELECT s.*,group_concat(r.chat_id) groups,(SELECT value FROM runtime_state st WHERE st.key='spender_poll_status:'||s.spender) poll_status FROM spender_rules s LEFT JOIN spender_routes r USING(spender) GROUP BY s.spender ORDER BY s.created_at DESC LIMIT 200").all()).results);
   if(method==="POST"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);if(!a)return bad("Spender 地址无效");
     if(!Array.isArray(d.chat_ids))return bad("请填写通知群 ID 列表");
