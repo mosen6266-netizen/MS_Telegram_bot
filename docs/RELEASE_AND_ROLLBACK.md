@@ -73,6 +73,16 @@
 - [ ] 运行 `tests/admin-ui-inline-mutations.test.mjs`、`tests/admin-ui-action-lock.test.mjs`、`tests/admin-ui-refresh-preservation.test.mjs` 和 `tests/full-worker-preflight.test.mjs`。
 - [ ] **本地测试不能替代真实浏览器 UI 验收**：必须在隔离预发布服务上检查实际点击、滚动、焦点、键盘输入、窄屏与长页面性能，确认左侧栏不随主页面滚动。
 
+## 历史监控调度与通知队列并发验收（第十三轮）
+
+- [ ] 历史 Owner 接入批量任务必须为到期重试保留名额；有新地址及失败地址持续涌入时，两类任务都能推进，任何一类缺少任务时可使用空余名额。
+- [ ] 两个 Cron 同时尝试历史批量接入时，只有持有 `spender_enroll_batch_lock` 独立令牌者可以执行；过期任务不能释放新任务的锁，异常后锁最终会释放。
+- [ ] 模拟 Alchemy HTTP 429 / 1015：确认遵守服务端 `Retry-After`，冷却期内不重复 PATCH；持续受限时进行有上限的指数退避。不能因限流把当前钱包错误标记为已监控。
+- [ ] 通知队列多执行器同时读取同一批待发记录，数据库领取动作必须原子检查 `state='pending'` 和 `due_at<=CURRENT_TIMESTAMP`；另一执行器刚延后重试时间时不得抢跑。
+- [ ] 一批正常通知投递过程中，单条永久失败的管理员告警不可打断其余任务；结果无法确认仍遵循人工核查，不自动盲重发。
+- [ ] 执行 `tests/spender-enrollment-fairness.test.mjs`、`tests/spender-enrollment-provider-429.test.mjs`、`tests/outbox-concurrency-load.test.mjs`、`tests/telegram-uncertain-delivery.test.mjs` 并确认 Worker 打包完整。
+- [ ] 自动化使用的是模拟 Alchemy、Telegram 和隔离 D1，不等于长时间云端可靠性验证；正式发布前必须在独立预发布环境实测真正的限流、Queue 和 Cron 重叠。
+
 ## 4. 发布后明确验收条件
 
 - [ ] 生产中既有的所有 Spender、钱包、Telegram 群组、备注、模板和历史交易行数无意外下降。
