@@ -19,7 +19,7 @@
 - [~] P0-E：ensureWatch 对 active 钱包幂等，失败不降级；远端只读对账已实现和测试，尚待生产真实结果验证及自动修复策略
 - [~] P1：发送租约恢复已修复；通知最终失败支持管理员单条确认后手动重新排队并有测试，自动无重复确认仍待完善
 - [ ] P1：补扫公平队列、授权区块时间一致性、区块重组核对
-- [~] P1：已引入 subscription_sources 多来源归属；新手动/管理员/Spender 订阅写来源，改群时按来源安全解除；旧数据按 legacy 保守保留；真实生产迁移尚未验证
+- [~] P1：已有 subscription_sources 多来源归属、保守 legacy 保留；已添加历史订阅来源只读搜索/分页审核；仍需人工来源确认流程和正式数据验收
 - [ ] P1：扫描、接入、定时任务分离和负载控制
 - [~] P2：通知队列已实现按状态/任务编号/群 ID 的服务端分页与 50 条加载；钱包/订阅/审计等其他页面及局部更新仍待处理
 - [ ] P2：密码安全、历史归档、费用用量查询优化、文档一致性
@@ -100,3 +100,19 @@
 - 最新文档提交 `0f1c3fa94bd75df8334ab714bcecf9f7ff826ef9` 仍需对应 CI 最终确认；文档不会自动部署。
 - **所有生产配置未变，当前草稿 PR #1 不可合并。**
 - 下阶段重点：`spender_rules` 删除和 Poll / History 并发竞态、通知失败与 Telegram 回执不可确定时的明确状态管理、订阅来源归属人工审核机制、真实发布迁移演练。
+
+## 2026-10-15 第六轮：Spender 删除/重建并发保护与历史订阅审核
+
+- **历史授权及实时授权版本护栏**：`migrations/20261016_spender_generation_fence.sql` 为 `spender_rules` 和历史扫描任务增加不可复用的 `generation`。新建 Spender 分配新的 `crypto.randomUUID()`，旧规则被删除并重建后旧扫描结果不得混入新版本。
+- `src/spender-history.ts`：Etherscan RPC 返回后、每批地址写入前校验规则 generation；历史地址和授权时间戳插入使用原子 `INSERT SELECT ... WHERE EXISTS` 版本护栏，游标/错误/核验结果按 generation 条件写入。旧请求不能复活已删历史记录。
+- `src/approval.ts`：实时扫描游标更新仅在 generation 与旧游标均匹配时执行；实时事件入库与 allowance UPSERT 也校验 generation；已失效的旧回调不进入新规则的通知群。
+- `tests/spender-generation-fence.test.mjs`：真实 Miniflare D1 测试中模拟 Etherscan 请求尚未返回时删除并重建 Spender，验证旧历史不写入新任务，旧版本实时写入被拒绝。
+- `tests/spender-live-generation.test.mjs`：模拟实时 RPC allowance 返回前删除并重建相同 Spender，验证旧授权事件、额度和游标不会重新出现。
+- **迁移顺序已修正**：开始时命名不正确，CI 捕获“历史扫描表尚未创建”；现迁移改为 `20261016_spender_generation_fence.sql`，并在 `docs/RELEASE_AND_ROLLBACK.md` 明确其必须排在历史表迁移之后。
+- **旧订阅来源审核**：`src/subscription-sources.ts` 新增只读 `listLegacySubscriptions`，管理员 `GET /api/subscriptions/legacy`，在地址群组订阅页面显示历史来源待核实清单，可搜索钱包/群组、每页 30 条；不会自动改写来源或停止旧群通知。
+- `tests/legacy-provenance-audit.test.mjs`：76 条模拟订阅、旧数据保守迁移、过滤和分页、无修改审计。
+- `scripts/verify-worker-bundle.mjs` 增加 generation 校验与历史来源审核模块检查。
+- 最新历史/实时竞态和只读审核功能提交 `d1c0ea7cb19adb9ac0e986bc0cc0d4f10f39d7f7` 已有 GitHub CI 与 Smoke Test 成功记录；发布清单与最终捆绑检查提交 `0c8a739140d6ecec56adc7e35caa8c6698d7477a` 的 CI 还需核对完成状态。
+- **仍未合并 main，也未修改生产 Cloudflare Worker/D1。**
+- **剩余并发风险**：对在删除前已开始、且在最后一次规则校验后才进入远端 Alchemy API 的调用，还需统一引入受控接入队列和操作租约，才能保证远端同样无孤儿监控。不要把本阶段说成彻底消除所有异步竞争。
+- **下一阶段**：完善 Alchemy 接入/删除统一调度与租约、Telegram 旧订阅来源人工确认/取消的强权限功能、交易通知可恢复性测试、性能和 UI 全面复核、隔离环境部署迁移演练。
