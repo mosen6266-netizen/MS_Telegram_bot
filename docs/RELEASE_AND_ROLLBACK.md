@@ -16,9 +16,10 @@
   - `20261015_outbox_sending_lease.sql`
   - `20261015_subscription_sources.sql`
   - `20261015_outbox_pagination_index.sql`
+  - `20261016_spender_generation_fence.sql`（必须在 `20261015_spender_history.sql` 和 `20261015_spender_history_times.sql` 之后执行）
 - [ ] 使用实际 D1 `PRAGMA table_info`、`PRAGMA foreign_key_check`、`SELECT count(*)` 检查迁移结果。
 - [ ] 验证旧 `subscriptions` 被标记为 `legacy` 且未被取消，现有监控/通知不丢失。
-- [ ] 新版 Worker 在**隔离预发布环境**通过健康检查、管理员登录、查询/修改备注、Spender 创建/编辑/删除、Alchemy webhook 模拟、Telegram outbox 发送模拟、Cron 恢复和限流测试。
+- [ ] 新版 Worker 在**隔离预发布环境**通过健康检查、管理员登录、查询/修改备注、Spender 创建/编辑/删除（含删除期间扫描和相同地址重建）、Alchemy webhook 模拟、Telegram outbox 发送模拟、Cron 恢复和限流测试。
 - [ ] 确定生产部署时间窗口及负责验收的管理员，事先告知现有监控风险。
 
 ## 2. 允许发布的执行顺序（仅在用户明确批准后）
