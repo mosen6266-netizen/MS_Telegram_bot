@@ -1824,6 +1824,29 @@ async function handleAdmin(req, env, path) {
     await env.DB.prepare("UPDATE spender_history_jobs SET state=CASE WHEN state='retrying' THEN 'scanning' ELSE state END,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(spender).run();
     return json({ ok: true, note: "\u5DF2\u5B89\u6392\u91CD\u65B0\u6838\u9A8C\u5F53\u524D\u6388\u6743\u989D\u5EA6\uFF0C\u5386\u53F2\u626B\u63CF\u4ECE\u65AD\u70B9\u7EE7\u7EED" });
   }
+  if (method === "DELETE" && path === "/api/spenders") {
+    const d = await body(req), a = addr(d.spender);
+    if (!a) return bad("Spender \u5730\u5740\u65E0\u6548");
+    const rule = await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
+    if (!rule) return bad("\u8BE5 Spender \u5DF2\u4E0D\u5B58\u5728", 404);
+    const histories = (await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n || 0;
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
+    ]);
+    await audit(env, "admin", "delete_spender", a, { remark: rule.remark, history_wallets_deleted_from_rule: histories, monitored_wallets_retained: true });
+    return json({
+      ok: true,
+      removed_spender: a,
+      history_records_removed: histories,
+      monitored_wallets_retained: true,
+      note: "Spender \u89C4\u5219\u5DF2\u5220\u9664\uFF0C\u5386\u53F2\u626B\u63CF\u4E0E\u8FD9\u6761\u89C4\u5219\u7684\u7FA4\u7EC4\u63A8\u9001\u5DF2\u505C\u6B62\uFF1B\u5DF2\u63A5\u5165\u7684\u72EC\u7ACB\u94B1\u5305\u76D1\u63A7\u548C\u65E2\u6709\u6D88\u606F\u8BB0\u5F55\u4FDD\u7559\u3002"
+    });
+  }
   if (method === "PATCH" && path === "/api/spenders") {
     const d = await body(req), a = addr(d.spender);
     if (!a) return bad("\u65E0\u6548 Spender \u5730\u5740");
