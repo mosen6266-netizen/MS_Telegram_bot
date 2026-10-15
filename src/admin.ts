@@ -3,6 +3,7 @@ import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
+import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
 import {defaults,templateCatalog} from "./notifications";
@@ -23,6 +24,11 @@ export async function handleAdmin(req,env,path){
     return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6]});
   }
   if(method==="GET"&&path==="/api/chats")return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
+  if(method==="GET"&&path==="/api/monitoring/reconciliation"){
+    // Admin authentication is verified above. This endpoint never contacts
+    // Alchemy or exposes the notify token; it serves the last safe snapshot.
+    return json(await lastAlchemyReconciliation(env.DB));
+  }
   if(method==="GET"&&path==="/api/monitoring"){
     const q=new URL(req.url).searchParams;
     const page=Math.min(100000,Math.max(0,parseInt(q.get("page")||"0",10)||0));
