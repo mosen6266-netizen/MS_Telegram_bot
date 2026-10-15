@@ -258,7 +258,11 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
       let remark="—";
       if(row.address){
         const sub=await env.DB.prepare("SELECT remark,status FROM subscriptions WHERE address=? AND chat_id=?").bind(row.address,row.chat_id).first();
-        if(!sub || sub.status!=="active"){
+        // A new approval should reach the configured Telegram group even if
+        // the Alchemy address enrollment is still pending. The alert explicitly
+        // labels this state. Explicitly paused/removed subscriptions stay muted.
+        const approvalAlert=row.template_key==="new_approval"||row.template_key==="approval_change";
+        if(!sub || (sub.status!=="active"&&!(approvalAlert&&sub.status==="pending"))){
           await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Subscription no longer active' WHERE id=?").bind(row.id).run();
           continue;
         }
