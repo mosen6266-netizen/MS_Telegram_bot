@@ -109,14 +109,20 @@ async function processApproval(env,rule,log){
   const before=BigInt(previous?.amount_raw||"0");
   const evId="approval:"+log.transactionHash+":"+log.logIndex;
   const type=amount===0n?"revoked":!previous?"new":before===0n?"reauthorized":amount>before?"increased":amount<before?"decreased":"unchanged";
-  await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)")
-   .bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type).run();
-  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP")
-   .bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber))).run();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) "+
+    "SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1)"
+  ).bind(evId,owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),log.transactionHash,type,rule.spender,rule.generation).run();
+  await env.DB.prepare(
+    "INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) "+
+    "SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1) "+
+    "ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP"
+  ).bind(owner,rule.spender,amount.toString(),Number(BigInt(log.blockNumber)),Number(BigInt(log.blockNumber)),rule.spender,rule.generation).run();
+  if(!await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=? AND generation=? AND enabled=1").bind(rule.spender,rule.generation).first())return;
   const registered=await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
   if(amount>0n && (!registered || !previous)){
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
-    const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
+    const {results:routes}=await env.DB.prepare("SELECT r.chat_id FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND s.generation=? AND s.enabled=1").bind(rule.spender,rule.generation).all();
     for(const route of routes||[]){
       const chat=String(route.chat_id);
       const exists=await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first();
@@ -133,7 +139,7 @@ async function processApproval(env,rule,log){
     });
     await increment(env,"discovered_wallets");
   } else if(type!=="unchanged" && previous) {
-    const {results:routes}=await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
+    const {results:routes}=await env.DB.prepare("SELECT r.chat_id FROM spender_routes r JOIN spender_rules s ON s.spender=r.spender WHERE r.spender=? AND s.generation=? AND s.enabled=1").bind(rule.spender,rule.generation).all();
     for(const route of routes||[])await queueNotice(env,{
       dedup:evId+":"+route.chat_id,chat_id:route.chat_id,address:owner,template:"approval_change",
       payload:{owner,spender:rule.spender,spender_remark:rule.remark,amount:formatUnits(amount,6)+" USDT",event_type:type,tx_hash:log.transactionHash}
