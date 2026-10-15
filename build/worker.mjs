@@ -1476,7 +1476,7 @@ function indexValue(value) {
 function transferKey(a, kind, hash, asset, from, to) {
   if (kind === "erc20") {
     const unique = String(a.uniqueId || "");
-    const suffix = unique.startsWith(hash + ":") ? unique.slice(hash.length + 1) : null;
+    const suffix = unique.startsWith(hash + ":log:") ? unique.slice(hash.length + 5) : unique.startsWith(hash + ":") ? unique.slice(hash.length + 1) : null;
     const logIndex = indexValue(a.log?.logIndex ?? a.logIndex ?? suffix);
     if (logIndex !== null) return "tx:" + hash + ":erc20:" + asset + ":" + logIndex;
     return "tx:" + hash + ":erc20:" + asset + ":" + (unique || from + ":" + to + ":" + String(a.rawContract?.rawValue ?? a.rawContract?.value ?? a.value));
