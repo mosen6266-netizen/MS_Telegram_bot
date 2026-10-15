@@ -1034,7 +1034,7 @@ async function verifyHistoricalAllowances(env, max = 8) {
     } catch (e) {
       const reason = String(e.message || e);
       console.error("History allowance verification", row.spender, row.owner, reason);
-      if (/429|1015|rate.limit|quota|too many requests|HTTP 5\\d\\d|not configured/i.test(reason)) {
+      if (/429|1015|rate.limit|quota|too many requests|HTTP 5\d\d|not configured/i.test(reason)) {
         await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(retryKey, String(Date.now() + 5 * 6e4)).run();
         break;
       }
