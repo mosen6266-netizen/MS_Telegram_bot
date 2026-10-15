@@ -2,6 +2,7 @@
 import {ensureWatch,short,now,blockNumber} from "./core";
 import {walletRemark} from "./wallet-remarks";
 import {sourceInsert} from "./subscription-sources";
+import {withAlchemyMutationLease,alchemyMutationFetch} from "./alchemy-mutation-lease";
 
 // Bulk enroll historical USDT Approval owners; this is distinct from discovering
 // the addresses. Alchemy can rate-limit dashboard API calls (HTTP 429 / 1015).
@@ -15,7 +16,7 @@ async function setEnrollmentCooldown(env,minutes){
 }
 
 export async function selectEnrollmentCandidates(db,limit=ENROLL_BATCH){
-  const query="SELECT h.spender,h.owner FROM spender_history_addresses h "+
+  const query="SELECT h.spender,h.owner,r.generation FROM spender_history_addresses h "+
       "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
       "LEFT JOIN wallets w ON w.address=h.owner "+
       "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
@@ -82,7 +83,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
         if(state?.state==="active"){
           await db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner,spender).run();
           await db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender,owner).run();
-        }else toSync.push({spender,owner});
+        }else toSync.push({spender,owner,generation:row.generation});
       }catch(e){
         const reason=String(e.message||e).slice(0,210);
         await db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(reason,spender,owner).run();
@@ -95,7 +96,10 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       // If this is the first monitored wallet, let the existing implementation
       // create the webhook and save its signing key before attempting bulk sync.
       if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID){
-        const created=await ensureWatch(env,unique[0]);
+        const first=toSync.find(x=>x.owner===unique[0]);
+        const created=await ensureWatch(env,unique[0],undefined,async()=>
+          !!await db.prepare("SELECT 1 FROM spender_rules r JOIN spender_history_addresses h ON h.spender=r.spender WHERE r.spender=? AND r.generation=? AND r.enabled=1 AND h.owner=?")
+            .bind(first.spender,first.generation,first.owner).first());
         if(!created)throw Error("Alchemy webhook 创建失败");
         const one=unique.shift();
         const matched=toSync.filter(x=>x.owner===one);
@@ -116,10 +120,26 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
         setup.push(db.prepare("INSERT OR IGNORE INTO wallet_checkpoints(address,last_block) VALUES(?,?)").bind(owner,Math.max(0,latest-1)));
       }
       await db.batch(setup);
-      const res=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
+      return await withAlchemyMutationLease(env,async()=>{
+        // The Spender DELETE API uses the same lease. A deletion that wins first
+        // invalidates these generations; a mutation that wins first prevents
+        // deletion until the remote call and local state commit finish.
+        const valid=[];
+        for(const row of toSync){
+          if(!unique.includes(row.owner))continue;
+          if(await db.prepare(
+            "SELECT 1 FROM spender_rules r JOIN spender_history_addresses h ON h.spender=r.spender "+
+            "WHERE r.spender=? AND r.generation=? AND r.enabled=1 AND h.owner=? "+
+            "AND NOT EXISTS(SELECT 1 FROM wallet_exclusions x WHERE x.address=h.owner) "+
+            "AND NOT EXISTS(SELECT 1 FROM wallets w WHERE w.address=h.owner AND w.deleted_at IS NOT NULL)"
+          ).bind(row.spender,row.generation,row.owner).first())valid.push(row);
+        }
+        const verified=[...new Set(valid.map(x=>x.owner))];
+        if(!verified.length)return {processed:rows.length,skipped:"spender_removed"};
+        const res=await alchemyMutationFetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
         method:"PATCH",
         headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
-        body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:unique,addresses_to_remove:[]})
+        body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:verified,addresses_to_remove:[]})
       });
       const body=await res.text();
       if(!res.ok)throw Error("Alchemy batch sync HTTP "+res.status+" "+body.slice(0,130));
@@ -128,14 +148,15 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
       if(parsed?.success===false||parsed?.error)throw Error("Alchemy batch rejected: "+JSON.stringify(parsed.error||parsed.message).slice(0,150));
       const stamp=now();
       const statements=[];
-      for(const owner of unique)statements.push(db.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=?").bind(stamp,stamp,owner));
-      for(const row of toSync){
+      for(const owner of verified)statements.push(db.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=? AND state='pending'").bind(stamp,stamp,owner));
+      for(const row of valid){
         statements.push(db.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(row.owner,row.spender));
         statements.push(db.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(row.spender,row.owner));
       }
       await db.batch(statements);
       await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(BACKOFF_KEY).run();
-      return {processed:rows.length,synced:unique.length};
+      return {processed:rows.length,synced:verified.length};
+      });
     }catch(e){
       const reason=String(e.message||e).slice(0,225);
       const limited=/HTTP 429|error code:\s*1015|rate limit/i.test(reason);
