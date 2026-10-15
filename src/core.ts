@@ -51,6 +51,9 @@ export async function telegram(env,method,body){
   if(!r.ok || !d.ok){
     const error=Error("Telegram "+(d.description||r.status));
     error.retryAfter=Number(d.parameters?.retry_after)||0;
+    // Telegram explicitly rejected this request. Unlike a timeout/transport
+    // failure, its non-ok response is evidence the message was not accepted.
+    error.telegramRejected=true;
     throw error;
   }
   if(method==="sendMessage")await recordUsage(env,"telegram_notifications");
