@@ -73,21 +73,62 @@ export async function addSpender(env,spender,remark,chat_ids){
   await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block) VALUES(?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender,remark,head,head).run();
   for(const chat of chat_ids||[])await env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender,String(chat)).run();
 }
+// Scan in bounded batches and narrow the block range if the RPC provider
+// rejects a request. Persist progress/errors instead of indefinitely retrying
+// one opaque 500-block request with no actionable diagnostics.
+const pollStatusKey=spender=>"spender_poll_status:"+spender;
+const pollWindowKey=spender=>"spender_poll_window:"+spender;
+async function savePollState(db,spender,details){
+  await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+    .bind(pollStatusKey(spender),JSON.stringify(details)).run();
+}
 export async function pollSpenders(env){
   const head=await blockNumber(env);
   const {results:rules}=await env.DB.prepare("SELECT * FROM spender_rules WHERE enabled=1 ORDER BY cursor_block ASC LIMIT 40").all();
   for(const rule of rules||[]){
-    const from=rule.cursor_block+1;
-    const to=Math.min(head,from+499);
-    if(from>to)continue;
-    try {
-      const logs=await rpc(env,"eth_getLogs",[{address:USDT,fromBlock:"0x"+from.toString(16),toBlock:"0x"+to.toString(16),topics:[APPROVAL_TOPIC,null,toTopic(rule.spender)]}]);
-      for(const log of logs||[]){
-        if(log.removed)continue;
-        await processApproval(env,rule,log);
+    let cursor=Number(rule.cursor_block);
+    const saved=await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(pollWindowKey(rule.spender)).first();
+    let window=Number(saved?.value||32);
+    if(!Number.isSafeInteger(window)||window<1||window>256)window=32;
+    let attempted=0;
+    for(let cycle=0;cycle<8&&cursor<head;cycle++){
+      const from=cursor+1,to=Math.min(head,from+window-1);
+      let logs;
+      try{
+        logs=await rpc(env,"eth_getLogs",[{address:USDT,fromBlock:"0x"+from.toString(16),toBlock:"0x"+to.toString(16),topics:[APPROVAL_TOPIC,null,toTopic(rule.spender)]}]);
+        if(!Array.isArray(logs))throw Error("Invalid eth_getLogs response");
+      }catch(e){
+        const reason=String(e.message||e).slice(0,220);
+        if(window>1){
+          window=Math.max(1,Math.floor(window/2));
+          await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollWindowKey(rule.spender),String(window)).run();
+          // The rejected range has not advanced the cursor; retry a smaller
+          // range immediately, without consuming a successful cycle.
+          cycle--;
+          attempted++;
+          if(attempted<9)continue;
+        }
+        await savePollState(env.DB,rule.spender,{status:"error",stage:"eth_getLogs",cursor,head,window,message:reason,at:now()});
+        console.error("Spender polling RPC error",rule.spender,reason);
+        break;
       }
-      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=?").bind(to,rule.spender).run();
-    }catch(e){console.error("Spender polling failed",rule.spender,String(e));}
+      try{
+        for(const log of logs){
+          if(log.removed)continue;
+          await processApproval(env,rule,log);
+        }
+        await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=? AND cursor_block<?").bind(to,rule.spender,to).run();
+        cursor=to;
+        window=Math.min(256,Math.max(8,window*2));
+        await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollWindowKey(rule.spender),String(window)).run();
+        await savePollState(env.DB,rule.spender,{status:"ok",cursor,head,window,events:logs.length,at:now()});
+      }catch(e){
+        const reason=String(e.message||e).slice(0,220);
+        await savePollState(env.DB,rule.spender,{status:"error",stage:"processApproval",cursor,head,window,message:reason,at:now()});
+        console.error("Spender approval processing failed",rule.spender,reason);
+        break;
+      }
+    }
   }
 }
 async function processApproval(env,rule,log){
