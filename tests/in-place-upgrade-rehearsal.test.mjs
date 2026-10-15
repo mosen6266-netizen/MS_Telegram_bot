@@ -41,7 +41,7 @@ test("upgrade preserves live wallet monitoring, Telegram subscriptions, pending 
   await db.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,'Original note','active')").bind(chat,owner).run();
   await db.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block,enabled) VALUES(?,'Original Spender',100,300,1)").bind(spender).run();
   await db.prepare("INSERT INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender,chat).run();
-  await db.prepare("UPDATE spender_history_jobs SET next_block=200,state='running',events_found=29 WHERE spender=?").bind(spender).run();
+  await db.prepare("INSERT INTO spender_history_jobs(spender,next_block,cutoff_block,window_size,state,events_found) VALUES(?,200,300,200000,'running',29)").bind(spender).run();
   await db.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block,latest_event_block,verify_status) VALUES(?,?,121,200,'active')").bind(spender,owner).run();
   await db.prepare("INSERT INTO spender_history_monitor_enrollments(spender,owner,state,attempts) VALUES(?,?,'active',1)").bind(spender,owner).run();
   await db.prepare("INSERT INTO outbox(dedup_key,chat_id,address,template_key,payload_json,state,attempts,created_at) VALUES('old:1',?,?,'transfer','{}','sending',2,datetime('now','-2 days'))").bind(chat,owner).run();
