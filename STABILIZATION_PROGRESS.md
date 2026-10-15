@@ -147,3 +147,16 @@
 - **测试状态**：功能与迁移的 CI 在 `9bddc14ee4434318fc9d72d0b533190291fb8abf` 已通过；最新 `4cfef07a8d5d0a63e5bd3be0af8e81b4f9b1cfe6` 测试数据生成优化的 CI 尚待最终结果核验。
 - **下一步**：确认 CI，随后重点执行隔离预发布 Worker + D1 真正的端到端运行测试、逐项浏览器交互与大数据量性能压力测试；继续修复剩余长列表、重复渲染和资源用量查询瓶颈。
 - **禁止直接部署到生产**：PR #1 保持草稿、`main` 不合并、生产 D1 与 Worker 未修改；上线仍需用户确认及真实回滚预案。
+
+## 2026-10-15 第九轮：完整 Worker 隔离运行、备注局部保存、检查流程区分
+
+- **第八轮最终确认**：此前提交 `79b38f039f47ee74cb9396989a6164ecb7fe6067` 的两组 CI 均成功；不再将其标为等待。
+- 新增 `tests/full-worker-preflight.test.mjs`：使用 **真正构建后的 `src/index.ts` 全部 Worker 代码**，通过 Miniflare 独立运行，采用按真实迁移创建的隔离 D1、模拟管理员登录会话及 HTTP 请求验证：`/health`、`/admin`、`/auth/status`、`/api/summary`、监控/钱包/订阅/审计/链上交易分页、Alchemy 对账结果读接口、未登录 401、合法管理员写入的 CSRF 拦截、备注同步与操作审计。
+- **不等于外部预发布**：本测试没有把 Worker 部署到 Cloudflare 预发布账号，没有调用真实 Telegram/Alchemy API，也没有做浏览器实机操作。真实 Cloudflare Queue、Cron、外部服务与版本发布仍需后续验收。
+- **备注保存体验**：`src/admin-ui.ts` 正在监控地址每行“保存备注”改为局部异步保存，无整页 `render()`；保护其他行未保存的输入与当前列表定位；按钮有“保存中”状态、阻止重复点击、错误后恢复。通用错误显示不再打开阻塞式浏览器 `alert`，改为页面提示。
+- 新增 `tests/admin-ui-remark-save.test.mjs`：通过 VM 执行实际前端 `saveRemarkInline`，验证成功、失败、双击及无页面重绘。新增完整 Worker 请求测试覆盖统一备注写入、订阅同步、搜索和审计。
+- **验证**：第九轮含端到端隔离测试与备注逻辑的功能提交 `dc840f44e7ec377fc96e8fe4e75dc2aca7a0e5e7` 已通过两组 GitHub CI。
+- **工作流澄清**：`.github/workflows/smoke.yml` 改名 `Production Liveness Check (not staging validation)`，仅 `main` push 或手动执行，用于确认现有生产端点存活；开发分支通过实际完整 Worker 的 CI 测试验证，避免“旧线上能打开 = 新版本已验收”的错误结论。
+- `docs/RELEASE_AND_ROLLBACK.md` 已加入新验收门槛、正式 Cloudflare 沙盒/预发布外部联调要求。
+- 当前仅修改 `stabilization/2026-10-15-p0`，**未合并 main，未修改生产 Worker/D1**。本轮文档/工作流最终 CI 需在下次继续前核实。
+- **下一步**：搭建与正式环境隔离的 Cloudflare 预发布 Worker + D1 + Queue，验证真正的 Telegram / Alchemy 接入与 Cron（不得复制生产密钥或混用生产 Webhook）；继续修复剩余列表/按钮的重复渲染、UI 搜索保存性能，以及用量汇总 N+1 查询和正式发布回滚演练。
