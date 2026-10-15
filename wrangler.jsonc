@@ -9,7 +9,7 @@
   ],
   "queues": {
     "producers": [{ "binding": "TASKS", "queue": "ethereum-usdt-monitor-tasks" }],
-    "consumers": [{ "queue": "ethereum-usdt-monitor-tasks", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "ethereum-usdt-monitor-dlq" }]
+    "consumers": [{ "queue": "ethereum-usdt-monitor-tasks", "max_batch_size": 1, "max_batch_timeout": 0, "max_retries": 5, "dead_letter_queue": "ethereum-usdt-monitor-dlq" }]
   },
   "triggers": { "crons": ["*/2 * * * *"] },
   "vars": {
