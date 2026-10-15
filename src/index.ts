@@ -75,10 +75,12 @@ export default {
   async queue(batch,env,ctx){
     for(const message of batch.messages){
       const item=message.body;
+      // Also used in the exhausted-retry error path below.
+      let configured=env;
       try{
         const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
         if(!active){message.retry({delaySeconds:120});continue;}
-        const configured=await configEnv(env);
+        configured=await configEnv(env);
         if(item.kind==="check"){
           await checkOwner(configured,item.owner,item.chat_id,item.user_id,item.display_name);
           // A final query result was delivered; temporary user input and progress are no longer needed.
