@@ -1707,7 +1707,36 @@ async function handleAdmin(req, env, path) {
     return json({ wallets: v[0], spenders: v[1], subscriptions: v[2], failed: v[3], transfers_today: v[4], cleanup_blocked: v[5], cleanup_pending: v[6] });
   }
   if (method === "GET" && path === "/api/chats") return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
-  if (method === "GET" && path === "/api/wallets") return json((await env.DB.prepare("SELECT w.*,ww.state watch_state FROM wallets w LEFT JOIN wallet_watches ww USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if (method === "GET" && path === "/api/monitoring") {
+    const q = new URL(req.url).searchParams;
+    const page = Math.min(1e5, Math.max(0, parseInt(q.get("page") || "0", 10) || 0));
+    const status2 = q.get("status") || "all", search = String(q.get("search") || "").trim().slice(0, 90);
+    if (!["all", "active", "pending", "removal_pending"].includes(status2)) return bad("\u76D1\u63A7\u72B6\u6001\u7B5B\u9009\u65E0\u6548");
+    const where = "ww.state IN ('active','pending','removal_pending') AND (w.deleted_at IS NULL OR w.address IS NULL)" + (status2 === "all" ? "" : " AND ww.state=?") + (search ? " AND (ww.address LIKE ? OR COALESCE(g.remark,(SELECT remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),'') LIKE ?)" : "");
+    const args = [...status2 === "all" ? [] : [status2], ...search ? ["%" + search + "%", "%" + search + "%"] : []];
+    const total = (await env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where).bind(...args).first())?.n || 0;
+    const rows = (await env.DB.prepare(
+      "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'\u5F85\u5907\u6CE8') AS remark,(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where + " ORDER BY ww.updated_at DESC LIMIT 50 OFFSET ?"
+    ).bind(...args, page * 50).all()).results || [];
+    const summary = (await env.DB.prepare("SELECT state,COUNT(*) n FROM wallet_watches WHERE state IN ('active','pending','removal_pending') GROUP BY state").all()).results || [];
+    return json({ rows, total, page, total_pages: Math.ceil(total / 50), summary });
+  }
+  if (method === "POST" && path === "/api/monitoring/remark") {
+    const d = await body(req), address = addr(d.address);
+    if (!address) return bad("\u94B1\u5305\u5730\u5740\u65E0\u6548");
+    const watch = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+    if (!watch || watch.state === "removed") return bad("\u6B64\u5730\u5740\u5F53\u524D\u4E0D\u5728\u76D1\u63A7\u5217\u8868\u4E2D", 404);
+    const previous = await walletRemark(env, address, "");
+    let remark;
+    try {
+      remark = await saveWalletRemark(env, address, d.remark);
+    } catch (e) {
+      return bad(String(e.message || e));
+    }
+    await audit(env, "admin", "global_wallet_remark", address, { previous, remark });
+    return json({ ok: true, remark, note: "\u6B64\u5730\u5740\u5907\u6CE8\u5DF2\u540C\u6B65\u6240\u6709\u7FA4\u7EC4\u3001\u540E\u53F0\u5217\u8868\u4E0E\u540E\u7EED\u6D88\u606F" });
+  }
+  if (method === "GET" && path === "/api/wallets") return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
   if (method === "POST" && path === "/api/wallets") {
     const d = await body(req), a = addr(d.address);
     if (!a) return bad("\u65E0\u6548\u7684 Ethereum \u5730\u5740");
@@ -1715,7 +1744,7 @@ async function handleAdmin(req, env, path) {
     if (d.chat_id) {
       const chat = String(d.chat_id);
       if (!await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first()) return bad("\u673A\u5668\u4EBA\u5FC5\u987B\u5148\u52A0\u5165\u8FD9\u4E2A Telegram \u7FA4\u7EC4");
-      const remark = String(d.remark || "\u5F85\u6838\u9A8C \xB7 " + short(a)).trim().slice(0, 80);
+      const remark = await walletRemark(env, a, String(d.remark || "\u5F85\u6838\u9A8C \xB7 " + short(a)).trim().slice(0, 80));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, a, remark).run();
       await env.TASKS.send({ kind: "verify_admin", owner: a, chat_id: chat });
     }
@@ -1729,6 +1758,7 @@ async function handleAdmin(req, env, path) {
     await env.DB.prepare("INSERT OR IGNORE INTO wallet_exclusions(address) VALUES(?)").bind(wallet).run();
     await env.DB.prepare("UPDATE subscriptions SET status='removed',updated_at=? WHERE address=?").bind(now(), wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=? WHERE address=?").bind(now(), wallet).run();
+    await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='excluded',last_error='\u7BA1\u7406\u5458\u624B\u52A8\u79FB\u9664',updated_at=CURRENT_TIMESTAMP WHERE owner=?").bind(wallet).run();
     const removed = await removeWatch(await configEnv(env), wallet);
     await audit(env, "admin", "global_remove_wallet", wallet, { alchemy_removed: removed });
     return json({ ok: true, alchemy_removed: removed, archived: true });
@@ -1738,6 +1768,7 @@ async function handleAdmin(req, env, path) {
     if (!wallet) return bad("\u65E0\u6548\u94B1\u5305\u5730\u5740");
     await env.DB.prepare("DELETE FROM wallet_exclusions WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=NULL WHERE address=?").bind(wallet).run();
+    await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='pending',last_error=NULL,updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='excluded'").bind(wallet).run();
     await audit(env, "admin", "restore_wallet", wallet);
     return json({ ok: true, watch_status: "not_automatically_resumed", note: "\u5DF2\u6062\u590D\u6863\u6848\u3002\u9700\u8981\u91CD\u65B0\u8FDB\u884C\u6709\u6548 USDT \u6388\u6743\u6838\u9A8C\u5E76\u5EFA\u7ACB\u7FA4\u7EC4\u8BA2\u9605\u3002" });
   }
@@ -1751,7 +1782,7 @@ async function handleAdmin(req, env, path) {
     await addSpender(await configEnv(env), a, String(d.remark || "Spender " + short(a)).slice(0, 80), groups);
     await startSpenderHistory(env, a);
     await audit(env, "admin", "create_spender", a, { groups });
-    return json({ ok: true, mode: "new_approvals_only", note: "\u53EA\u76D1\u63A7\u65B0\u6388\u6743 Owner \u7684\u8D44\u91D1\uFF0C\u4E0D\u81EA\u52A8\u76D1\u63A7 Spender \u81EA\u8EAB\u3002" });
+    return json({ ok: true, mode: "history_and_new_approvals", note: "\u5386\u53F2\u4E0A\u6388\u6743\u8FC7\u6B64 Spender \u7684 Owner \u5C06\u9010\u6B65\u52A0\u5165\u76D1\u63A7\uFF1B\u4E0D\u81EA\u52A8\u76D1\u63A7 Spender \u81EA\u8EAB\u3002" });
   }
   if (method === "GET" && path === "/api/spenders/history") {
     const q = new URL(req.url).searchParams, spender = addr(q.get("spender"));
@@ -1764,7 +1795,7 @@ async function handleAdmin(req, env, path) {
     const counts = await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender).first();
     const filter = status2 === "all" ? "" : " AND h.verify_status=?";
     const args = status2 === "all" ? [spender, 50, page * 50] : [spender, status2, 50, page * 50];
-    const rows = (await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner WHERE h.spender=?" + filter + " ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results || [];
+    const rows = (await env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?" + filter + " ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args).all()).results || [];
     const total = status2 === "all" ? counts.total : counts[status2];
     return json({ job, counts, rows, page, total, total_pages: Math.ceil(total / 50) });
   }
@@ -1797,7 +1828,7 @@ async function handleAdmin(req, env, path) {
     if (d.remark !== void 0) {
       const text = String(d.remark).trim();
       if (!text || Array.from(text).length > 80) return bad("\u5907\u6CE8\u957F\u5EA6\u4E3A 1\u201380 \u5B57\u7B26");
-      await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=?").bind(text, now(), chat, a).run();
+      await saveWalletRemark(env, a, text);
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chat, a, "admin", old.remark, text).run();
     }
     if (d.status !== void 0) {
