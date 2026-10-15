@@ -1,0 +1,34 @@
+name: Build deployable Worker bundle
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/bundle-worker.yml'
+permissions:
+  contents: write
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx esbuild src/index.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=build/worker.mjs
+      - name: Save bundle for controlled Cloudflare deployment
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f build/worker.mjs
+          if ! git diff --cached --quiet; then
+            git commit -m "build: update reviewed Worker bundle [skip ci]"
+            git push origin HEAD:main
+          fi
