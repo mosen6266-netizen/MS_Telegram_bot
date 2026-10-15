@@ -55,3 +55,23 @@ test("errors display nonblocking status without browser alert flashing",()=>{
   assert.doesNotMatch(script,/\balert\(/);
   assert.match(script,/function prefetchView\(/);
 });
+
+test("large administrative lists request only one 50-row page at a time",()=>{
+  const admin=readFileSync("src/admin.ts","utf8");
+  assert.match(script,/var listPages=\{subscriptions:0,transfers:0,outbox:0,audit:0\}/);
+  assert.match(script,/function listPager\(/);
+  for(const view of ["subscriptions","transfers","outbox","audit"]){
+    assert.ok(script.includes('"/api/'+view+'?paged=1&page="+listPages.'+view),
+      view+" view should request paginated records");
+    assert.ok(admin.includes('path==="/api/'+view+'"'),
+      view+" API should be preserved");
+  }
+  assert.match(admin,/async function pagedRows\(/);
+  assert.match(admin,/LIMIT 50 OFFSET \?/);
+  assert.match(admin,/total_pages:Math\.ceil\(total\/50\)/);
+});
+
+test("monitor remark changes do not rebuild the entire page",()=>{
+  assert.match(script,/x\.remark=field\.value\.trim\(\);alertMsg/);
+  assert.doesNotMatch(script,/api\("\/api\/monitoring\/remark","POST",[^\n]*await render\(\)/);
+});
