@@ -238,6 +238,9 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
   for(const row of rows||[]){
     const locked=await env.DB.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,sending_started_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending'").bind(row.id).run();
     if(!locked.meta?.changes)continue;
+    // Once a network request starts, a transport timeout or a DB commit error
+    // cannot prove whether Telegram accepted the message. Fail closed.
+    let deliveryStarted=false;
     try {
       const payload=JSON.parse(row.payload_json||"{}");
       // A changed Spender destination must not receive delayed approval notices
@@ -265,10 +268,19 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
         remark=sub.remark;
       }
       const content=await renderTemplate(env,row.template_key,row.chat_id,{...payload,remark,address:row.address});
+      deliveryStarted=true;
       const result=await send(env,row.chat_id,content.slice(0,3800),row.address?buttons(row.address):undefined);
       await env.DB.prepare("UPDATE outbox SET state='sent',sent_at=?,telegram_message_id=?,sending_started_at=NULL,last_error=NULL WHERE id=?").bind(now(),result.message_id,row.id).run();
     }catch(e){
       const message=String(e).slice(0,250);
+      if(deliveryStarted&&!e?.telegramRejected){
+        // The remote message may have been delivered despite a lost response
+        // or an unsuccessful D1 commit. Never blindly send it again.
+        await env.DB.prepare("UPDATE outbox SET state='delivery_unknown',sending_started_at=NULL,last_error=? WHERE id=? AND state='sending'")
+          .bind("Telegram 投递结果无法确认："+message,row.id).run();
+        console.warn("Telegram delivery is ambiguous; requires manual reconciliation",row.id);
+        continue;
+      }
       if(row.attempts+1>=5&&row.template_key!=="usage_alert"){
         await env.DB.prepare("UPDATE outbox SET state='failed',sending_started_at=NULL,last_error=? WHERE id=?").bind(message,row.id).run();
         await notifyAdmin(env,await renderTemplate(env,"notice_failed",env.ADMIN_TELEGRAM_CHAT_ID||"*",{queue_id:row.id,error_message:message}));
@@ -280,5 +292,12 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
   }
 }
 export async function recoverStuck(env){
-  await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now'),sending_started_at=NULL WHERE state='sending' AND sending_started_at<datetime('now','-10 minutes')").run();
+  // An abandoned 'sending' lease may have been interrupted after Telegram
+  // accepted the message, before we persisted its message ID. Its outcome is
+  // unknowable without manual verification. Automatic requeue risks duplicates.
+  await env.DB.prepare(
+    "UPDATE outbox SET state='delivery_unknown',sending_started_at=NULL,"+
+    "last_error='发送任务中断：Telegram 是否已收到消息无法确认，请人工检查后处理' "+
+    "WHERE state='sending' AND sending_started_at<datetime('now','-10 minutes')"
+  ).run();
 }
