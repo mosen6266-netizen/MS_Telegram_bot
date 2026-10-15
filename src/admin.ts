@@ -121,6 +121,10 @@ export async function handleAdmin(req,env,path){
   }
   if(method==="POST"&&path==="/api/wallets/restore"){
     const d=await body(req),wallet=addr(d.address);if(!wallet)return bad("无效钱包地址");
+    const record=await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(wallet).first();
+    if(!record)return bad("钱包档案不存在，无法恢复",404);
+    if(!record.deleted_at && !(await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(wallet).first()))
+      return json({ok:true,already_restored:true,note:"该钱包档案已经恢复，无需重复执行"});
     await env.DB.prepare("DELETE FROM wallet_exclusions WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=NULL WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='pending',last_error=NULL,updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='excluded'").bind(wallet).run();
@@ -139,6 +143,8 @@ export async function handleAdmin(req,env,path){
     }
     const label=String(d.remark||"Spender "+short(a)).trim();
     if(!label||Array.from(label).length>80||/[\u0000-\u001f\u007f]/.test(label))return bad("备注须为 1–80 个字符");
+    if(await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=?").bind(a).first())
+      return bad("此 Spender 已存在，请使用编辑功能修改备注、通知群或启用状态",409);
     await addSpender(await configEnv(env),a,label,groups);
     await startSpenderHistory(env,a);
     await audit(env,"admin","create_spender",a,{groups});
@@ -229,6 +235,7 @@ export async function handleAdmin(req,env,path){
       removed=oldGroups.filter(x=>!chats.includes(x));
       added=chats.filter(x=>!oldGroups.includes(x));
     }
+    if(d.enabled!==undefined&&typeof d.enabled!=="boolean")return bad("运行开关必须为布尔值");
     const changes=[];
     if(d.enabled!==undefined)changes.push(env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled?1:0,a));
     if(remark!==undefined)changes.push(env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark,a));
