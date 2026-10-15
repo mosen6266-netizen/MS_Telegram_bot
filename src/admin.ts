@@ -132,7 +132,7 @@ export async function handleAdmin(req,env,path){
     const d=await body(req),a=addr(d.spender);if(!a)return bad("Spender 地址无效");
     if(!Array.isArray(d.chat_ids))return bad("请填写通知群 ID 列表");
     const groups=[...new Set(d.chat_ids.map(x=>String(x).trim()))];
-    if(!groups.length||groups.some(x=>!(/^-\d{5,20}$/.test(x)))return bad("请填写至少一个有效的 Telegram 群 ID");
+    if(!groups.length||groups.some(x=>!/^\-\d{5,20}$/.test(x)))return bad("请填写至少一个有效的 Telegram 群 ID");
     for(const chat of groups){
       const target=await env.DB.prepare("SELECT active,chat_type FROM telegram_chats WHERE chat_id=?").bind(chat).first();
       if(!target||!target.active||!["group","supergroup"].includes(target.chat_type))return bad("通知群尚未登记、已停用或不是群组："+chat);
