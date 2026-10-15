@@ -83,6 +83,15 @@
 - [ ] 执行 `tests/spender-enrollment-fairness.test.mjs`、`tests/spender-enrollment-provider-429.test.mjs`、`tests/outbox-concurrency-load.test.mjs`、`tests/telegram-uncertain-delivery.test.mjs` 并确认 Worker 打包完整。
 - [ ] 自动化使用的是模拟 Alchemy、Telegram 和隔离 D1，不等于长时间云端可靠性验证；正式发布前必须在独立预发布环境实测真正的限流、Queue 和 Cron 重叠。
 
+## 第十四轮：多 Spender 公平调度和历史/钱包恢复验收
+
+- [ ] 至少 32 个 Spender 同时具有新 Owner 和到期重试 Owner：使用持久化游标轮转，各 Spender 在有限 Cron 轮次内都能被选中；只存在一个处理名额时新/重试池必须交替，20 条批次依然保留前述 15/5 配额。
+- [ ] Etherscan 历史任务：多个任务具有相同秒级 `updated_at` 时，借助 `spender_history_rr_cursor` 轮流推进；单个 Spender 查询失败后延迟重试，不影响其他 Spender 继续完成扫描；成功和错误情况下 `next_block` 不得错误跳过区块。
+- [ ] 模拟 Etherscan 429：所有历史查询暂停短暂冷却；不因反复 Cron 继续发送 Etherscan HTTP 请求。
+- [ ] 钱包资金缺口恢复：最旧的钱包反复 RPC 失败时，用 `checked_at` 进行至少五分钟的退避，但保留 `last_block`，其余活跃钱包继续扫描；冷却到期后可以重新选择。
+- [ ] 运行 `tests/spender-enrollment-fairness.test.mjs`、`tests/spender-history-scheduler.test.mjs`、`tests/wallet-gap-recovery-fairness.test.mjs`，确认完整 Worker 包含上述功能。
+- [ ] **仍需单独的云端长时间负载测试**：模拟 D1/RPC 的通过结果不代表 100–200 钱包在实际 Alchemy/Etherscan 配额下能够保持同步。必须采集真实滞后区块、Cron 耗时、Provider 429 和通知延迟。
+
 ## 4. 发布后明确验收条件
 
 - [ ] 生产中既有的所有 Spender、钱包、Telegram 群组、备注、模板和历史交易行数无意外下降。
