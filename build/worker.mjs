@@ -2092,6 +2092,10 @@ async function handleAdmin(req, env, path) {
   if (method === "POST" && path === "/api/wallets/restore") {
     const d = await body(req), wallet = addr(d.address);
     if (!wallet) return bad("\u65E0\u6548\u94B1\u5305\u5730\u5740");
+    const record = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(wallet).first();
+    if (!record) return bad("\u94B1\u5305\u6863\u6848\u4E0D\u5B58\u5728\uFF0C\u65E0\u6CD5\u6062\u590D", 404);
+    if (!record.deleted_at && !await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(wallet).first())
+      return json({ ok: true, already_restored: true, note: "\u8BE5\u94B1\u5305\u6863\u6848\u5DF2\u7ECF\u6062\u590D\uFF0C\u65E0\u9700\u91CD\u590D\u6267\u884C" });
     await env.DB.prepare("DELETE FROM wallet_exclusions WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE wallets SET deleted_at=NULL WHERE address=?").bind(wallet).run();
     await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='pending',last_error=NULL,updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='excluded'").bind(wallet).run();
@@ -2111,6 +2115,8 @@ async function handleAdmin(req, env, path) {
     }
     const label = String(d.remark || "Spender " + short(a)).trim();
     if (!label || Array.from(label).length > 80 || /[\u0000-\u001f\u007f]/.test(label)) return bad("\u5907\u6CE8\u987B\u4E3A 1\u201380 \u4E2A\u5B57\u7B26");
+    if (await env.DB.prepare("SELECT 1 FROM spender_rules WHERE spender=?").bind(a).first())
+      return bad("\u6B64 Spender \u5DF2\u5B58\u5728\uFF0C\u8BF7\u4F7F\u7528\u7F16\u8F91\u529F\u80FD\u4FEE\u6539\u5907\u6CE8\u3001\u901A\u77E5\u7FA4\u6216\u542F\u7528\u72B6\u6001", 409);
     await addSpender(await configEnv(env), a, label, groups);
     await startSpenderHistory(env, a);
     await audit(env, "admin", "create_spender", a, { groups });
@@ -2195,6 +2201,7 @@ async function handleAdmin(req, env, path) {
       removed = oldGroups.filter((x) => !chats.includes(x));
       added = chats.filter((x) => !oldGroups.includes(x));
     }
+    if (d.enabled !== void 0 && typeof d.enabled !== "boolean") return bad("\u8FD0\u884C\u5F00\u5173\u5FC5\u987B\u4E3A\u5E03\u5C14\u503C");
     const changes = [];
     if (d.enabled !== void 0) changes.push(env.DB.prepare("UPDATE spender_rules SET enabled=? WHERE spender=?").bind(d.enabled ? 1 : 0, a));
     if (remark !== void 0) changes.push(env.DB.prepare("UPDATE spender_rules SET remark=? WHERE spender=?").bind(remark, a));
