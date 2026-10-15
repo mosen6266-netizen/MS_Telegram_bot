@@ -38,7 +38,7 @@ test("all passive and active Telegram messages are listed and editable with Chin
   const admin=readFileSync("src/admin.ts","utf8");
   const ui=readFileSync("src/admin-ui.ts","utf8");
   for(const key of ["query_progress","query_active","query_inactive","query_failed","remark_prompt","remark_invalid","remark_unwatched","remark_conflict","remark_saved","start_welcome","new_approval","approval_change","transfer","reorg_correction","usage_alert","notice_failed"]){
-    assert.match(templates,new RegExp('\\\\b'+key+'\\\\b'));
+    assert.ok(templates.includes(key+":" )||templates.includes('"key":'.replace("key",key)),key+" must exist in message templates");
   }
   assert.match(templates,/export const templateCatalog/);
   assert.match(templates,/HTML-escaped/);
