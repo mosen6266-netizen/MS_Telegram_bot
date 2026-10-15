@@ -1133,22 +1133,55 @@ async function addSpender(env, spender, remark, chat_ids) {
   await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block) VALUES(?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender, remark, head, head).run();
   for (const chat of chat_ids || []) await env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender, String(chat)).run();
 }
+var pollStatusKey = (spender) => "spender_poll_status:" + spender;
+var pollWindowKey = (spender) => "spender_poll_window:" + spender;
+async function savePollState(db, spender, details) {
+  await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollStatusKey(spender), JSON.stringify(details)).run();
+}
 async function pollSpenders(env) {
   const head = await blockNumber(env);
   const { results: rules } = await env.DB.prepare("SELECT * FROM spender_rules WHERE enabled=1 ORDER BY cursor_block ASC LIMIT 40").all();
   for (const rule of rules || []) {
-    const from = rule.cursor_block + 1;
-    const to = Math.min(head, from + 499);
-    if (from > to) continue;
-    try {
-      const logs = await rpc(env, "eth_getLogs", [{ address: USDT, fromBlock: "0x" + from.toString(16), toBlock: "0x" + to.toString(16), topics: [APPROVAL_TOPIC, null, toTopic(rule.spender)] }]);
-      for (const log of logs || []) {
-        if (log.removed) continue;
-        await processApproval(env, rule, log);
+    let cursor = Number(rule.cursor_block);
+    const saved = await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(pollWindowKey(rule.spender)).first();
+    let window = Number(saved?.value || 32);
+    if (!Number.isSafeInteger(window) || window < 1 || window > 256) window = 32;
+    let attempted = 0;
+    for (let cycle = 0; cycle < 8 && cursor < head; cycle++) {
+      const from = cursor + 1, to = Math.min(head, from + window - 1);
+      let logs;
+      try {
+        logs = await rpc(env, "eth_getLogs", [{ address: USDT, fromBlock: "0x" + from.toString(16), toBlock: "0x" + to.toString(16), topics: [APPROVAL_TOPIC, null, toTopic(rule.spender)] }]);
+        if (!Array.isArray(logs)) throw Error("Invalid eth_getLogs response");
+      } catch (e) {
+        const reason = String(e.message || e).slice(0, 220);
+        if (window > 1) {
+          window = Math.max(1, Math.floor(window / 2));
+          await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollWindowKey(rule.spender), String(window)).run();
+          cycle--;
+          attempted++;
+          if (attempted < 9) continue;
+        }
+        await savePollState(env.DB, rule.spender, { status: "error", stage: "eth_getLogs", cursor, head, window, message: reason, at: now() });
+        console.error("Spender polling RPC error", rule.spender, reason);
+        break;
       }
-      await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=?").bind(to, rule.spender).run();
-    } catch (e) {
-      console.error("Spender polling failed", rule.spender, String(e));
+      try {
+        for (const log of logs) {
+          if (log.removed) continue;
+          await processApproval(env, rule, log);
+        }
+        await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=? AND cursor_block<?").bind(to, rule.spender, to).run();
+        cursor = to;
+        window = Math.min(256, Math.max(8, window * 2));
+        await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollWindowKey(rule.spender), String(window)).run();
+        await savePollState(env.DB, rule.spender, { status: "ok", cursor, head, window, events: logs.length, at: now() });
+      } catch (e) {
+        const reason = String(e.message || e).slice(0, 220);
+        await savePollState(env.DB, rule.spender, { status: "error", stage: "processApproval", cursor, head, window, message: reason, at: now() });
+        console.error("Spender approval processing failed", rule.spender, reason);
+        break;
+      }
     }
   }
 }
@@ -1822,14 +1855,14 @@ async function cfDay(env, day) {
 }
 async function collectCloudflare(env, settings) {
   if (!env.CF_ANALYTICS_API_TOKEN) throw Error("\u5F85\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684 Account Analytics Read \u53EA\u8BFB\u4EE4\u724C");
-  const now3 = /* @__PURE__ */ new Date(), today = now3.toISOString().slice(0, 10), monthly = monthPeriod(now3, settings.cloudflare_billing_day), daily = dayPeriod(now3);
+  const now2 = /* @__PURE__ */ new Date(), today = now2.toISOString().slice(0, 10), monthly = monthPeriod(now2, settings.cloudflare_billing_day), daily = dayPeriod(now2);
   const rows = (await env.DB.prepare("SELECT day FROM usage_cf_days WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const cached = new Set(rows.map((x) => x.day));
   await cfDay(env, today);
-  const yesterday = new Date(+now3 - 864e5).toISOString().slice(0, 10);
+  const yesterday = new Date(+now2 - 864e5).toISOString().slice(0, 10);
   if (yesterday >= monthly.start.slice(0, 10)) await cfDay(env, yesterday);
   const required = [];
-  for (let time = Date.parse(monthly.start); time < +now3; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
+  for (let time = Date.parse(monthly.start); time < +now2; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
   for (const day of required.filter((d) => !cached.has(d) && d !== today && d !== yesterday).slice(0, 4)) await cfDay(env, day);
   const updated = (await env.DB.prepare("SELECT day,payload_json FROM usage_cf_days WHERE day>=? AND day<=?").bind(monthly.start.slice(0, 10), today).all()).results;
   const totals = new Map(updated.map((x) => [x.day, JSON.parse(x.payload_json)]));
@@ -1847,7 +1880,7 @@ async function collectCloudflare(env, settings) {
       used,
       quota: known && complete ? limit?.quota ?? presets[key2] : null,
       unit: meter.unit,
-      period_start: storage ? monthPeriod(now3).start : period.start,
+      period_start: storage ? monthPeriod(now2).start : period.start,
       period_end: storage ? "9999-12-31T00:00:00.000Z" : period.end,
       observed_at: ISO(),
       source: "official_api",
@@ -1862,7 +1895,7 @@ async function collectCloudflare(env, settings) {
   }
 }
 async function collectInternal(env) {
-  const now3 = /* @__PURE__ */ new Date(), daily = dayPeriod(now3), monthly = monthPeriod(now3);
+  const now2 = /* @__PURE__ */ new Date(), daily = dayPeriod(now2), monthly = monthPeriod(now2);
   const rows = (await env.DB.prepare("SELECT metric,day,value FROM counters WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const limits = (await env.DB.prepare("SELECT * FROM usage_limits").all()).results;
   const started = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_started_at'").first())?.value;
