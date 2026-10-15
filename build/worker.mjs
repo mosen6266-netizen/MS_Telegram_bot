@@ -1517,6 +1517,51 @@ async function processActivity(env, payload) {
   }
 }
 
+// src/activity-replay.ts
+var PREFIX2 = "failed_activity:";
+function storageKey(bytes) {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(bytes)).then((buffer) => PREFIX2 + [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join(""));
+}
+async function retainFailedActivity(env, payload, error) {
+  const encoded = JSON.stringify(payload);
+  if (!encoded || encoded === "null") throw Error("Missing activity payload");
+  const key2 = await storageKey(encoded);
+  const content = JSON.stringify({ payload, attempts: 0, next_at: 0, last_error: String(error || "unknown").slice(0, 240), saved_at: (/* @__PURE__ */ new Date()).toISOString() });
+  await env.DB.prepare("INSERT OR IGNORE INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)").bind(key2, content).run();
+  return key2;
+}
+async function replayFailedActivities(env, max = 3) {
+  const db = env.DB;
+  const { results: rows } = await db.prepare(
+    "SELECT key,value FROM runtime_state WHERE key LIKE 'failed_activity:%' ORDER BY updated_at ASC LIMIT 30"
+  ).all();
+  let checked = 0, recovered = 0;
+  for (const row of rows || []) {
+    if (checked >= max) break;
+    let record;
+    try {
+      record = JSON.parse(row.value);
+    } catch (e) {
+      console.error("Stored activity replay payload unreadable", row.key);
+      continue;
+    }
+    if (!record?.payload || Number(record.next_at || 0) > Date.now()) continue;
+    checked++;
+    try {
+      await processActivity(env, record.payload);
+      await db.prepare("DELETE FROM runtime_state WHERE key=?").bind(row.key).run();
+      recovered++;
+    } catch (e) {
+      const attempts = Math.max(0, Number(record.attempts) || 0) + 1;
+      const delay = Math.min(6 * 60 * 60 * 1e3, 60 * 1e3 * Math.pow(2, Math.min(attempts, 8)));
+      const updated = { ...record, attempts, next_at: Date.now() + delay, last_error: String(e.message || e).slice(0, 240) };
+      await db.prepare("UPDATE runtime_state SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key=?").bind(JSON.stringify(updated), row.key).run();
+      console.warn("Stored activity replay deferred", row.key, updated.last_error);
+    }
+  }
+  return { checked, recovered };
+}
+
 // src/recovery.ts
 async function getOneDirection(env, address, direction, from, to) {
   let cursor = null, loops = 0, transactions = 0;
@@ -2417,6 +2462,11 @@ async function cron(env) {
     console.error("Reorg checks", String(e));
   }
   try {
+    await replayFailedActivities(env, 3);
+  } catch (e) {
+    console.error("Failed activity recovery", String(e));
+  }
+  try {
     await flushOutbox(env, 40);
   } catch (e) {
     console.error("Telegram outbox delivery", String(e));
@@ -2491,6 +2541,15 @@ var index_default = {
       } catch (e) {
         console.error("Queue job failed", item.kind, String(e));
         if (message.attempts >= 5) {
+          if (item.kind === "activity") {
+            try {
+              await retainFailedActivity(env, item.payload, e);
+            } catch (saveError) {
+              console.error("Activity failure retention failed", String(saveError));
+              message.retry({ delaySeconds: 120 });
+              continue;
+            }
+          }
           if (item.kind === "check") {
             try {
               await send(configured, item.chat_id, await renderTemplate(configured, "query_failed", item.chat_id, { address: item.owner }));
