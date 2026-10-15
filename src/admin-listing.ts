@@ -52,3 +52,18 @@ export async function listAuditPage(db,options={}){
   selectSql:"SELECT id,actor,action,target,created_at FROM admin_audit"+filter+
     " ORDER BY id DESC LIMIT 50 OFFSET ?"});
 }
+
+export async function listTransfersPage(db,options={}){
+ const {page,search}=pageArgs(options),asset=String(options.asset||"all").toUpperCase();
+ if(!["ALL","ETH","USDT","USDC"].includes(asset))return {error:"invalid_asset",status:400};
+ const predicates=[],params=[];
+ if(asset!=="ALL"){predicates.push("asset=?");params.push(asset)}
+ if(search){
+  predicates.push("(instr(lower(address),lower(?))>0 OR instr(lower(tx_hash),lower(?))>0)");
+  params.push(search,search);
+ }
+ const where=predicates.length?" WHERE "+predicates.join(" AND "):"";
+ return runPage(db,{page,params,countSql:"SELECT COUNT(*) n FROM transfer_events"+where,
+  selectSql:"SELECT event_id,address,asset,direction,raw_amount,block_number,tx_hash FROM transfer_events"+where+
+    " ORDER BY block_number DESC,event_id DESC LIMIT 50 OFFSET ?"});
+}
