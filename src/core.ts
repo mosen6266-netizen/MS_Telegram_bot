@@ -131,6 +131,10 @@ export async function removeWatch(env,address){
 }
 export async function ensureWatch(env,address,fromBlock=undefined){
   await env.DB.prepare("INSERT OR IGNORE INTO wallet_watches(address,state) VALUES(?,'pending')").bind(address).run();
+  // Do not issue another Alchemy mutation for a locally active subscription:
+  // concurrent retries must not downgrade healthy wallets after a 429.
+  const existing=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(address).first();
+  if(existing?.state==="active")return true;
   try {
     // Start recovery at first relevant authorization block when available.
     const head=fromBlock===undefined?await blockNumber(env):fromBlock;
@@ -139,7 +143,7 @@ export async function ensureWatch(env,address,fromBlock=undefined){
     await env.DB.prepare("UPDATE wallet_watches SET state='active',synced_at=?,last_error=NULL,updated_at=? WHERE address=?").bind(now(),now(),address).run();
     return true;
   } catch(e) {
-    await env.DB.prepare("UPDATE wallet_watches SET state='pending',last_error=?,updated_at=? WHERE address=?").bind(String(e).slice(0,500),now(),address).run();
+    await env.DB.prepare("UPDATE wallet_watches SET state='pending',last_error=?,updated_at=? WHERE address=? AND state<>'active'").bind(String(e).slice(0,500),now(),address).run();
     return false;
   }
 }
