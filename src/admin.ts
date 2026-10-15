@@ -58,7 +58,21 @@ export async function handleAdmin(req,env,path){
     await audit(env,"admin","global_wallet_remark",address,{previous,remark});
     return json({ok:true,remark,note:"此地址备注已同步所有群组、后台列表与后续消息"});
   }
-  if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
+  if(method==="GET"&&path==="/api/wallets"){
+    const q=new URL(req.url).searchParams;
+    const select="SELECT w.*,ww.state watch_state,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name) remark FROM wallets w LEFT JOIN wallet_watches ww USING(address) LEFT JOIN wallet_global_remarks g USING(address) ";
+    // Preserve the original array response for older API clients.
+    if(q.get("paged")!=="1")return json((await env.DB.prepare(select+"ORDER BY w.created_at DESC LIMIT 200").all()).results);
+    const page=Math.min(100000,Math.max(0,Number.parseInt(q.get("page")||"0",10)||0));
+    const search=String(q.get("search")||"").trim().slice(0,90);
+    const where=search?"WHERE w.address LIKE ? OR COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=w.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'') LIKE ? ":"";
+    const args=search?["%"+search+"%","%"+search+"%"]:[];
+    const count=env.DB.prepare("SELECT COUNT(*) n FROM wallets w LEFT JOIN wallet_global_remarks g ON g.address=w.address "+where).bind(...args);
+    const rows=env.DB.prepare(select+where+"ORDER BY w.created_at DESC,w.address ASC LIMIT 50 OFFSET ?").bind(...args,page*50);
+    const [countResult,rowsResult]=await env.DB.batch([count,rows]);
+    const total=countResult.results?.[0]?.n||0;
+    return json({rows:rowsResult.results||[],total,page,total_pages:Math.ceil(total/50)});
+  }
   if(method==="POST"&&path==="/api/wallets"){
     const d=await body(req),a=addr(d.address);if(!a)return bad("无效的 Ethereum 地址");
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'admin')").bind(a).run();
