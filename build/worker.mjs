@@ -736,6 +736,23 @@ async function recoverStuck(env) {
   await env.DB.prepare("UPDATE outbox SET state='pending',due_at=datetime('now') WHERE state='sending' AND created_at<datetime('now','-10 minutes')").run();
 }
 
+// src/wallet-remarks.ts
+async function walletRemark(env, address, fallback = "") {
+  const row = await env.DB.prepare("SELECT remark FROM wallet_global_remarks WHERE address=?").bind(address).first();
+  if (row?.remark) return row.remark;
+  const existing = await env.DB.prepare("SELECT remark FROM subscriptions WHERE address=? ORDER BY updated_at DESC LIMIT 1").bind(address).first();
+  return existing?.remark || fallback;
+}
+async function saveWalletRemark(env, address, value) {
+  const a = addr(address), remark = String(value ?? "").trim();
+  if (!a || !remark || Array.from(remark).length > 80 || /[\u0000-\u001f\u007f]/.test(remark)) throw Error("\u5907\u6CE8\u4E0D\u80FD\u4E3A\u7A7A\u3001\u6700\u591A80\u4E2A\u5B57\u7B26\uFF0C\u4E14\u4E0D\u80FD\u5305\u542B\u63A7\u5236\u5B57\u7B26");
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO wallet_global_remarks(address,remark,updated_at) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET remark=excluded.remark,updated_at=excluded.updated_at").bind(a, remark, now()),
+    env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE address=?").bind(remark, now(), a)
+  ]);
+  return remark;
+}
+
 // src/telegram.ts
 async function memberAllowed(env, chatId, userId) {
   try {
@@ -800,6 +817,7 @@ async function handleTelegram(env, upd) {
         }
         return;
       }
+      await saveWalletRemark(env, session2.address, remark);
       await env.DB.prepare("INSERT INTO remark_edits(chat_id,address,actor_id,old_value,new_value) VALUES(?,?,?,?,?)").bind(chatId, session2.address, userId, old.remark, remark).run();
       await send(env, chatId, await renderTemplate(env, "remark_saved", chatId, { remark, address: session2.address }), buttons(session2.address));
       await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId, userId, m.reply_to_message.message_id).run();
@@ -1040,11 +1058,12 @@ async function checkOwner(env, owner, chat_id, user_id, display_name) {
   await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,first_user_id,first_user_name,discovery_source) VALUES(?,?,?,'manual')").bind(owner, String(user_id), display_name).run();
   await env.DB.prepare("UPDATE wallets SET first_user_id=?,first_user_name=? WHERE address=? AND first_user_id IS NULL").bind(String(user_id), display_name, owner).run();
   const first = await env.DB.prepare("SELECT first_user_name FROM wallets WHERE address=?").bind(owner).first();
-  await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id), owner, first?.first_user_name || display_name).run();
+  const sharedRemark = await walletRemark(env, owner, first?.first_user_name || display_name);
+  await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id), owner, sharedRemark).run();
   const watched = await ensureWatch(env, owner);
   if (watched) await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id), owner).run();
   const current = await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id), owner).first();
-  const groupRemark = current?.remark || first?.first_user_name || display_name;
+  const groupRemark = await walletRemark(env, owner, current?.remark || first?.first_user_name || display_name);
   const lines = positives.slice(0, 25).map((x, i) => i + 1 + ". <code>" + esc(x.spender) + "</code>\n\u989D\u5EA6\uFF1A" + (BigInt(x.amount) >= 1n << 255n ? "\u65E0\u9650" : formatUnits(x.amount, 6) + " USDT"));
   const output = await renderTemplate(env, "query_active", chat_id, {
     remark: groupRemark,
@@ -1100,7 +1119,7 @@ async function processApproval(env, rule, log) {
       const chat = String(route.chat_id);
       const exists = await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(chat).first();
       if (!exists) continue;
-      const remark = "\u5F85\u5907\u6CE8 \xB7 " + short(owner);
+      const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat, owner, remark).run();
     }
     const watched = await ensureWatch(env, owner, Number(BigInt(log.blockNumber)));
@@ -1122,6 +1141,43 @@ async function processApproval(env, rule, log) {
       template: "approval_change",
       payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount, 6) + " USDT", event_type: type, tx_hash: log.transactionHash }
     });
+  }
+}
+
+// src/spender-enroll.ts
+async function enrollHistoricalOwners(env, limit = 8) {
+  const { results: rows } = await env.DB.prepare(
+    "SELECT h.spender,h.owner FROM spender_history_addresses h JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 LEFT JOIN wallets w ON w.address=h.owner LEFT JOIN wallet_exclusions x ON x.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE x.address IS NULL AND (w.deleted_at IS NULL OR w.address IS NULL) AND (e.spender IS NULL OR (e.state IN ('pending','retrying') AND e.updated_at<datetime('now','-90 seconds')) OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes'))) ORDER BY h.first_seen_block ASC LIMIT ?"
+  ).bind(Math.max(1, Math.min(20, limit))).all();
+  for (const row of rows || []) {
+    const spender = row.spender, owner = row.owner;
+    try {
+      await env.DB.prepare("INSERT OR IGNORE INTO spender_history_monitor_enrollments(spender,owner,state) VALUES(?,?,'pending')").bind(spender, owner).run();
+      const claim = await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='running',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND (state='pending' OR (state='retrying' AND updated_at<datetime('now','-90 seconds')) OR (state='running' AND updated_at<datetime('now','-5 minutes')))").bind(spender, owner).run();
+      if (!claim.meta?.changes) continue;
+      const excluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
+      const deleted = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
+      if (excluded || deleted?.deleted_at) {
+        await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='excluded',last_error='\u7BA1\u7406\u5458\u5DF2\u624B\u52A8\u79FB\u9664',updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
+        continue;
+      }
+      await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender_history')").bind(owner).run();
+      const remark = await walletRemark(env, owner, "\u5F85\u5907\u6CE8 \xB7 " + short(owner));
+      const chats = (await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(spender).all()).results || [];
+      if (!chats.length) throw Error("Spender \u5C1A\u672A\u7ED1\u5B9A\u901A\u77E5\u7FA4\u7EC4");
+      for (const rowChat of chats) {
+        if (!await env.DB.prepare("SELECT 1 FROM telegram_chats WHERE chat_id=?").bind(String(rowChat.chat_id)).first()) continue;
+        await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(String(rowChat.chat_id), owner, remark).run();
+      }
+      const watch = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first();
+      const synced = watch?.state === "active" || await ensureWatch(env, owner);
+      if (!synced) throw Error("Alchemy \u94B1\u5305\u76D1\u63A7\u8BA2\u9605\u5C1A\u672A\u6210\u529F\uFF0C\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5");
+      await env.DB.prepare("UPDATE subscriptions SET status='active',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='pending' AND chat_id IN (SELECT chat_id FROM spender_routes WHERE spender=?)").bind(owner, spender).run();
+      await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='active',last_error=NULL,synced_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(spender, owner).run();
+    } catch (e) {
+      console.error("Historical Owner enrollment", spender, owner, String(e));
+      await env.DB.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=?").bind(String(e.message || e).slice(0, 240), spender, owner).run();
+    }
   }
 }
 
@@ -1441,14 +1497,14 @@ async function cfDay(env, day) {
 }
 async function collectCloudflare(env, settings) {
   if (!env.CF_ANALYTICS_API_TOKEN) throw Error("\u5F85\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684 Account Analytics Read \u53EA\u8BFB\u4EE4\u724C");
-  const now3 = /* @__PURE__ */ new Date(), today = now3.toISOString().slice(0, 10), monthly = monthPeriod(now3, settings.cloudflare_billing_day), daily = dayPeriod(now3);
+  const now4 = /* @__PURE__ */ new Date(), today = now4.toISOString().slice(0, 10), monthly = monthPeriod(now4, settings.cloudflare_billing_day), daily = dayPeriod(now4);
   const rows = (await env.DB.prepare("SELECT day FROM usage_cf_days WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const cached = new Set(rows.map((x) => x.day));
   await cfDay(env, today);
-  const yesterday = new Date(+now3 - 864e5).toISOString().slice(0, 10);
+  const yesterday = new Date(+now4 - 864e5).toISOString().slice(0, 10);
   if (yesterday >= monthly.start.slice(0, 10)) await cfDay(env, yesterday);
   const required = [];
-  for (let time = Date.parse(monthly.start); time < +now3; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
+  for (let time = Date.parse(monthly.start); time < +now4; time += 864e5) required.push(new Date(time).toISOString().slice(0, 10));
   for (const day of required.filter((d) => !cached.has(d) && d !== today && d !== yesterday).slice(0, 4)) await cfDay(env, day);
   const updated = (await env.DB.prepare("SELECT day,payload_json FROM usage_cf_days WHERE day>=? AND day<=?").bind(monthly.start.slice(0, 10), today).all()).results;
   const totals = new Map(updated.map((x) => [x.day, JSON.parse(x.payload_json)]));
@@ -1466,7 +1522,7 @@ async function collectCloudflare(env, settings) {
       used,
       quota: known && complete ? limit?.quota ?? presets[key2] : null,
       unit: meter.unit,
-      period_start: storage ? monthPeriod(now3).start : period.start,
+      period_start: storage ? monthPeriod(now4).start : period.start,
       period_end: storage ? "9999-12-31T00:00:00.000Z" : period.end,
       observed_at: ISO(),
       source: "official_api",
@@ -1481,7 +1537,7 @@ async function collectCloudflare(env, settings) {
   }
 }
 async function collectInternal(env) {
-  const now3 = /* @__PURE__ */ new Date(), daily = dayPeriod(now3), monthly = monthPeriod(now3);
+  const now4 = /* @__PURE__ */ new Date(), daily = dayPeriod(now4), monthly = monthPeriod(now4);
   const rows = (await env.DB.prepare("SELECT metric,day,value FROM counters WHERE day>=?").bind(monthly.start.slice(0, 10)).all()).results;
   const limits = (await env.DB.prepare("SELECT * FROM usage_limits").all()).results;
   const started = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='usage_started_at'").first())?.value;
@@ -1849,6 +1905,11 @@ async function cron(env) {
     await verifyHistoricalAllowances(env, 8);
   } catch (e) {
     console.error("Historical allowance checks", String(e));
+  }
+  try {
+    await enrollHistoricalOwners(env, 8);
+  } catch (e) {
+    console.error("Historical monitoring enrollment", String(e));
   }
   try {
     await scanWalletGaps(env, 3);
