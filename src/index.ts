@@ -13,6 +13,7 @@ import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
 import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 import {finishAddressQueryCleanup,flushMessageCleanup} from "./cleanup";
+import {receiveDeadLetters} from "./queue-dead-letters";
 async function cron(env){
   await recoverStuck(env);
   const pending=await selectStandalonePendingWatches(env.DB,8);
@@ -74,6 +75,12 @@ export default {
     }
   },
   async queue(batch,env,ctx){
+    // Cloudflare's DLQ retains unconsumed messages for only a limited time.
+    // Archive them to D1, ACK only after DB commit, and never replay here.
+    if(String(batch.queue||"").endsWith("-dlq")){
+      await receiveDeadLetters(env,batch);
+      return;
+    }
     for(const message of batch.messages){
       const item=message.body;
       // Also used in the exhausted-retry error path below.
