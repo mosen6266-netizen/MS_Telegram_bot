@@ -196,6 +196,14 @@ export async function pollSpenders(env){
     }
   }
 }
+export async function processRealtimeApproval(env,spender,log){
+  const rule=await env.DB.prepare("SELECT * FROM spender_rules WHERE spender=? AND enabled=1").bind(addr(spender)).first();
+  if(!rule)return {ignored:"spender_disabled_or_unknown"};
+  if(addr(log.address)!==USDT||String(log.topics?.[0]).toLowerCase()!==APPROVAL_TOPIC||
+      fromTopic(log.topics?.[2])!==rule.spender)throw Error("Invalid realtime Approval log");
+  await processApproval(env,rule,log);
+  return {ok:true};
+}
 async function processApproval(env,rule,log){
   const owner=fromTopic(log.topics?.[1]);if(!owner)return;
   const ok=await receiptSuccess(env,log.transactionHash);
