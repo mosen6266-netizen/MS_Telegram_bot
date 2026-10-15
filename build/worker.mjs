@@ -1134,6 +1134,67 @@ async function addSpender(env, spender, remark, chat_ids) {
   await env.DB.prepare("INSERT INTO spender_rules(spender,remark,start_block,cursor_block) VALUES(?,?,?,?) ON CONFLICT(spender) DO UPDATE SET remark=excluded.remark,enabled=1").bind(spender, remark, head, head).run();
   for (const chat of chat_ids || []) await env.DB.prepare("INSERT OR IGNORE INTO spender_routes(spender,chat_id) VALUES(?,?)").bind(spender, String(chat)).run();
 }
+async function etherscanApprovalLogs(env, spender, from, to) {
+  if (!env.ETHERSCAN_API_KEY) throw Error("Etherscan backup API key unavailable");
+  const combined = [];
+  for (let page = 1; page <= 20; page++) {
+    const q = new URLSearchParams({
+      chainid: "1",
+      module: "logs",
+      action: "getLogs",
+      address: USDT,
+      fromBlock: String(from),
+      toBlock: String(to),
+      topic0: APPROVAL_TOPIC,
+      topic2: toTopic(spender),
+      topic0_2_opr: "and",
+      page: String(page),
+      offset: "200",
+      apikey: env.ETHERSCAN_API_KEY
+    });
+    await recordUsage(env, "etherscan_requests");
+    const res = await fetch("https://api.etherscan.io/v2/api?" + q);
+    if (!res.ok) throw Error("Etherscan backup HTTP " + res.status);
+    const data = await res.json();
+    if (data.status === "0" && /no records found/i.test(String(data.message) + " " + String(data.result))) return combined;
+    if (data.status !== "1" || !Array.isArray(data.result))
+      throw Error("Etherscan backup " + String(data.result || data.message || "response invalid").slice(0, 120));
+    if (from !== to && data.result.length >= 200)
+      throw Error("Etherscan backup range saturated; reduce block window");
+    combined.push(...data.result);
+    if (data.result.length < 200) return combined;
+  }
+  throw Error("Etherscan backup single block exceeds safe pagination limit");
+}
+async function fetchApprovalLogs(env, spender, from, to, preferBackup) {
+  const params = [{
+    address: USDT,
+    fromBlock: "0x" + from.toString(16),
+    toBlock: "0x" + to.toString(16),
+    topics: [APPROVAL_TOPIC, null, toTopic(spender)]
+  }];
+  if (preferBackup) {
+    try {
+      return { logs: await etherscanApprovalLogs(env, spender, from, to), provider: "etherscan" };
+    } catch (backupErr) {
+      const logs = await rpc(env, "eth_getLogs", params);
+      if (!Array.isArray(logs)) throw Error("Invalid RPC logs");
+      return { logs, provider: "alchemy" };
+    }
+  }
+  try {
+    const logs = await rpc(env, "eth_getLogs", params);
+    if (!Array.isArray(logs)) throw Error("Invalid RPC logs");
+    return { logs, provider: "alchemy" };
+  } catch (rpcError) {
+    if (!env.ETHERSCAN_API_KEY) throw rpcError;
+    try {
+      return { logs: await etherscanApprovalLogs(env, spender, from, to), provider: "etherscan" };
+    } catch (backupErr) {
+      throw Error("Alchemy " + String(rpcError.message || rpcError).slice(0, 90) + "; backup " + String(backupErr.message || backupErr).slice(0, 125));
+    }
+  }
+}
 var pollStatusKey = (spender) => "spender_poll_status:" + spender;
 var pollWindowKey = (spender) => "spender_poll_window:" + spender;
 async function savePollState(db, spender, details) {
@@ -1144,16 +1205,19 @@ async function pollSpenders(env) {
   const { results: rules } = await env.DB.prepare("SELECT * FROM spender_rules WHERE enabled=1 ORDER BY cursor_block ASC LIMIT 40").all();
   for (const rule of rules || []) {
     let cursor = Number(rule.cursor_block);
-    const saved = await env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(pollWindowKey(rule.spender)).first();
+    const [saved, providerState] = await Promise.all([
+      env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind(pollWindowKey(rule.spender)).first(),
+      env.DB.prepare("SELECT value FROM runtime_state WHERE key=?").bind("spender_poll_provider:" + rule.spender).first()
+    ]);
+    let preferBackup = providerState?.value === "etherscan";
     let window = Number(saved?.value || 32);
     if (!Number.isSafeInteger(window) || window < 1 || window > 256) window = 32;
     let attempted = 0;
     for (let cycle = 0; cycle < 8 && cursor < head; cycle++) {
       const from = cursor + 1, to = Math.min(head, from + window - 1);
-      let logs;
+      let logs, provider;
       try {
-        logs = await rpc(env, "eth_getLogs", [{ address: USDT, fromBlock: "0x" + from.toString(16), toBlock: "0x" + to.toString(16), topics: [APPROVAL_TOPIC, null, toTopic(rule.spender)] }]);
-        if (!Array.isArray(logs)) throw Error("Invalid eth_getLogs response");
+        ({ logs, provider } = await fetchApprovalLogs(env, rule.spender, from, to, preferBackup));
       } catch (e) {
         const reason = String(e.message || e).slice(0, 220);
         if (window > 1) {
@@ -1174,9 +1238,11 @@ async function pollSpenders(env) {
         }
         await env.DB.prepare("UPDATE spender_rules SET cursor_block=? WHERE spender=? AND cursor_block<?").bind(to, rule.spender, to).run();
         cursor = to;
+        if (provider === "etherscan" && !preferBackup) preferBackup = true;
+        await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind("spender_poll_provider:" + rule.spender, provider).run();
         window = Math.min(256, Math.max(8, window * 2));
         await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(pollWindowKey(rule.spender), String(window)).run();
-        await savePollState(env.DB, rule.spender, { status: "ok", cursor, head, window, events: logs.length, at: now() });
+        await savePollState(env.DB, rule.spender, { status: "ok", cursor, head, window, provider, events: logs.length, at: now() });
       } catch (e) {
         const reason = String(e.message || e).slice(0, 220);
         await savePollState(env.DB, rule.spender, { status: "error", stage: "processApproval", cursor, head, window, message: reason, at: now() });
