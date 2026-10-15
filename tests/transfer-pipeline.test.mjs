@@ -127,5 +127,10 @@ test("wallet gap scanning is paced for 212 wallets",async()=>{
   assert.match(recovery,/maxWallets=8/);
   assert.match(recovery,/last_block\+600/);
   assert.match(recovery,/last_error IS NULL OR c\.checked_at IS NULL/);
+  assert.match(recovery,/datetime\(c\.checked_at\)<datetime\('now','-5 minutes'\)/);
+  // Cloudflare writes ISO UTC time using "T". Comparing it directly to SQLite
+  // datetime() text containing a space incorrectly suppresses expired retries.
+  assert.ok("2026-10-15T18:58:00Z">"2026-10-15 19:58:00");
+
   assert.match(index,/scanWalletGaps\(env,8\)/);
 });
