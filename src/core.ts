@@ -137,7 +137,15 @@ export async function removeWatch(env,address){
   }catch(e){
     // Do not turn healthy monitoring into a removal state just because a
     // different operation temporarily holds the Alchemy address lease.
-    if(e instanceof AlchemyMutationBusy)return false;
+    if(e instanceof AlchemyMutationBusy){
+      // Global removal may already have archived this address. Persist an
+      // actionable retry state instead of leaving the remote webhook active
+      // forever after a temporary lease collision.
+      const active=await env.DB.prepare("SELECT COUNT(*) n FROM subscriptions WHERE address=? AND status='active'").bind(address).first();
+      if(!active?.n)await env.DB.prepare("UPDATE wallet_watches SET state='removal_pending',last_error=?,updated_at=? WHERE address=? AND state IN ('active','pending','removal_pending')")
+        .bind("Alchemy 地址更新忙，已安排自动重试",now(),address).run();
+      return false;
+    }
     await env.DB.prepare("UPDATE wallet_watches SET state='removal_pending',last_error=?,updated_at=? WHERE address=? AND state<>'removed'").bind(String(e).slice(0,300),now(),address).run();
     return false;
   }
