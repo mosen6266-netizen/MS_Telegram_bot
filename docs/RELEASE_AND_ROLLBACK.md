@@ -64,6 +64,15 @@
 - [ ] 重发前必须由管理员核对目标群聊天记录，理解可能重复发送的风险；`acknowledged` 表示“人工核查完成”，**不能**伪装成 Telegram 已确认送达。
 - [ ] 执行 `tests/telegram-uncertain-delivery.test.mjs`、`tests/outbox-lease.test.mjs`、`tests/failed-outbox-retry.test.mjs` 和完整 Worker 权限回归。生产环境 Telegram 真正的送达结果依然必须人工核实，不能用本地模拟代替。
 
+## 管理后台交互验收（第十二轮）
+
+- [ ] 保存或恢复消息模板，不应整页重载；模板正文与管理员备注要在同一页面内保留并同步，自定义状态即时更新。
+- [ ] 群组订阅修改备注或状态不应清空其他筛选和输入草稿；同一钱包的统一备注在列表中即时同步。
+- [ ] 模拟当前页面刷新接口返回 HTTP 503：原页面和未保存输入仍可使用，页面内提示错误，不出现白屏；切换到新页面失败时仍应给出明确错误信息。
+- [ ] 连续双击保存、重试等异步按钮只提交一次；请求期间锁定该按钮，请求失败后恢复；左侧栏正常导航不得被锁定。
+- [ ] 运行 `tests/admin-ui-inline-mutations.test.mjs`、`tests/admin-ui-action-lock.test.mjs`、`tests/admin-ui-refresh-preservation.test.mjs` 和 `tests/full-worker-preflight.test.mjs`。
+- [ ] **本地测试不能替代真实浏览器 UI 验收**：必须在隔离预发布服务上检查实际点击、滚动、焦点、键盘输入、窄屏与长页面性能，确认左侧栏不随主页面滚动。
+
 ## 4. 发布后明确验收条件
 
 - [ ] 生产中既有的所有 Spender、钱包、Telegram 群组、备注、模板和历史交易行数无意外下降。
