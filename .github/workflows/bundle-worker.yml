@@ -6,6 +6,7 @@ on:
       - 'src/**'
       - 'package.json'
       - 'package-lock.json'
+      - 'scripts/verify-worker-bundle.mjs'
       - '.github/workflows/bundle-worker.yml'
 permissions:
   contents: write
@@ -22,7 +23,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
-      - run: npx esbuild src/index.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=build/worker.mjs
+      - run: npm run bundle:verify
       - name: Save bundle for controlled Cloudflare deployment
         run: |
           git config user.name "github-actions[bot]"
