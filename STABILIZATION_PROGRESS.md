@@ -174,3 +174,17 @@
 - **验证记录**：数据与性能改动提交 `72a6526f92398f679a08b93b872ee933f663d11b` 已双 CI 成功；预发布独立配置验证及手册 `5cc88a73e77f8783bf6fe4e8a6fe1596356cc5fe` 已双 CI 成功。最近几个仅文档/.gitignore 提交的 CI 还在运行，下一轮须确认。
 - **当前严格边界**：只操作 `stabilization/2026-10-15-p0`；未部署生产或预发布 Cloudflare、未创建任何云端新资源、未改生产 D1/Queue、未合并 `main`。
 - **下一步**：在得到独立预发布资源所需权限与用户同意后，按文档创建和验证云端测试环境；在此之前可继续针对剩余页面交互、历史列表查询性能、队列异常和用量长周期测试进行纯开发分支修复。绝不可把 GitHub 绿色 CI 当作生产完整验收。
+
+## 2026-10-15 第十一轮：Telegram 投递结果不明时防重复发送与人工核查
+
+- **起点确认**：第十轮最终进度提交 `601e5f1477a91d8a7361f937800df8cf9ac55ff1` 的 GitHub CI 双份成功。
+- **核心故障**：原 `recoverStuck` 会在 `sending` 超过十分钟后自动变为 `pending`，但这不能证明 Telegram 没有收到消息；若 Telegram 已收、D1 回执写入失败或 Worker 崩溃，可能导致重复通知。
+- `src/notifications.ts`：超过十分钟的遗留 `sending` 任务改为 `delivery_unknown`，不再自动重发；发送网络阶段出现断连/超时，或 Telegram 已返回成功后 D1 记录失败，统一标记“投递结果待确认”，等待人工核对。仅当 Telegram 明确返回非 OK/429 时，仍按既有重试及限流逻辑处理。
+- `src/core.ts`：Telegram 明确拒绝错误携带 `telegramRejected` 标识，以区别送达结果无法确认的网络/持久化错误。
+- `src/outbox-operations.ts`、`src/admin.ts`：管理员可对 `delivery_unknown` / `failed` 显式重新排队，对 `delivery_unknown` 核查后标记 `acknowledged`（人工核查完成，不代表 Telegram 已送达）；全部保留管理员审计、状态二次比较与非授权请求拦截。
+- `src/admin-ui.ts`：通知队列状态、筛选与处理按钮全部中文，新增“投递结果待确认”和“已人工核查”；首页显示待确认数量，重发前要求确认 Telegram 群记录，避免无意重复发送。
+- **真实 D1 故障注入与权限测试**：`tests/telegram-uncertain-delivery.test.mjs` 验证网络断连不重发、明确 429 仍按冷却重试、Telegram 成功但 D1 sent 状态写入失败不重发，以及人工重发/核查状态；`tests/outbox-lease.test.mjs` 验证十分钟任务回收不盲目重发；`tests/failed-outbox-retry.test.mjs` 更新明确错误状态；`tests/full-worker-preflight.test.mjs` 覆盖授权/未授权管理员、首页数量、人工核查 API。
+- `scripts/verify-worker-bundle.mjs` 增加打包检查，要求人工核查逻辑与 `delivery_unknown` 必须进入 Worker 产物。发布手册 `docs/RELEASE_AND_ROLLBACK.md` 增加上述异常场景的强制验收门槛。
+- **已核验 CI**：完整 Worker 管理员 API 与异常通知逻辑提交 `ddfe5a9d772c70d514a7abad29bb95a577353216` 双 CI 成功；打包强制检查提交 `e75e3c553dc46666accb4a4fab84037ab1319dea` 至少一轮 CI 成功。末尾文档与状态中文化提交需核对最新 CI 完成状态。
+- **发布边界不变**：仅在 `stabilization/2026-10-15-p0`；未合并 `main`，未修改正式 Worker、D1、Queue、Telegram Bot、Alchemy 配置。新的业务逻辑**尚未在真实 Telegram/Cloudflare 预发布环境联调**。
+- **待继续**：对多发送端/并发 Cron 负载进行压测，检查 `delivery_unknown` 人工操作审计与权限，完善用户所要求的其他界面局部保存以及启动后长时间资源性能测试。正式发布需先完成独立预发布环境和备份回滚演练。
