@@ -14,9 +14,9 @@ export async function handleAdmin(req,env,path){
   if(!await isAdmin(req,env))return bad("管理员验证失败或请求来源无效",401);
   const method=req.method;
   if(method==="GET"&&path==="/api/summary"){
-    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')"];
+    const qs=["SELECT count(*) n FROM wallets","SELECT count(*) n FROM spender_rules WHERE enabled=1","SELECT count(*) n FROM subscriptions WHERE status='active'","SELECT count(*) n FROM outbox WHERE state='failed'","SELECT count(*) n FROM transfer_events WHERE date(created_at)=date('now')","SELECT count(*) n FROM telegram_message_cleanup WHERE state='blocked'","SELECT count(*) n FROM telegram_message_cleanup WHERE state='pending'"];
     const v=[];for(const q of qs)v.push((await env.DB.prepare(q).first())?.n||0);
-    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4]});
+    return json({wallets:v[0],spenders:v[1],subscriptions:v[2],failed:v[3],transfers_today:v[4],cleanup_blocked:v[5],cleanup_pending:v[6]});
   }
   if(method==="GET"&&path==="/api/chats")return json((await env.DB.prepare("SELECT * FROM telegram_chats ORDER BY title").all()).results);
   if(method==="GET"&&path==="/api/wallets")return json((await env.DB.prepare("SELECT w.*,ww.state watch_state FROM wallets w LEFT JOIN wallet_watches ww USING(address) ORDER BY w.created_at DESC LIMIT 200").all()).results);
