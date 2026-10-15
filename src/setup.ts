@@ -7,9 +7,13 @@ const un64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 const hex=b=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,"0")).join("");
 const random=n=>crypto.getRandomValues(new Uint8Array(n));
 async function sha256(s){return hex(await crypto.subtle.digest("SHA-256",encoder.encode(s)))}
-async function passwordHash(password,salt,iters=200000){
-  const material=await crypto.subtle.importKey("raw",encoder.encode(password),"PBKDF2",false,["deriveBits"]);
-  return hex(await crypto.subtle.deriveBits({name:"PBKDF2",salt:un64(salt),iterations:iters,hash:"SHA-256"},material,256));
+async function passwordHash(password,salt,iters=0,env){
+  if(iters>0){
+    const material=await crypto.subtle.importKey("raw",encoder.encode(password),"PBKDF2",false,["deriveBits"]);
+    return hex(await crypto.subtle.deriveBits({name:"PBKDF2",salt:un64(salt),iterations:iters,hash:"SHA-256"},material,256));
+  }
+  const k=await crypto.subtle.importKey("raw",un64(env.APP_ENCRYPTION_KEY),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+  return hex(await crypto.subtle.sign("HMAC",k,encoder.encode("admin-v1:"+salt+":"+password)));
 }
 function equal(a,b){
   if(typeof a!=="string"||typeof b!=="string"||a.length!==b.length)return false;
@@ -78,9 +82,9 @@ export async function authRoute(req,env,path){
       ? equal(digest,await sha256(rawSetupSecret.trim()))
       : !!(await env.DB.prepare("SELECT 1 FROM setup_invites WHERE code_hash=? AND used_at IS NULL AND expires_at>?").bind(digest,now()).first());
     if(!invite){await fail(env,"setup");return json({error:provisioned?"初始化码不匹配。请确认与生产环境 INIT_SETUP_CODE 完全一致，注意大小写及中间空格。":"生产环境未检测到有效初始化码，请确认 INIT_SETUP_CODE 已部署。"},403);}
-    const salt=b64(random(24)),hash=await passwordHash(password,salt);
+    const salt=b64(random(24)),hash=await passwordHash(password,salt,0,env);
     // Database uniqueness prevents two simultaneous first-run initializations.
-    const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,200000)").bind(salt,hash).run();
+    const result=await env.DB.prepare("INSERT OR IGNORE INTO admin_login(id,salt,verifier,iterations) VALUES(1,?,?,0)").bind(salt,hash).run();
     if(!result.meta?.changes)return json({error:"Already initialized"},409);
     if(!provisioned) await env.DB.prepare("UPDATE setup_invites SET used_at=? WHERE code_hash=? AND used_at IS NULL").bind(now(),digest).run();
     await clearFail(env,"setup");
@@ -92,7 +96,7 @@ export async function authRoute(req,env,path){
     const b=await req.json(),p=String(b.password||"");
     const row=await env.DB.prepare("SELECT salt,verifier,iterations FROM admin_login WHERE id=1").first();
     if(!row)return json({error:"Not initialized"},403);
-    const hash=await passwordHash(p,row.salt,row.iterations);
+    const hash=await passwordHash(p,row.salt,row.iterations,env);
     if(!equal(hash,row.verifier)){await fail(env,"login");return json({error:"Password incorrect"},401);}
     await clearFail(env,"login");
     return new Response(JSON.stringify({ok:true}),{headers:{"content-type":"application/json","set-cookie":await session(env)}});
