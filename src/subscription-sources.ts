@@ -46,3 +46,21 @@ export function retainDeletedSpenderSources(db,spender){
     db.prepare("DELETE FROM subscription_sources WHERE source_type='spender' AND source_id=?").bind(spender)
   ];
 }
+
+// Review-only audit for subscriptions that predate attribution migration.
+// Never infer a legacy origin from historical Spender memberships: these
+// rows may also be manual or have multiple owners.
+export async function listLegacySubscriptions(db,{page=0,search=""}={}){
+  page=Math.max(0,Math.min(100000,parseInt(String(page),10)||0));
+  search=String(search||"").trim().slice(0,80);
+  const filter="l.source_type='legacy' AND s.status IN ('active','paused','pending')"+
+    (search?" AND (instr(lower(s.address),lower(?))>0 OR instr(cast(s.chat_id AS TEXT),?)>0 OR instr(lower(COALESCE(c.title,'')),lower(?))>0)":"");
+  const params=search?[search,search,search]:[];
+  const [totalResult,rowsResult]=await db.batch([
+    db.prepare("SELECT COUNT(*) n FROM subscription_sources l JOIN subscriptions s ON s.chat_id=l.chat_id AND s.address=l.address LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE "+filter).bind(...params),
+    db.prepare("SELECT s.chat_id,s.address,s.status,s.remark,c.title,l.created_at FROM subscription_sources l JOIN subscriptions s ON s.chat_id=l.chat_id AND s.address=l.address LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE "+filter+" ORDER BY s.updated_at DESC,s.address LIMIT 30 OFFSET ?").bind(...params,page*30)
+  ]);
+  const total=totalResult.results?.[0]?.n||0;
+  return {rows:rowsResult.results||[],total,page,total_pages:Math.ceil(total/30),read_only:true,
+    note:"历史订阅来源不明，不能自动清理。请人工核对后再决定是否调整；此页面不会停止任何通知。"};
+}
