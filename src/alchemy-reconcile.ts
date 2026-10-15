@@ -27,7 +27,8 @@ async function verifyWebhookConfiguration(env){
   if(!webhook)throw Error("Configured Alchemy activity webhook is not present in team");
   if(webhook.is_active!==true)throw Error("Configured Alchemy webhook is disabled");
   if(webhook.network!=="ETH_MAINNET"||webhook.webhook_type!=="ADDRESS_ACTIVITY")throw Error("Alchemy webhook type or network differs from Ethereum Mainnet address activity");
-  const expected=String(env.PUBLIC_BASE_URL||"").replace(/\\/$/,"")+"/webhooks/alchemy";
+  const base=String(env.PUBLIC_BASE_URL||"");
+  const expected=(base.endsWith("/")?base.slice(0,-1):base)+"/webhooks/alchemy";
   if(webhook.webhook_url!==expected)throw Error("Alchemy webhook destination URL does not match the bot");
 }
 
