@@ -13,6 +13,14 @@ export async function startSpenderHistory(env,spender){
     .bind(spender,Math.max(0,Number(rule.start_block)-1),HISTORY_WINDOW).run();
 }
 
+function parseApprovalTime(log){
+  const raw=log.timeStamp||log.blockTimestamp;
+  if(!raw)return null;
+  try{const seconds=Number(BigInt(raw));return seconds>1400000000&&Number.isSafeInteger(seconds)?new Date(seconds*1000).toISOString():null;}catch{return null;}
+}
+function historyTimeStmt(env,spender,owner,block,time){
+  return env.DB.prepare("INSERT INTO spender_history_timestamps(spender,owner,block_number,approval_at) VALUES(?,?,?,?) ON CONFLICT(spender,owner) DO UPDATE SET block_number=excluded.block_number,approval_at=excluded.approval_at WHERE excluded.block_number>=spender_history_timestamps.block_number").bind(spender,owner,block,time);
+}
 function historyEventStmt(env,spender,owner,block,hash,amount){
   return env.DB.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block,latest_event_block,latest_tx_hash,last_event_amount_raw,verify_status) VALUES(?,?,?,?,?,?,'pending') ON CONFLICT(spender,owner) DO UPDATE SET first_seen_block=MIN(spender_history_addresses.first_seen_block,excluded.first_seen_block),latest_tx_hash=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.latest_tx_hash ELSE spender_history_addresses.latest_tx_hash END,last_event_amount_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.last_event_amount_raw ELSE spender_history_addresses.last_event_amount_raw END,verify_status=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN 'pending' ELSE spender_history_addresses.verify_status END,current_allowance_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.current_allowance_raw END,verified_at=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.verified_at END,latest_event_block=MAX(spender_history_addresses.latest_event_block,excluded.latest_event_block)")
     .bind(spender,owner,block,block,hash,amount);
@@ -22,7 +30,9 @@ export async function recordSpenderLiveApproval(env,spender,log,amount){
   const owner=fromTopic(log.topics?.[1]);
   if(!owner)return;
   const block=Number(BigInt(log.blockNumber));
-  await historyEventStmt(env,spender,owner,block,log.transactionHash,amount.toString()).run();
+  await historyEventStmt(env,spender,owner,block,log.transactionHash,BigInt(log.data||"0x0").toString()).run();
+  const stamp=parseApprovalTime(log);
+  if(stamp)await historyTimeStmt(env,spender,owner,block,stamp).run();
   await env.DB.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND latest_event_block<=?")
     .bind(amount.toString(),amount>0n?"active":"revoked",spender,owner,block).run();
 }
@@ -71,12 +81,12 @@ export async function scanSpenderHistories(env){
       if(!owner||!/^0x[0-9a-fA-F]{64}$/.test(String(log.data||""))||!/^0x[0-9a-fA-F]{64}$/.test(String(log.transactionHash||"")))throw Error("历史授权事件格式不完整");
       const block=Number(BigInt(log.blockNumber));
       if(!Number.isSafeInteger(block)||block<begin||block>end)throw Error("历史授权事件区块范围不匹配");
-      const event={owner,block,hash:log.transactionHash,amount:BigInt(log.data).toString()};
+      const event={owner,block,hash:log.transactionHash,amount:BigInt(log.data).toString(),stamp:parseApprovalTime(log)};
       const previous=latest.get(owner);
       if(!previous)latest.set(owner,{...event,first:block});
       else{
         previous.first=Math.min(previous.first,block);
-        if(block>=previous.block){previous.block=block;previous.hash=event.hash;previous.amount=event.amount;}
+        if(block>=previous.block){previous.block=block;previous.hash=event.hash;previous.amount=event.amount;previous.stamp=event.stamp;}
       }
     }
     const records=[...latest.values()];
@@ -88,12 +98,20 @@ export async function scanSpenderHistories(env){
           .bind(job.spender,records[i+j].owner,records[i+j].first,records[i+j].block,records[i+j].hash,records[i+j].amount);
       }
       await env.DB.batch(statements);
+      const times=records.slice(i,i+35).filter(row=>row.stamp).map(row=>historyTimeStmt(env,job.spender,row.owner,row.block,row.stamp));
+      if(times.length)await env.DB.batch(times);
     }
     const next=end+1;
     await env.DB.prepare("UPDATE spender_history_jobs SET next_block=?,window_size=?,state=?,events_found=events_found+?,last_error=NULL,retry_count=0,updated_at=CURRENT_TIMESTAMP,finished_at=CASE WHEN ?>cutoff_block THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE spender=?")
       .bind(next,Math.min(HISTORY_WINDOW,Math.max(5000,window*2)),next>cutoff?"completed":"scanning",logs.length,next,job.spender).run();
   }catch(e){
     console.error("Spender history scan",job.spender,String(e));
+    const message=String(e.message||e).slice(0,240);
+    if(/block range|query timeout|too large|response size|exceed|more than|too many records|window limit/i.test(message)&&Number(job.window_size)>1){
+      await env.DB.prepare("UPDATE spender_history_jobs SET window_size=?,state='scanning',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
+       .bind(Math.max(1,Math.floor(Number(job.window_size)/2)),"请求范围过大，正在自动缩小区块范围",job.spender).run();
+      return;
+    }
     await env.DB.prepare("UPDATE spender_history_jobs SET state='retrying',last_error=?,retry_count=retry_count+1,updated_at=CURRENT_TIMESTAMP WHERE spender=?")
       .bind(String(e.message||e).slice(0,240),job.spender).run();
   }
