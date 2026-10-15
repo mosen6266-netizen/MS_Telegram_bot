@@ -6,6 +6,7 @@ import {scanSpenderHistories,verifyHistoricalAllowances} from "./spender-history
 import {enrollHistoricalOwners} from "./spender-enroll";
 import {reconcileAlchemyAddresses} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
+import {retainFailedActivity,replayFailedActivities} from "./activity-replay";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
@@ -32,6 +33,7 @@ async function cron(env){
   try{await reconcileAlchemyAddresses(env);}catch(e){console.error("Alchemy address reconciliation",String(e))}
   try{await scanWalletGaps(env,8);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
+  try{await replayFailedActivities(env,3);}catch(e){console.error("Failed activity recovery",String(e))}
   try{await flushOutbox(env,40);}catch(e){console.error("Telegram outbox delivery",String(e))}
   try{await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();}
   catch(e){console.error("Expired remark session cleanup",String(e))}
@@ -100,6 +102,16 @@ export default {
       }catch(e){
         console.error("Queue job failed",item.kind,String(e));
         if(message.attempts>=5){
+          if(item.kind==="activity"){
+            // Never ACK a failed real chain event until its replay payload
+            // has been durably stored in D1.
+            try{await retainFailedActivity(env,item.payload,e);}
+            catch(saveError){
+              console.error("Activity failure retention failed",String(saveError));
+              message.retry({delaySeconds:120});
+              continue;
+            }
+          }
           if(item.kind==="check"){
             try{await send(configured,item.chat_id,await renderTemplate(configured,"query_failed",item.chat_id,{address:item.owner}));}catch{}
             try{await finishAddressQueryCleanup(configured,item);}
