@@ -23,18 +23,25 @@ test("Alchemy D1 mutation lease rejects overlap, releases after failures and pre
  try{
   const env={DB};
   const epoch=1800000000000;
-  const first=await withAlchemyMutationLease(env,async()=>{
+  let enterNew,releaseNew;
+  const entered=new Promise(resolve=>enterNew=resolve);
+  const holdNew=new Promise(resolve=>releaseNew=resolve);
+  let newLease;
+  await withAlchemyMutationLease(env,async()=>{
    await assert.rejects(withAlchemyMutationLease(env,async()=>{}, {clock:()=>epoch}),err=>err instanceof AlchemyMutationBusy);
-   // After an abandoned lease's expiry a fresh lease may be claimed. The
-   // old owner's finally cleanup must not remove the new owner's token.
-   return withAlchemyMutationLease(env,async()=>{
-    const busy=await DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_mutation_lease'").first();
-    assert.match(busy.value,/\|/);
-    return busy.value;
+   // The successor must still be holding its lease when the predecessor
+   // tries releasing its stale token.
+   newLease=withAlchemyMutationLease(env,async()=>{
+    enterNew();
+    await holdNew;
    },{clock:()=>epoch+200000});
+   await entered;
   },{clock:()=>epoch});
   const stillHeld=await DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_mutation_lease'").first();
-  assert.equal(stillHeld.value,first);
+  assert.ok(stillHeld&&stillHeld.value.includes("|"),"successor must still own the lease");
+  releaseNew();
+  await newLease;
+  assert.equal((await DB.prepare("SELECT COUNT(*) n FROM runtime_state WHERE key='alchemy_mutation_lease'").first()).n,0);
   await DB.prepare("DELETE FROM runtime_state WHERE key='alchemy_mutation_lease'").run();
   await assert.rejects(withAlchemyMutationLease(env,async()=>{throw Error("callback fails")}),/callback fails/);
   assert.equal((await DB.prepare("SELECT COUNT(*) n FROM runtime_state WHERE key='alchemy_mutation_lease'").first()).n,0);
