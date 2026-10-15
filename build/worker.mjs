@@ -732,7 +732,11 @@ async function flushOutbox(env, max = 30, onlyUsage = false) {
       const message = String(e).slice(0, 250);
       if (row.attempts + 1 >= 5 && row.template_key !== "usage_alert") {
         await env.DB.prepare("UPDATE outbox SET state='failed',last_error=? WHERE id=?").bind(message, row.id).run();
-        await notifyAdmin2(env, await renderTemplate(env, "notice_failed", env.ADMIN_TELEGRAM_CHAT_ID || "*", { queue_id: row.id, error_message: message }));
+        try {
+          await notifyAdmin2(env, await renderTemplate(env, "notice_failed", env.ADMIN_TELEGRAM_CHAT_ID || "*", { queue_id: row.id, error_message: message }));
+        } catch (reportError) {
+          console.warn("Failed-notice escalation unavailable", String(reportError));
+        }
       } else {
         const seconds = Math.max(Number(e?.retryAfter) || 0, Math.min(3600, 30 * Math.pow(2, Math.min(row.attempts, 7))));
         await env.DB.prepare("UPDATE outbox SET state='pending',last_error=?,due_at=datetime('now',?) WHERE id=?").bind(message, "+" + seconds + " seconds", row.id).run();
@@ -1380,17 +1384,6 @@ async function actualAddresses(env) {
   }
   throw Error("Alchemy address pagination exceeds the safe limit");
 }
-async function markUnsynced(db, addresses) {
-  for (let i = 0; i < addresses.length; i += 20) {
-    const statements = [];
-    for (const address of addresses.slice(i, i + 20)) {
-      statements.push(db.prepare("UPDATE wallet_watches SET state='pending',last_error='Alchemy webhook address missing; retry queued',updated_at=CURRENT_TIMESTAMP WHERE address=? AND state='active'").bind(address));
-      statements.push(db.prepare("UPDATE subscriptions SET status='pending',updated_at=CURRENT_TIMESTAMP WHERE address=? AND status='active'").bind(address));
-      statements.push(db.prepare("UPDATE spender_history_monitor_enrollments SET state='retrying',last_error='Alchemy webhook address missing; retry queued',updated_at=datetime('now','-2 minutes') WHERE owner=? AND state='active'").bind(address));
-    }
-    await db.batch(statements);
-  }
-}
 async function reconcileAlchemyAddresses(env) {
   const db = env.DB;
   if (Number(await state(db, NEXT) || 0) > Date.now()) return { skipped: "not_due" };
@@ -1423,7 +1416,6 @@ async function reconcileAlchemyAddresses(env) {
       }
       const after = await actualAddresses(env);
       const unresolved = missing.filter((a) => !after.has(a));
-      if (unresolved.length) await markUnsynced(db, unresolved);
       const report2 = { status: unresolved.length ? "incomplete" : "repaired", expected: expected.length, actual: actual.size, missing_before: missing.length, missing_after: unresolved.length, checked_at: (/* @__PURE__ */ new Date()).toISOString() };
       await save(db, RESULT, JSON.stringify(report2));
       await save(db, NEXT, Date.now() + (unresolved.length ? ERROR_DELAY : OK_DELAY));
@@ -2369,10 +2361,23 @@ async function handleAdmin(req, env, path) {
 
 // src/index.ts
 async function cron(env) {
-  await recoverStuck(env);
-  const { results: pending } = await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status IN ('active','pending')) AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
-  for (const p of pending || []) {
-    if (await ensureWatch(env, p.address)) await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
+  try {
+    await recoverStuck(env);
+  } catch (e) {
+    console.error("Outbox stuck-task recovery", String(e));
+  }
+  try {
+    const { results: pending } = await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status IN ('active','pending')) AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
+    for (const p of pending || []) {
+      try {
+        if (await ensureWatch(env, p.address))
+          await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(p.address).run();
+      } catch (e) {
+        console.error("Pending wallet subscription retry", p.address, String(e));
+      }
+    }
+  } catch (e) {
+    console.error("Pending wallet discovery", String(e));
   }
   try {
     await pollSpenders(env);
@@ -2411,8 +2416,16 @@ async function cron(env) {
   } catch (e) {
     console.error("Reorg checks", String(e));
   }
-  await flushOutbox(env, 40);
-  await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
+  try {
+    await flushOutbox(env, 40);
+  } catch (e) {
+    console.error("Telegram outbox delivery", String(e));
+  }
+  try {
+    await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
+  } catch (e) {
+    console.error("Expired remark session cleanup", String(e));
+  }
 }
 var index_default = {
   async fetch(req, env, ctx) {
