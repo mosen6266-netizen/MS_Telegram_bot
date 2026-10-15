@@ -121,6 +121,28 @@ export async function handleAdmin(req,env,path){
     await env.DB.prepare("UPDATE spender_history_jobs SET state=CASE WHEN state='retrying' THEN 'scanning' ELSE state END,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE spender=?").bind(spender).run();
     return json({ok:true,note:"已安排重新核验当前授权额度，历史扫描从断点继续"});
   }
+  if(method==="DELETE"&&path==="/api/spenders"){
+    const d=await body(req),a=addr(d.spender);
+    if(!a)return bad("Spender 地址无效");
+    const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
+    if(!rule)return bad("该 Spender 已不存在",404);
+    const histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
+    // Remove dependent rows before deleting the parent; spender_routes
+    // references spender_rules via a foreign key. Preserve wallet watches,
+    // subscriptions and transaction/audit archives to avoid accidental loss
+    // of unrelated monitoring. Re-adding starts a clean history scan.
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM spender_routes WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_monitor_enrollments WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_timestamps WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_addresses WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_history_jobs WHERE spender=?").bind(a),
+      env.DB.prepare("DELETE FROM spender_rules WHERE spender=?").bind(a)
+    ]);
+    await audit(env,"admin","delete_spender",a,{remark:rule.remark,history_wallets_deleted_from_rule:histories,monitored_wallets_retained:true});
+    return json({ok:true,removed_spender:a,history_records_removed:histories,monitored_wallets_retained:true,
+      note:"Spender 规则已删除，历史扫描与这条规则的群组推送已停止；已接入的独立钱包监控和既有消息记录保留。"});
+  }
   if(method==="PATCH"&&path==="/api/spenders"){
     const d=await body(req),a=addr(d.spender);
     if(!a)return bad("无效 Spender 地址");
