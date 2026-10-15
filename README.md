@@ -28,7 +28,7 @@ Do not submit credentials to GitHub, Telegram groups or Issues. Credentials are 
 
 ### Caveats
 
-- Financial usage percentages are currently internal estimates/manual reference quotas; official Cloudflare and Alchemy billing data APIs are **not** yet connected.
+- Usage collection and alert delivery are implemented. Cloudflare official account analytics require a scoped Account Analytics Read token; Alchemy official team usage requires an Admin API access key with Usage read only. Until these credentials are configured, the dashboard reports the provider as waiting, never as zero usage. Etherscan and Telegram use separately labelled application counters from the update onward.
 - Historical Spender queries may be incomplete when free Etherscan log APIs restrict deep historical access. The bot should not falsely report absence when the index is unavailable.
 - Transaction replay is bounded to keep API costs under control. First-block notifications may require chain reorganization corrections.
 - Production reliability depends on real-provider acceptance tests and long-running monitoring tests.
@@ -69,3 +69,14 @@ Read-only chain monitoring: no private keys, wallet connects or transfer signing
 - Cloudflare resource usage panel must distinguish officially measured metrics from local estimates and manually configured quotas.
 - Contract-wallet/Permit2 approvals and internal ETH transfers have indexing caveats.
 - Per-block reorg handling and replay validation are required for high-reliability use; test on mainnet before claiming zero missed events.
+
+## Usage monitoring update — 2026-10-15
+
+- The scheduler collects usage about every 15 minutes, independently of whether transfer monitoring is paused. Cloudflare uses account-wide Workers requests / CPU, D1 rows read / written / storage, and Queues billable operations. Alchemy uses the official Usage Summary endpoint, including its billing-period boundaries, quota, and freshness.
+- In Connection and Startup, save `CF_ANALYTICS_API_TOKEN` (Account Analytics Read, restricted to this Cloudflare account) and `ALCHEMY_USAGE_TOKEN` (Usage read only; no app-management write). Credentials remain AES-GCM encrypted in D1 or Cloudflare Worker Secrets. Existing RPC / Notify credentials remain dedicated to chain monitoring.
+- Confirm the actual Cloudflare Free / Paid plan and billing start day in Resource Usage. Unknown plans show real counts without an invented limit or percentage. Monthly history is backfilled in small batches; incomplete history cannot trigger an exhaustion alert. Source/reference pricing checked against Cloudflare official documentation on 2026-10-15; custom limits can be updated in the dashboard.
+- Etherscan counts requests attempted by this program, including failures; it cannot count another application using the same API key. The configured reference is the account's observed 100,000/day plan. Telegram counts all successful sendMessage calls and tracks HTTP 429; ordinary messages have no invented monthly allowance. Public GitHub repository visibility is checked daily; public standard Actions minutes are not treated as a private-repository quota.
+- Threshold alerts use the actual 80% fraction. Forecasts need two valid observations at least 15 minutes apart, in the same meter/source/period, and only warn if exhaustion occurs before the quota resets. Samples older than 45 minutes or with an active collection error do not trigger alerts. Failed collection preserves the last good sample and displays its status.
+- Alerts enter the existing durable outbox with a unique metric/reason/period key. Sending failures retry with backoff; Telegram retry_after is honoured. Old period alerts expire after reset. The dashboard includes a clearly labelled private-message channel test. Email remains off.
+
+Validation: `npm test`, `npm run typecheck`, `npx wrangler deploy --dry-run --outdir dist`. Tests include real local D1 migrations and persistence, official response parsing, failure retention, UTC/billing boundaries, alert deduplication, expired notices, and failed-then-successful Telegram delivery.

@@ -5,7 +5,7 @@ import {checkOwner,pollSpenders,verifyAdminOwner} from "./approval";
 import {processActivity} from "./transfers";
 import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
 import {flushOutbox,recoverStuck} from "./notifications";
-import {runUsageAlerts} from "./usage";
+import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
 import {authRoute,isAdmin,setupApi,configEnv} from "./setup";
 async function cron(env){
@@ -19,7 +19,6 @@ async function cron(env){
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
   await flushOutbox(env,40);
   await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
-  await runUsageAlerts(env);
 }
 export default {
   async fetch(req,env,ctx){
@@ -32,7 +31,7 @@ export default {
       }
       const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
       const configured=active?await configEnv(env):env;
-      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",database_configured:!!env.DB});
+      if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-usage-v1",database_configured:!!env.DB});
       if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
       if(path.startsWith("/api/"))return await handleAdmin(req,env,path);
       if(req.method==="POST"&&path==="/webhooks/telegram"){
@@ -85,6 +84,11 @@ export default {
     }
   },
   async scheduled(event,env,ctx){
-    ctx.waitUntil((async()=>{const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";if(active)await cron(await configEnv(env));})());
+    const configured=await configEnv(env);
+    ctx.waitUntil((async()=>{
+      try{await collectUsage(configured);await runUsageAlerts(configured);await flushOutbox(configured,10,true);}
+      catch(e){console.error("Usage maintenance failed",String(e));}
+    })());
+    ctx.waitUntil((async()=>{const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";if(active)await cron(configured);})());
   }
 };

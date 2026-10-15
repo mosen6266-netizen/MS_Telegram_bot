@@ -1,6 +1,6 @@
 // @ts-nocheck
-import {json,telegram,now,notifyAdmin} from "./core";
-const SECRET_KEYS=["TELEGRAM_BOT_TOKEN","TELEGRAM_WEBHOOK_SECRET","ADMIN_TELEGRAM_CHAT_ID","ALCHEMY_RPC_URL","ALCHEMY_NOTIFY_TOKEN","ALCHEMY_ACTIVITY_WEBHOOK_ID","ALCHEMY_SIGNING_KEY","ETHERSCAN_API_KEY"];
+import {json,telegram,now,notifyAdmin,recordUsage} from "./core";
+const SECRET_KEYS=["TELEGRAM_BOT_TOKEN","TELEGRAM_WEBHOOK_SECRET","ADMIN_TELEGRAM_CHAT_ID","ALCHEMY_RPC_URL","ALCHEMY_NOTIFY_TOKEN","ALCHEMY_ACTIVITY_WEBHOOK_ID","ALCHEMY_SIGNING_KEY","ETHERSCAN_API_KEY","CF_ANALYTICS_API_TOKEN","ALCHEMY_USAGE_TOKEN"];
 const encoder=new TextEncoder();
 const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));
 const un64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
@@ -125,7 +125,7 @@ export async function persistSecret(env,keyName,value){
 async function status(env){
   const configured=new Set(((await env.DB.prepare("SELECT key FROM setup_secrets").all()).results||[]).map(x=>x.key));
   const ready=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
-  return {active:ready,keys:Object.fromEntries(SECRET_KEYS.map(k=>[k,configured.has(k)])),needs:[
+  return {active:ready,keys:Object.fromEntries(SECRET_KEYS.map(k=>[k,configured.has(k)||!!env[k]])),needs:[
     "TELEGRAM_BOT_TOKEN","TELEGRAM_WEBHOOK_SECRET","ALCHEMY_RPC_URL","ALCHEMY_NOTIFY_TOKEN","ETHERSCAN_API_KEY"
   ].filter(k=>!configured.has(k))};
 }
@@ -143,6 +143,7 @@ export async function setupApi(req,env,path){
       const encrypted=await encrypt(env,clean);
       await env.DB.prepare("INSERT INTO setup_secrets(key,encrypted_value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET encrypted_value=excluded.encrypted_value,updated_at=CURRENT_TIMESTAMP").bind(name,encrypted).run();
     }
+    await env.DB.prepare("DELETE FROM runtime_state WHERE key='usage_last_collect'").run();
     return json({ok:true,configured:incoming.map(x=>x[0]),...(await status(env))});
   }
   if(path==="/api/setup/test"&&req.method==="POST"){
@@ -164,6 +165,7 @@ export async function setupApi(req,env,path){
       if(!e.ETHERSCAN_API_KEY)return json({error:"Etherscan API Key 未配置"},400);
       try{
         const u=new URL("https://api.etherscan.io/v2/api");u.search=new URLSearchParams({chainid:"1",module:"proxy",action:"eth_blockNumber",apikey:e.ETHERSCAN_API_KEY}).toString();
+        await recordUsage(e,"etherscan_requests");
         const data=await (await fetch(u)).json();
         if(!data.result||!String(data.result).startsWith("0x"))throw Error("Key refused or rate-limited");
         return json({ok:true,block:Number(BigInt(data.result))});

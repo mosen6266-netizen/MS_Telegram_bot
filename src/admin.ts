@@ -1,7 +1,8 @@
 // @ts-nocheck
 import {addr,json,audit,short,now,ensureWatch} from "./core";
 import {addSpender} from "./approval";
-import {usageSnapshot} from "./usage";
+import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
+import {flushOutbox} from "./notifications";
 import {defaults} from "./notifications";
 import {ADMIN_HTML} from "./admin-ui";
 import {isAdmin,configEnv} from "./setup";
@@ -105,12 +106,30 @@ export async function handleAdmin(req,env,path){
   if(method==="GET"&&path==="/api/transfers")return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/outbox")return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
-  if(method==="GET"&&path==="/api/usage")return json({warning_threshold_percent:80,forecast_days:7,telegram_dm:true,email:false,source_warning:"官方账单 API 未接入；内部计数不等于平台真实用量。",platforms:await usageSnapshot(env)});
+  if(method==="GET"&&path==="/api/usage")return json({warning_threshold_percent:80,forecast_days:7,telegram_dm:true,email:false,
+    source_warning:"官方用量约每 15 分钟同步；本程序计数单独标注。失联或过期数据不参与预警。预测只比较同一账期的实际增量，并考虑额度重置。",
+    settings:await usageSettings(env),platforms:await usageSnapshot(env)});
+  if(method==="POST"&&path==="/api/usage/refresh"){
+    const e=await configEnv(env);const result=await collectUsage(e,true);
+    await runUsageAlerts(e);await flushOutbox(e,10,true);
+    return json({...result,platforms:await usageSnapshot(e)});
+  }
+  if(method==="PUT"&&path==="/api/usage/settings"){
+    try{await saveUsageSettings(env,await body(req));}catch(e){return bad(e.message);}
+    await audit(env,"admin","update_usage_settings","usage");
+    return json({ok:true});
+  }
+  if(method==="POST"&&path==="/api/usage/test-alert"){
+    const e=await configEnv(env),dedup=await queueUsageTest(e);
+    await flushOutbox(e,10,true);
+    return json(await env.DB.prepare("SELECT state,attempts,last_error FROM outbox WHERE dedup_key=?").bind(dedup).first());
+  }
   if(method==="PUT"&&path==="/api/usage/limit"){
     const d=await body(req);
-    const allowed={"alchemy_cu":"Alchemy","workers_requests":"Cloudflare Workers","d1_reads":"Cloudflare D1","queue_ops":"Cloudflare Queues","etherscan_requests":"Etherscan","telegram_notifications":"Telegram","github_actions":"GitHub"};
+    const allowed=Object.fromEntries(USAGE_METERS.map(x=>[x.metric,x.name]));
     if(!allowed[d.metric]||!["daily","monthly"].includes(d.period)||!Number.isSafeInteger(d.quota)||d.quota<1)return bad("配额参数无效");
-    await env.DB.prepare("INSERT INTO usage_limits(metric,platform,unit,quota,period) VALUES(?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET quota=excluded.quota,period=excluded.period,updated_at=CURRENT_TIMESTAMP").bind(d.metric,allowed[d.metric],String(d.unit||"units"),d.quota,d.period).run();
+    if(d.metric==="alchemy_cu")return bad("Alchemy 额度由官方 Usage API 返回，无需手动覆盖");
+    await env.DB.prepare("INSERT INTO usage_limits(metric,platform,unit,quota,period) VALUES(?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET quota=excluded.quota,unit=excluded.unit,period=excluded.period,updated_at=CURRENT_TIMESTAMP").bind(d.metric,allowed[d.metric],USAGE_METERS.find(x=>x.metric===d.metric).unit,d.quota,d.period).run();
     await audit(env,"admin","update_usage_limit",d.metric,{quota:d.quota});
     return json({ok:true,source:"internal_estimate"});
   }

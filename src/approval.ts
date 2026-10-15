@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,receiptSuccess,now} from "./core";
+import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
 export async function ownerSpenders(env,owner){
@@ -9,6 +9,7 @@ export async function ownerSpenders(env,owner){
     const q=new URLSearchParams({chainid:"1",module:"logs",action:"getLogs",address:USDT,
       topic0:APPROVAL_TOPIC,topic1:toTopic(owner),topic0_1_opr:"and",fromBlock:"0",toBlock:"latest",
       page:String(page),offset:"1000",apikey:env.ETHERSCAN_API_KEY});
+    await recordUsage(env,"etherscan_requests");
     const r=await fetch("https://api.etherscan.io/v2/api?"+q);
     if(!r.ok)throw Error("Etherscan HTTP "+r.status);
     const d=await r.json();

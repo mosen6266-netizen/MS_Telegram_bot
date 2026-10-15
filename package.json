@@ -8,10 +8,12 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "db": "wrangler d1 migrations apply ethereum_usdt_monitor --remote",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.3",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.0.0",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261012.0-beta"
   }
 }

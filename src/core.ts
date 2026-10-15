@@ -22,6 +22,7 @@ export function formatUnits(raw,decimals=6) {
 }
 export async function rpc(env, method, params) {
   if(!env.ALCHEMY_RPC_URL) throw Error("ALCHEMY_RPC_URL is not configured");
+  await recordUsage(env,"alchemy_rpc_requests");
   const r=await fetch(env.ALCHEMY_RPC_URL,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})});
   if(!r.ok)throw Error("Ethereum RPC HTTP "+r.status);
   const d=await r.json();
@@ -40,11 +41,18 @@ export async function receiptSuccess(env,hash){
 }
 export async function telegram(env,method,body){
   if(!env.TELEGRAM_BOT_TOKEN)throw Error("TELEGRAM_BOT_TOKEN is missing");
+  await recordUsage(env,"telegram_api_requests");
   const r=await fetch("https://api.telegram.org/bot"+env.TELEGRAM_BOT_TOKEN+"/"+method,{
     method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)
   });
   const d=await r.json();
-  if(!r.ok || !d.ok) throw Error("Telegram "+(d.description||r.status));
+  if(r.status===429)await recordUsage(env,"telegram_rate_limited");
+  if(!r.ok || !d.ok){
+    const error=Error("Telegram "+(d.description||r.status));
+    error.retryAfter=Number(d.parameters?.retry_after)||0;
+    throw error;
+  }
+  if(method==="sendMessage")await recordUsage(env,"telegram_notifications");
   return d.result;
 }
 export const send=(env,chat_id,text,reply_markup=undefined)=>telegram(env,"sendMessage",{
@@ -56,6 +64,9 @@ export const buttons=address=>({inline_keyboard:[
 ]});
 export async function increment(env,metric){
   await env.DB.prepare("INSERT INTO counters(metric,day,value) VALUES(?,date('now'),1) ON CONFLICT(metric,day) DO UPDATE SET value=value+1").bind(metric).run();
+}
+export async function recordUsage(env,metric){
+  try{await increment(env,metric);}catch{console.warn("Usage counter unavailable",metric);}
 }
 export async function queueNotice(env,{dedup,chat_id,address,template,payload}){
   await env.DB.prepare("INSERT OR IGNORE INTO outbox(dedup_key,chat_id,address,template_key,payload_json) VALUES(?,?,?,?,?)")
