@@ -36,7 +36,7 @@ function transferKey(a,kind,hash,asset,from,to){
   // historical Transfers API. Both must produce the same outbox dedup key.
   if(kind==="erc20"){
     const unique=String(a.uniqueId||"");
-    const suffix=unique.startsWith(hash+":")?unique.slice(hash.length+1):null;
+    const suffix=unique.startsWith(hash+":log:")?unique.slice(hash.length+5):unique.startsWith(hash+":")?unique.slice(hash.length+1):null;
     const logIndex=indexValue(a.log?.logIndex??a.logIndex??suffix);
     if(logIndex!==null)return "tx:"+hash+":erc20:"+asset+":"+logIndex;
     // If the provider omitted log index, retain its unique ID, otherwise
