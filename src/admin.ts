@@ -282,6 +282,25 @@ export async function handleAdmin(req,env,path){
     return json({ok:true});
   }
   if(method==="GET"&&path==="/api/transfers")return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
+  if(method==="POST"&&path==="/api/outbox/retry"){
+    const request=await body(req);
+    const id=Number(request.id);
+    if(!Number.isSafeInteger(id)||id<=0)return bad("无效通知任务编号");
+    const existing=await env.DB.prepare("SELECT id,state,template_key,chat_id,address FROM outbox WHERE id=?").bind(id).first();
+    if(!existing)return bad("通知任务不存在",404);
+    if(existing.state!=="failed")return bad("只有最终发送失败的任务才能手动重试",409);
+    // Do not send from the HTTP request. Requeue one task and let the normal
+    // outbox worker re-check subscriptions and destinations before sending.
+    // Administrators must explicitly accept possible duplicate delivery when
+    // Telegram succeeded but D1 state recording failed.
+    const changed=await env.DB.prepare(
+      "UPDATE outbox SET state='pending',attempts=0,sending_started_at=NULL,due_at=CURRENT_TIMESTAMP,last_error=NULL "+
+      "WHERE id=? AND state='failed'"
+    ).bind(id).run();
+    if(!changed.meta?.changes)return bad("任务状态已改变，请刷新后重试",409);
+    await audit(env,"admin","retry_failed_outbox",String(id),{chat:existing.chat_id,template:existing.template_key});
+    return json({ok:true,queued:true,note:"任务已重新排队。极少数远端实际发送成功、但回执记录失败的情况可能产生重复消息。"});
+  }
   if(method==="GET"&&path==="/api/outbox")return json((await env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at FROM outbox ORDER BY id DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/usage"){
