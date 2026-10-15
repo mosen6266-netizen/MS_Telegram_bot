@@ -160,7 +160,7 @@ export async function handleAdmin(req,env,path){
         // All Alchemy address changes use the same lease. If an enrollment is
         // still in flight, fail safely instead of deleting underneath it.
         const rule=await env.DB.prepare("SELECT spender,remark FROM spender_rules WHERE spender=?").bind(a).first();
-        if(!rule)return bad("该 Spender 已不存在",404);
+        if(!rule){const err=Error("Spender not found");err.code="SPENDER_NOT_FOUND";throw err;}
         histories=(await env.DB.prepare("SELECT COUNT(*) AS n FROM spender_history_addresses WHERE spender=?").bind(a).first())?.n||0;
         // Remove dependent rows before deleting the parent; spender_routes
         // references spender_rules via a foreign key. Preserve wallet watches,
@@ -180,6 +180,7 @@ export async function handleAdmin(req,env,path){
       });
     }catch(e){
       if(e instanceof AlchemyMutationBusy)return bad("Alchemy 正在更新监控地址，请稍后再删除 Spender",409);
+      if(e.code==="SPENDER_NOT_FOUND")return bad("该 Spender 已不存在",404);
       throw e;
     }
     return json({ok:true,removed_spender:a,history_records_removed:histories,monitored_wallets_retained:true,
