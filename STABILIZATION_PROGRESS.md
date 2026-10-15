@@ -217,3 +217,17 @@
 - **已验证 CI**：核心功能与所有新增测试提交 `fe13732fbd97b8b4190a31b190d88662306ab386` 两组 CI 成功；最终捆绑检查提交 `c3f369206c4aa00a254be1f80930fd31a5ddef44` 两组 CI 成功。最后的文档提交需继续确认 CI。
 - **仍未完成**：各 Spender 之间的严格配额公平性、真实高负载云端压测和 Queue/Cron 的长时间故障恢复、Alchemy 在实际配额下的稳定性、正式云端预发布 D1/Queue/Worker 的部署和最终回滚验收。此次仍未触碰生产 Worker、正式 D1/Queue、主分支或 Telegram Bot。
 - **下轮建议**：继续补充多 Spender 公平调度和跨服务长时间故障测试，以及安全的云端预发布环境验收；不要把模拟 CI 成功表述为已通过正式生产验收。
+
+## 2026-10-15 第十四轮：多 Spender 跨任务公平性与资金回扫失败隔离
+
+- **接续状态**：上一轮最后的进度提交 `290d7118edd51a8f224b59030e05e5cf5cb25a49` 两次 CI 都已成功；仍然仅操作 `stabilization/2026-10-15-p0`。
+- `src/spender-enroll.ts`：在原有“每批 15 个新 Owner / 5 个到期重试 Owner”基础上，加入 `ROW_NUMBER() OVER(PARTITION BY spender)` 的跨 Spender 公平轮转，使用 `runtime_state` 中的 `spender_enroll_rr_fresh` / `spender_enroll_rr_retry` 持久化两个队列的上次服务位置。超过单批容量的 Spender 不再永久排在后面。仅一个名额时使用 `spender_enroll_rr_pool_turn` 新/重试交替，避免单类饿死。
+- `tests/spender-enrollment-fairness.test.mjs`：保留原先 80 个 Owner 测试；新增 32 个竞争 Spender、两类队列连续七轮、公平进度断言，以及单名额新/重试交替。对应功能和测试两组 GitHub CI 已通过。
+- `src/spender-history.ts`：Etherscan 历史任务采用 `spender_history_rr_cursor` 对相同更新时间的不同 Spender 轮转；单个失败任务根据重试次数延迟 2/10/60 分钟，避免连续占据 Cron 配额；HTTP 429 触发短暂全局历史扫描冷却。当前 Spender 扫描完成或普通失败，Cron 仍可继续检查其他待扫描任务；不改写失败任务的扫描游标。
+- `tests/spender-history-scheduler.test.mjs`：8 个待扫描 Spender，其中一个模拟 Etherscan 错误，7 个能继续完成；故障任务到期后恢复。模拟全局 429 则后续不再重复发送历史查询。测试两组 CI 通过。
+- `src/recovery.ts`：为失败的钱包资金缺口回扫设置约五分钟退避，将最近失败时间写入已有 `wallet_checkpoints.checked_at`（不会前进 `last_block`），避免最旧且连续失败的钱包永久挤占 3 个回扫名额；筛选时通过 `datetime(checked_at)` 正确比较 SQLite 时间戳和 ISO8601。
+- `tests/wallet-gap-recovery-fairness.test.mjs`：使用模拟 RPC 超时和隔离真实 D1，验证失败钱包的断点保留、其他活跃钱包继续回扫、五分钟后失败钱包可重新入队。提交 `1b52c19a82af7c36b73fb920415e6c1adb1214cb` 两组 CI 成功。
+- `scripts/verify-worker-bundle.mjs`：增加跨 Spender 游标、钱包失败退避函数的完整构建检查。`docs/RELEASE_AND_ROLLBACK.md` 增强上线前公平调度、冷却、断点完整性、100–200 钱包负载验收条款。
+- **已确认 CI**：核心功能与新 D1 故障测试提交 `1b52c19a82af7c36b73fb920415e6c1adb1214cb` 双 CI 成功。最新构建校验与文档更新提交仍需核对最终 CI。
+- **尚未完成的风险**：仅本地模拟数据库/RPC 测试，实际外部 Cloudflare Queue/Cron/Alchemy/Etherscan 长时间运行、回调投递验证、100–200 钱包持续区块跟踪能力、生产数据库备份回滚均未验收；跨服务 429 仍需云端压力测试。不得承诺完全消除重组与通知延迟风险。
+- **发布隔离边界**：未修改生产 Worker、生产 D1、Queues、Telegram Bot、Alchemy、`main`；PR #1 继续保持草稿。下一阶段优先使用 `docs/ISOLATED_STAGING.md` 的独立环境验收，在用户批准并确认资源隔离后再实际创建预发布资源；在此之前继续修复阻断正式发布的代码问题和静态核对。
