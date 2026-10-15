@@ -37,7 +37,7 @@ async function setEnrollmentCooldown(env,seconds){
 }
 export async function selectEnrollmentCandidates(db,limit=ENROLL_BATCH){
   const max=Math.max(1,Math.min(ENROLL_BATCH,limit));
-  const base="SELECT h.spender,h.owner,r.generation FROM spender_history_addresses h "+
+  const base="FROM spender_history_addresses h "+
     "JOIN spender_rules r ON r.spender=h.spender AND r.enabled=1 "+
     "LEFT JOIN wallets w ON w.address=h.owner "+
     "LEFT JOIN wallet_exclusions x ON x.address=h.owner "+
@@ -46,29 +46,53 @@ export async function selectEnrollmentCandidates(db,limit=ENROLL_BATCH){
   const retry="(e.state IN ('pending','retrying') AND e.updated_at<datetime('now', "+
       "CASE WHEN e.attempts>=5 THEN '-30 minutes' WHEN e.attempts>=3 THEN '-10 minutes' ELSE '-90 seconds' END) "+
     "OR (e.state='running' AND e.updated_at<datetime('now','-5 minutes')))";
-  // Always reserve at least one slot for a due failed attempt, even when a
-  // continuous feed of fresh Owners would otherwise permanently starve it.
-  const reserved=max>=4?Math.max(1,Math.floor(max/4)):max===1?0:1;
+  const cursorKeys=["spender_enroll_rr_fresh","spender_enroll_rr_retry","spender_enroll_rr_pool_turn"];
+  const cursors=await db.batch(cursorKeys.map(key=>
+    db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(key)));
+  const [freshCursor,retryCursor,turn]=cursors.map(x=>String(x.results?.[0]?.value||""));
+  // Even a one-slot batch must alternate queues when both remain busy.
+  const reserved=max===1?(turn==="retry"?1:0):max>=4?Math.max(1,Math.floor(max/4)):1;
   const freshCount=max-reserved;
-  const [newcomers,retries]=await db.batch([
-    db.prepare(base+"e.spender IS NULL ORDER BY h.first_seen_block ASC,h.spender,h.owner LIMIT ?").bind(freshCount),
-    db.prepare(base+retry+" ORDER BY e.updated_at ASC,h.first_seen_block ASC,h.owner LIMIT ?").bind(reserved)
+  const makeQuery=(where,order)=>
+    "WITH ranked AS (SELECT h.spender,h.owner,r.generation,"+
+    "ROW_NUMBER() OVER (PARTITION BY h.spender ORDER BY "+order+") AS round_no "+
+    base+where+") "+
+    "SELECT spender,owner,generation FROM ranked ORDER BY round_no ASC,"+
+    "CASE WHEN spender>? THEN 0 ELSE 1 END,spender ASC,owner ASC LIMIT ? OFFSET ?";
+  const freshSQL=makeQuery("e.spender IS NULL","h.first_seen_block ASC,h.owner ASC");
+  const retrySQL=makeQuery(retry,"e.updated_at ASC,h.first_seen_block ASC,h.owner ASC");
+  const [freshResult,retryResult]=await db.batch([
+    db.prepare(freshSQL).bind(freshCursor,freshCount,0),
+    db.prepare(retrySQL).bind(retryCursor,reserved,0)
   ]);
-  const rows=[...(newcomers.results||[]),...(retries.results||[])];
-  if(rows.length<max){
-    // Fill unused slots from whichever queue has more work, with OFFSET
-    // values grounded in the already returned ordering.
-    const needed=max-rows.length;
-    const [moreFresh,moreRetry]=await db.batch([
-      db.prepare(base+"e.spender IS NULL ORDER BY h.first_seen_block ASC,h.spender,h.owner LIMIT ? OFFSET ?")
-        .bind(needed,newcomers.results?.length||0),
-      db.prepare(base+retry+" ORDER BY e.updated_at ASC,h.first_seen_block ASC,h.owner LIMIT ? OFFSET ?")
-        .bind(needed,retries.results?.length||0)
+  const fresh=[...(freshResult.results||[])],due=[...(retryResult.results||[])];
+  if(fresh.length+due.length<max){
+    const missing=max-fresh.length-due.length;
+    const [extraFresh,extraDue]=await db.batch([
+      db.prepare(freshSQL).bind(freshCursor,missing,fresh.length),
+      db.prepare(retrySQL).bind(retryCursor,missing,due.length)
     ]);
-    rows.push(...(moreFresh.results||[]).slice(0,needed));
-    rows.push(...(moreRetry.results||[]).slice(0,Math.max(0,max-rows.length)));
+    fresh.push(...(extraFresh.results||[]).slice(0,missing));
+    due.push(...(extraDue.results||[]).slice(0,Math.max(0,max-fresh.length-due.length)));
   }
-  return rows;
+  // Cursor persists across Cron cycles; with more Spenders than batch slots,
+  // the next batch begins after the last served Spender rather than always
+  // starting from the lexicographically smallest.
+  const updates=[];
+  if(fresh.length)updates.push(db.prepare(
+    "INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_enroll_rr_fresh',?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP"
+  ).bind(fresh.at(-1).spender));
+  if(due.length)updates.push(db.prepare(
+    "INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_enroll_rr_retry',?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP"
+  ).bind(due.at(-1).spender));
+  if(max===1&&fresh.length+due.length)updates.push(db.prepare(
+    "INSERT INTO runtime_state(key,value,updated_at) VALUES('spender_enroll_rr_pool_turn',?,CURRENT_TIMESTAMP) "+
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP"
+  ).bind(reserved?"fresh":"retry"));
+  if(updates.length)await db.batch(updates);
+  return [...fresh,...due];
 }
 
 export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
