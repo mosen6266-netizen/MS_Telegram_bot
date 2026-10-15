@@ -17,7 +17,8 @@ async function dbFor(name){
  const DB=await mf.getD1Database("DB");
  await DB.prepare("CREATE TABLE outbox (id INTEGER PRIMARY KEY,dedup_key TEXT UNIQUE,chat_id TEXT NOT NULL,address TEXT,"+
   "template_key TEXT,payload_json TEXT,state TEXT DEFAULT 'pending',attempts INTEGER DEFAULT 0,"+
-  "due_at TEXT DEFAULT CURRENT_TIMESTAMP,last_error TEXT,sending_started_at TEXT,telegram_message_id INTEGER,sent_at TEXT)").run();
+  "due_at TEXT DEFAULT CURRENT_TIMESTAMP,last_error TEXT,sending_started_at TEXT,telegram_message_id INTEGER,sent_at TEXT,"+
+  "created_at TEXT DEFAULT CURRENT_TIMESTAMP)").run();
  await DB.prepare("CREATE TABLE templates (template_key TEXT,chat_id TEXT,body TEXT,PRIMARY KEY(template_key,chat_id))").run();
  await DB.prepare("INSERT INTO outbox(id,dedup_key,chat_id,template_key,payload_json) VALUES(1,'a','-10001','usage_alert','{}')").run();
  return {mf,DB,env:{DB,TELEGRAM_BOT_TOKEN:"synthetic-test-only",ADMIN_TELEGRAM_CHAT_ID:null}};
