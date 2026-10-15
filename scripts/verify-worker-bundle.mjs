@@ -25,6 +25,7 @@ const required=[
  ["paginated wallet admin list",/async function listWalletsPage\s*\(/],
  ["paginated subscription admin list",/async function listSubscriptionsPage\s*\(/],
  ["paginated audit admin list",/async function listAuditPage\s*\(/],
+ ["paginated transfer history",/async function listTransfersPage\s*\(/],
  ["safe Spender route source cleanup",/function removeSpenderRouteSourceStatements\s*\(/],
  ["administrator failed-notification retry",/async function requeueFailedOutbox\s*\(/],
  ["live approval monitor",/async function pollSpenders\s*\(/],
