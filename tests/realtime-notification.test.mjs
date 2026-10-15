@@ -88,6 +88,6 @@ test("queue and outbox fast path are connected for approvals and ETH transfers",
  assert.match(index,/await processRealtimeApprovalWebhook\(configured,item\.payload\)/);
  assert.match(index,/item\.kind===\"activity\"\|\|item\.kind===\"approval_webhook\"/);
  assert.match(index,/await flushOutbox\(configured,20\)/);
- assert.match(index,/kind:\"enroll_owner\"/);
+ assert.match(index,/item\.kind===\"enroll_owner\"/);
  assert.match(wrangler,/"max_batch_timeout": 0/);
 });
