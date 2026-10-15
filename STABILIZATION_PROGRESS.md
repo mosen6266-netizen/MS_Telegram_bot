@@ -116,3 +116,19 @@
 - **仍未合并 main，也未修改生产 Cloudflare Worker/D1。**
 - **剩余并发风险**：对在删除前已开始、且在最后一次规则校验后才进入远端 Alchemy API 的调用，还需统一引入受控接入队列和操作租约，才能保证远端同样无孤儿监控。不要把本阶段说成彻底消除所有异步竞争。
 - **下一阶段**：完善 Alchemy 接入/删除统一调度与租约、Telegram 旧订阅来源人工确认/取消的强权限功能、交易通知可恢复性测试、性能和 UI 全面复核、隔离环境部署迁移演练。
+
+## 2026-10-15 第七轮：Alchemy 增删全局互斥、Webhook 去重及删除冲突防护
+
+- 新增 `src/alchemy-mutation-lease.ts`：基于现有 D1 `runtime_state` 的全局 `alchemy_mutation_lease`。通过原子条件 UPSERT 抢占，凭独立随机令牌释放；旧执行不能误解锁新执行。租约容错 180 秒，单次远端调用 AbortSignal 超时 25 秒，避免默认长期卡死。
+- `src/core.ts`：单钱包 `ensureWatch`、`removeWatch` 和 `syncWatch` 统一借助锁完成远端操作及本地状态写入；锁繁忙时移除任务保留或改为 `removal_pending` 供后续清理，避免误报 Alchemy 已删除。
+- 同一钱包添加与删除请求发生重叠时，显式删除优先：地址会继续处于 `removal_pending`，添加流程不能错误返回已激活。定时删除遵守活跃订阅保护。
+- 首次 Webhook 创建时，在锁内重新查找并解密数据库保存的 ID；避免其他执行已经创建成功但本执行持有旧配置时重复创建 Webhook；如果已存密钥无法解密，拒绝新建，须人工处理配置。
+- `src/spender-enroll.ts`：历史批量接入 Alchemy 前锁内重新检查每条 Spender 规则 `generation`、已发现地址及管理员排除；仅提交仍有效的地址，成功后仍在锁内写入本地监控及订阅状态。
+- Spender 删除接口也参与该全局互斥锁。已有远端接入调用尚未结束时返回 HTTP 409 告知管理员稍后重试；不能直接删除规则导致远端新增孤儿地址。
+- `src/watch-maintenance.ts`、`src/index.ts`：普通 Cron 重试现在只接入仍有活跃来源的 pending 订阅，排除已移除 Spender 留下的待接入孤立地址；原有手动、管理员与旧 legacy 来源保持兼容。
+- 新增测试 `tests/alchemy-mutation-lease.test.mjs`、`tests/alchemy-webhook-identity.test.mjs`、`tests/spender-alchemy-race.test.mjs`、`tests/pending-watch-origin.test.mjs`。覆盖锁冲突/令牌交接、加/删重叠、旧 webhook 身份重读、正在批量接入时删 Spender、规则删除后禁止远端残留新增、定时重试孤儿隔离。
+- 扩展 `scripts/verify-worker-bundle.mjs`：关键 Alchemy 互斥、超时控制与待监控任务来源筛选模块必须存在于最终 Worker 包。
+- 功能与测试提交 `ae236a61d14d906359c033dcbdcaa3c985aff4e4` 的 CI、Deployment Smoke Test 均已通过；捆绑校验提交 `e4161e0c62363ad729b21f58f955f111cddc1cff` 正在 CI 检查中，应确认最终结果。
+- **仍未改动生产 Worker、生产 D1 或 main**；全部修复位于草稿 PR #1 的独立开发分支，尚不允许上线。
+- **剩余风险**：租约能防止所有使用统一调用路径的操作重叠，但不能阻止未来新增、未使用锁的外部代码或已有 Worker。历史地址初期本地记录准备与删除的全部步骤尚不是同一事务；应继续增加输入来源版本条件、解除规则时的待接入数据清理和生产级灰度演练。
+- **下一步**：验证正式迁移顺序与回滚、监控真实 Alchemy 远端清单对账、统一群组来源人工归属审查与界面性能压测。发布需要单独征得用户同意。
