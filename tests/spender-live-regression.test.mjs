@@ -128,7 +128,8 @@ test("Etherscan fallback rescues Alchemy HTTP 400 and preserves scanning progres
  };
  try{
    await pollSpenders(env);
-   assert.equal(state.rules[0].cursor_block,160);
+   // Backup provider keeps twelve recent blocks buffered for indexing safety.
+   assert.equal(state.rules[0].cursor_block,148);
    assert.ok(requests>0);
    assert.equal(state.map.get("spender_poll_provider:"+spender),"etherscan");
    const status=JSON.parse(state.map.get("spender_poll_status:"+spender));
