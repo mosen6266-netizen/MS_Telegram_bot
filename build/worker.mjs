@@ -896,17 +896,17 @@ function parseApprovalTime(log) {
 function historyTimeStmt(env, spender, owner, block, time) {
   return env.DB.prepare("INSERT INTO spender_history_timestamps(spender,owner,block_number,approval_at) VALUES(?,?,?,?) ON CONFLICT(spender,owner) DO UPDATE SET block_number=excluded.block_number,approval_at=excluded.approval_at WHERE excluded.block_number>=spender_history_timestamps.block_number").bind(spender, owner, block, time);
 }
-function historyEventStmt(env, spender, owner, block, hash, amount) {
-  return env.DB.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block,latest_event_block,latest_tx_hash,last_event_amount_raw,verify_status) VALUES(?,?,?,?,?,?,'pending') ON CONFLICT(spender,owner) DO UPDATE SET first_seen_block=MIN(spender_history_addresses.first_seen_block,excluded.first_seen_block),latest_tx_hash=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.latest_tx_hash ELSE spender_history_addresses.latest_tx_hash END,last_event_amount_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.last_event_amount_raw ELSE spender_history_addresses.last_event_amount_raw END,verify_status=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN 'pending' ELSE spender_history_addresses.verify_status END,current_allowance_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.current_allowance_raw END,verified_at=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.verified_at END,latest_event_block=MAX(spender_history_addresses.latest_event_block,excluded.latest_event_block)").bind(spender, owner, block, block, hash, amount);
+function historyEventStmt(env, spender, owner, block, hash, amount2) {
+  return env.DB.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block,latest_event_block,latest_tx_hash,last_event_amount_raw,verify_status) VALUES(?,?,?,?,?,?,'pending') ON CONFLICT(spender,owner) DO UPDATE SET first_seen_block=MIN(spender_history_addresses.first_seen_block,excluded.first_seen_block),latest_tx_hash=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.latest_tx_hash ELSE spender_history_addresses.latest_tx_hash END,last_event_amount_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN excluded.last_event_amount_raw ELSE spender_history_addresses.last_event_amount_raw END,verify_status=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN 'pending' ELSE spender_history_addresses.verify_status END,current_allowance_raw=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.current_allowance_raw END,verified_at=CASE WHEN excluded.latest_event_block>=spender_history_addresses.latest_event_block THEN NULL ELSE spender_history_addresses.verified_at END,latest_event_block=MAX(spender_history_addresses.latest_event_block,excluded.latest_event_block)").bind(spender, owner, block, block, hash, amount2);
 }
-async function recordSpenderLiveApproval(env, spender, log, amount) {
+async function recordSpenderLiveApproval(env, spender, log, amount2) {
   const owner = fromTopic(log.topics?.[1]);
   if (!owner) return;
   const block = Number(BigInt(log.blockNumber));
   await historyEventStmt(env, spender, owner, block, log.transactionHash, BigInt(log.data || "0x0").toString()).run();
   const stamp = parseApprovalTime(log);
   if (stamp) await historyTimeStmt(env, spender, owner, block, stamp).run();
-  await env.DB.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND latest_event_block<=?").bind(amount.toString(), amount > 0n ? "active" : "revoked", spender, owner, block).run();
+  await env.DB.prepare("UPDATE spender_history_addresses SET current_allowance_raw=?,verify_status=?,verified_at=CURRENT_TIMESTAMP WHERE spender=? AND owner=? AND latest_event_block<=?").bind(amount2.toString(), amount2 > 0n ? "active" : "revoked", spender, owner, block).run();
 }
 async function fetchHistoryRange(env, spender, from, to, page = 1) {
   if (!env.ETHERSCAN_API_KEY) throw Error("Etherscan V2 API Key \u672A\u914D\u7F6E");
@@ -1154,19 +1154,19 @@ async function processApproval(env, rule, log) {
   const ok = await receiptSuccess(env, log.transactionHash);
   if (ok === null) throw Error("Transaction receipt is not indexed yet; retry this block");
   if (ok === false) return;
-  const amount = await allowance(env, owner, rule.spender);
-  await recordSpenderLiveApproval(env, rule.spender, log, amount);
+  const amount2 = await allowance(env, owner, rule.spender);
+  await recordSpenderLiveApproval(env, rule.spender, log, amount2);
   const manuallyExcluded = await env.DB.prepare("SELECT 1 FROM wallet_exclusions WHERE address=?").bind(owner).first();
   const walletRecord = await env.DB.prepare("SELECT deleted_at FROM wallets WHERE address=?").bind(owner).first();
   if (manuallyExcluded || walletRecord?.deleted_at) return;
   const previous = await env.DB.prepare("SELECT amount_raw FROM allowances WHERE owner=? AND spender=?").bind(owner, rule.spender).first();
   const before = BigInt(previous?.amount_raw || "0");
   const evId = "approval:" + log.transactionHash + ":" + log.logIndex;
-  const type = amount === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount > before ? "increased" : amount < before ? "decreased" : "unchanged";
-  await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)").bind(evId, owner, rule.spender, amount.toString(), Number(BigInt(log.blockNumber)), log.transactionHash, type).run();
-  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP").bind(owner, rule.spender, amount.toString(), Number(BigInt(log.blockNumber)), Number(BigInt(log.blockNumber))).run();
+  const type = amount2 === 0n ? "revoked" : !previous ? "new" : before === 0n ? "reauthorized" : amount2 > before ? "increased" : amount2 < before ? "decreased" : "unchanged";
+  await env.DB.prepare("INSERT OR IGNORE INTO approval_events(event_id,owner,spender,amount_raw,block_number,tx_hash,event_type) VALUES(?,?,?,?,?,?,?)").bind(evId, owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), log.transactionHash, type).run();
+  await env.DB.prepare("INSERT INTO allowances(owner,spender,amount_raw,first_seen_block,latest_block) VALUES(?,?,?,?,?) ON CONFLICT(owner,spender) DO UPDATE SET amount_raw=excluded.amount_raw,latest_block=excluded.latest_block,updated_at=CURRENT_TIMESTAMP").bind(owner, rule.spender, amount2.toString(), Number(BigInt(log.blockNumber)), Number(BigInt(log.blockNumber))).run();
   const registered = await env.DB.prepare("SELECT 1 FROM wallet_watches WHERE address=?").bind(owner).first();
-  if (amount > 0n && (!registered || !previous)) {
+  if (amount2 > 0n && (!registered || !previous)) {
     await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,discovery_source) VALUES(?,'spender')").bind(owner).run();
     const { results: routes } = await env.DB.prepare("SELECT chat_id FROM spender_routes WHERE spender=?").bind(rule.spender).all();
     for (const route of routes || []) {
@@ -1183,7 +1183,7 @@ async function processApproval(env, rule, log) {
       chat_id: route.chat_id,
       address: owner,
       template: "new_approval",
-      payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount, 6) + " USDT", tx_hash: log.transactionHash, watch_status: watched ? "active" : "pending" }
+      payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount2, 6) + " USDT", tx_hash: log.transactionHash, watch_status: watched ? "active" : "pending" }
     });
     await increment(env, "discovered_wallets");
   } else if (type !== "unchanged" && previous) {
@@ -1193,7 +1193,7 @@ async function processApproval(env, rule, log) {
       chat_id: route.chat_id,
       address: owner,
       template: "approval_change",
-      payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount, 6) + " USDT", event_type: type, tx_hash: log.transactionHash }
+      payload: { owner, spender: rule.spender, spender_remark: rule.remark, amount: formatUnits(amount2, 6) + " USDT", event_type: type, tx_hash: log.transactionHash }
     });
   }
 }
@@ -1445,58 +1445,82 @@ async function reconcileAlchemyAddresses(env) {
 }
 
 // src/transfers.ts
-var asNum = (x) => typeof x === "string" && x.startsWith("0x") ? Number(BigInt(x)) : Number(x || 0);
 function identify(a) {
   const category = String(a.category || "").toLowerCase();
-  if (category === "external" || category === "internal") return { asset: "ETH", decimals: 18 };
-  if (category !== "erc20") return null;
-  const contract = addr(a.rawContract?.address || a.contractAddress || "");
-  if (contract === USDT) return { asset: "USDT", decimals: 6 };
-  if (contract === USDC) return { asset: "USDC", decimals: 6 };
+  if (category === "external" || category === "internal") return { asset: "ETH", kind: category, decimals: 18 };
+  if (category !== "erc20" && category !== "token") return null;
+  const contract = addr(a.rawContract?.address || a.contractAddress || a.log?.address || "");
+  if (contract === USDT) return { asset: "USDT", kind: "erc20", decimals: 6 };
+  if (contract === USDC) return { asset: "USDC", kind: "erc20", decimals: 6 };
   return null;
 }
-function displayAmount(a, asset) {
-  if (a.value !== void 0 && a.value !== null) return String(a.value);
-  const raw = a.rawContract?.rawValue;
-  if (raw !== void 0 && raw !== null) {
-    let n = BigInt(raw), d = asset === "ETH" ? 18 : 6, txt = n.toString().padStart(d + 1, "0");
-    return txt.slice(0, -d) + (txt.slice(-d).replace(/0+$/, "") ? "." + txt.slice(-d).replace(/0+$/, "") : "");
+function amount(a, decimals) {
+  const raw = a.rawContract?.rawValue ?? a.rawContract?.value;
+  if (raw !== null && raw !== void 0) {
+    const digits = BigInt(raw).toString().padStart(decimals + 1, "0");
+    const fraction = digits.slice(-decimals).replace(/0+$/, "");
+    return digits.slice(0, -decimals) + (fraction ? "." + fraction : "");
   }
+  if (a.value !== null && a.value !== void 0) return String(a.value);
   return "\u672A\u77E5";
+}
+function indexValue(value) {
+  if (value === void 0 || value === null || value === "") return null;
+  try {
+    const n = BigInt(value);
+    return n >= 0n ? n.toString() : null;
+  } catch {
+    return null;
+  }
+}
+function transferKey(a, kind, hash, asset, from, to) {
+  if (kind === "erc20") {
+    const unique = String(a.uniqueId || "");
+    const suffix = unique.startsWith(hash + ":") ? unique.slice(hash.length + 1) : null;
+    const logIndex = indexValue(a.log?.logIndex ?? a.logIndex ?? suffix);
+    if (logIndex !== null) return "tx:" + hash + ":erc20:" + asset + ":" + logIndex;
+    return "tx:" + hash + ":erc20:" + asset + ":" + (unique || from + ":" + to + ":" + String(a.rawContract?.rawValue ?? a.rawContract?.value ?? a.value));
+  }
+  if (kind === "external") return "tx:" + hash + ":external:ETH";
+  return "tx:" + hash + ":internal:ETH:" + (a.typeTraceAddress || a.uniqueId || from + ":" + to + ":" + String(a.rawContract?.rawValue ?? a.value));
 }
 async function processActivity(env, payload) {
   const event = payload.event || {};
   if (event.network && event.network !== "ETH_MAINNET") throw Error("Not Ethereum mainnet activity");
   if (payload.network && payload.network !== "ETH_MAINNET") throw Error("Invalid source network");
   const activities = event.activity || [];
+  if (!Array.isArray(activities)) throw Error("Invalid Alchemy activity list");
   for (const a of activities) {
     const asset = identify(a);
     if (!asset) continue;
-    const from = addr(a.fromAddress), to = addr(a.toAddress);
+    const from = addr(a.fromAddress || a.from), to = addr(a.toAddress || a.to);
     if (!from || !to) continue;
-    const hash = a.hash || a.transactionHash;
-    if (!/^0x[a-fA-F0-9]{64}$/.test(hash || "")) continue;
+    const hash = String(a.hash || a.transactionHash || "").toLowerCase();
+    if (!/^0x[a-f0-9]{64}$/.test(hash)) continue;
+    if (a.log?.removed === true) continue;
     const success = await receiptSuccess(env, hash);
-    if (success !== true) continue;
-    const baseId = "tx:" + hash + ":" + (a.uniqueId || a.logIndex || a.category + ":" + from + ":" + to + ":" + a.rawContract?.rawValue);
-    const block = asNum(a.blockNum || a.blockNumber);
-    const val = displayAmount(a, asset.asset);
+    if (success === null) throw Error("Transaction receipt not indexed yet; retry this activity payload");
+    if (success === false) continue;
+    const baseId = transferKey(a, asset.kind, hash, asset.asset, from, to);
+    const rawBlock = a.blockNum ?? a.blockNumber ?? a.log?.blockNumber;
+    const block = typeof rawBlock === "string" && rawBlock.startsWith("0x") ? Number(BigInt(rawBlock)) : Number(rawBlock);
+    if (!Number.isSafeInteger(block) || block < 0) throw Error("Transaction block number missing or invalid");
+    const value = amount(a, asset.decimals);
     const owners = from === to ? [{ address: from, direction: "\u81EA\u8F6C" }] : [{ address: from, direction: "\u8F6C\u51FA" }, { address: to, direction: "\u8F6C\u5165" }];
     for (const o of owners) {
       const watch = await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=? AND state='active'").bind(o.address).first();
       if (!watch) continue;
       const eventId = baseId + ":" + o.address + ":" + o.direction;
-      const inserted = await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(eventId, o.address, asset.asset, o.direction, val, from, to, hash, block, a.blockHash || null).run();
-      if (!inserted.meta?.changes) continue;
+      const inserted = await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(eventId, o.address, asset.asset, o.direction, value, from, to, hash, block, a.blockHash || a.log?.blockHash || null).run();
       const { results: subs } = await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
       for (const s of subs || []) await queueNotice(env, {
         dedup: eventId + ":" + s.chat_id,
         chat_id: s.chat_id,
         address: o.address,
         template: "transfer",
-        payload: { asset: asset.asset, direction: o.direction, amount: val, from_address: from, to_address: to, tx_hash: hash, block_number: block }
+        payload: { asset: asset.asset, direction: o.direction, amount: value, from_address: from, to_address: to, tx_hash: hash, block_number: block }
       });
-      await increment(env, "transfer_events");
+      if (inserted.meta?.changes) await increment(env, "transfer_events");
     }
   }
 }
