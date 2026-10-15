@@ -4,7 +4,7 @@ import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
 import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources} from "./subscription-sources";
-import {requeueFailedOutbox} from "./outbox-operations";
+import {requeueFailedOutbox,listOutboxPage} from "./outbox-operations";
 import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
@@ -297,20 +297,9 @@ export async function handleAdmin(req,env,path){
   }
   if(method==="GET"&&path==="/api/outbox"){
     const q=new URL(req.url).searchParams;
-    const page=Math.max(0,Math.min(100000,Number.parseInt(q.get("page")||"0",10)||0));
-    const status=q.get("status")||"all",search=String(q.get("search")||"").trim().slice(0,40);
-    if(!["all","pending","sending","sent","failed","skipped"].includes(status))return bad("通知状态筛选无效");
-    if(search&&!/^-?[0-9]{1,20}$/.test(search))return bad("请输入有效任务编号或 Telegram 群 ID");
-    const id=search&&Number.isSafeInteger(Number(search))&&Number(search)>0?Number(search):null;
-    const where="1=1"+(status==="all"?"":" AND state=?")+(search?(id!==null?" AND (id=? OR chat_id=?)":" AND chat_id=?"):"");
-    const params=[...(status==="all"?[]:[status]),...(search?(id!==null?[id,search]:[search]):[])];
-    const [totalResult,rowsResult,statsResult]=await env.DB.batch([
-      env.DB.prepare("SELECT COUNT(*) AS n FROM outbox WHERE "+where).bind(...params),
-      env.DB.prepare("SELECT id,chat_id,address,template_key,state,attempts,last_error,created_at,due_at FROM outbox WHERE "+where+" ORDER BY id DESC LIMIT 50 OFFSET ?").bind(...params,page*50),
-      env.DB.prepare("SELECT state,COUNT(*) n FROM outbox GROUP BY state")
-    ]);
-    const total=totalResult.results?.[0]?.n||0;
-    return json({rows:rowsResult.results||[],summary:statsResult.results||[],total,page,total_pages:Math.ceil(total/50)});
+    const result=await listOutboxPage(env.DB,{page:q.get("page"),status:q.get("status")||"all",search:q.get("search")||""});
+    if(result.error)return bad(result.error==="invalid_status"?"通知状态筛选无效":"请输入有效任务编号或 Telegram 群 ID",result.status);
+    return json(result);
   }
   if(method==="GET"&&path==="/api/audit")return json((await env.DB.prepare("SELECT * FROM admin_audit ORDER BY id DESC LIMIT 200").all()).results);
   if(method==="GET"&&path==="/api/usage"){
