@@ -74,8 +74,8 @@ test("adding and removing the same wallet cannot mutate Alchemy concurrently",as
   assert.equal(await removeWatch(env,owner),false,"remove must wait for active add");
   assert.equal(calls.length,1,"removal must not reach Alchemy while add is pending");
   finish();
-  assert.equal(await addPromise,true);
-  assert.equal((await DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first()).state,"active");
+  assert.equal(await addPromise,false,"an explicitly requested removal overrides the earlier add");
+  assert.equal((await DB.prepare("SELECT state FROM wallet_watches WHERE address=?").bind(owner).first()).state,"removal_pending");
   assert.equal(await removeWatch(env,owner),true);
   assert.equal(calls.length,2);
   assert.deepEqual(calls.map(x=>[x.addresses_to_add.length,x.addresses_to_remove.length]),[[1,0],[0,1]]);
