@@ -84,3 +84,55 @@ test("rate-limit Retry-After accepts seconds, HTTP dates and safely clamps very 
  assert.equal(enrollmentRetryAfterSeconds("invalid"),null);
  assert.equal(enrollmentRetryAfterSeconds(null),null);
 });
+
+test("32 competing Spenders make progress in fresh and retry pools instead of one huge Spender monopolizing slots",async()=>{
+ const {mf,DB}=await tempDb("spender-cross-fairness");
+ try{
+  await DB.prepare("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<32) "+
+   "INSERT INTO spender_rules(spender,enabled,generation) SELECT printf('0x%040x',1000+i),1,'fair-gen' FROM n").run();
+  await DB.prepare("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<32) "+
+   "INSERT INTO spender_history_addresses(spender,owner,first_seen_block) "+
+   "SELECT printf('0x%040x',1000+i),printf('0x%040x',2000+i),i FROM n").run();
+  await DB.prepare("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<32) "+
+   "INSERT INTO spender_history_addresses(spender,owner,first_seen_block) "+
+   "SELECT printf('0x%040x',1000+i),printf('0x%040x',3000+i),i FROM n").run();
+  await DB.prepare("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<32) "+
+   "INSERT INTO spender_history_monitor_enrollments(spender,owner,state,updated_at,attempts) "+
+   "SELECT printf('0x%040x',1000+i),printf('0x%040x',3000+i),'retrying',datetime('now','-2 hours'),5 FROM n").run();
+
+  const seenFresh=new Set(),seenRetries=new Set();
+  for(let cycle=0;cycle<7;cycle++){
+    const batch=await selectEnrollmentCandidates(DB,20);
+    assert.equal(batch.length,20);
+    const fresh=batch.filter(x=>BigInt(x.owner)<3000n);
+    const retries=batch.filter(x=>BigInt(x.owner)>=3000n);
+    assert.equal(fresh.length,15);
+    assert.equal(retries.length,5);
+    assert.equal(new Set(fresh.map(x=>x.spender)).size,15,"no single Spender dominates fresh queue");
+    assert.equal(new Set(retries.map(x=>x.spender)).size,5,"no single Spender dominates retry queue");
+    for(const x of fresh)seenFresh.add(x.spender);
+    for(const x of retries)seenRetries.add(x.spender);
+  }
+  assert.equal(seenFresh.size,32,"all Spenders get a fresh slot within three cycles");
+  assert.equal(seenRetries.size,32,"all Spenders get retry attention within seven cycles");
+
+  const round=await DB.prepare("SELECT key,value FROM runtime_state WHERE key LIKE 'spender_enroll_rr_%'").all();
+  assert.ok(round.results.some(x=>x.key==="spender_enroll_rr_fresh"));
+  assert.ok(round.results.some(x=>x.key==="spender_enroll_rr_retry"));
+ }finally{await mf.dispose()}
+});
+
+test("single-slot enrollment alternates fresh and failed owners when both pools are backlogged",async()=>{
+ const {mf,DB}=await tempDb("spender-single-slot");
+ try{
+  const spender=wallet(999),fresh=wallet(1),retry=wallet(2);
+  await DB.prepare("INSERT INTO spender_rules(spender,enabled,generation) VALUES(?,1,'single-slot')").bind(spender).run();
+  await DB.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block) VALUES(?,?,1)").bind(spender,fresh).run();
+  await DB.prepare("INSERT INTO spender_history_addresses(spender,owner,first_seen_block) VALUES(?,?,2)").bind(spender,retry).run();
+  await DB.prepare("INSERT INTO spender_history_monitor_enrollments(spender,owner,state,updated_at,attempts) VALUES(?,?,'retrying',datetime('now','-1 hour'),4)").bind(spender,retry).run();
+  const first=(await selectEnrollmentCandidates(DB,1))[0].owner;
+  const second=(await selectEnrollmentCandidates(DB,1))[0].owner;
+  const third=(await selectEnrollmentCandidates(DB,1))[0].owner;
+  assert.deepEqual([first,second,third],[fresh,retry,fresh]);
+ }finally{await mf.dispose()}
+});
