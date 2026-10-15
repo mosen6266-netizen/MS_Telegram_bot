@@ -4,7 +4,7 @@ import {addSpender} from "./approval";
 import {saveWalletRemark,walletRemark} from "./wallet-remarks";
 import {startSpenderHistory} from "./spender-history";
 import {sourceInsert,assignSpenderSourcesForRoute,removeSpenderRouteSourceStatements,retainDeletedSpenderSources,listLegacySubscriptions} from "./subscription-sources";
-import {requeueFailedOutbox,listOutboxPage} from "./outbox-operations";
+import {requeueFailedOutbox,listOutboxPage,acknowledgeUnknownOutbox} from "./outbox-operations";
 import {lastAlchemyReconciliation} from "./alchemy-reconcile";
 import {usageSnapshot,usageSettings,saveUsageSettings,collectUsage,runUsageAlerts,queueUsageTest,USAGE_METERS} from "./usage";
 import {flushOutbox} from "./notifications";
@@ -318,13 +318,25 @@ export async function handleAdmin(req,env,path){
     const d=await body(req);
     const result=await requeueFailedOutbox(env.DB,Number(d.id));
     if(result.error){
-      const messages={invalid_id:"无效通知任务编号",not_found:"通知任务不存在",not_failed:"只有最终发送失败的任务才能手动重试",conflict:"任务状态已改变，请刷新后重试"};
+      const messages={invalid_id:"无效通知任务编号",not_found:"通知任务不存在",not_retryable:"只有发送失败或投递结果待确认的任务才能手动重试",conflict:"任务状态已改变，请刷新后重试"};
       return bad(messages[result.error]||"无法重新排队",result.status);
     }
     // A manual requeue is explicitly requested by an administrator. It never
     // sends synchronously, and the outbox worker still validates subscription.
     await audit(env,"admin","retry_failed_outbox",String(result.task.id),{chat:result.task.chat_id,template:result.task.template_key});
-    return json({ok:true,queued:true,note:"任务已重新排队。极少数远端实际发送成功、但回执记录失败的情况可能产生重复消息。"});
+    return json({ok:true,queued:true,note:"任务已重新排队。请先确认 Telegram 群内没有收到同一条消息，避免重复发送。"});
+  }
+  if(method==="POST"&&path==="/api/outbox/acknowledge"){
+    const d=await body(req);
+    const result=await acknowledgeUnknownOutbox(env.DB,Number(d.id));
+    if(result.error){
+      const errors={invalid_id:"无效通知任务编号",not_found:"通知任务不存在",
+        not_unknown:"只有投递结果待确认的任务才可标记已核查",conflict:"任务状态已变化，请刷新后重试"};
+      return bad(errors[result.error]||"处理失败",result.status);
+    }
+    await audit(env,"admin","acknowledge_uncertain_outbox",String(result.task.id),
+      {chat:result.task.chat_id,template:result.task.template_key});
+    return json({ok:true,note:"该通知已标记为人工核查完成，不会重新发送，也未被错误标记为已送达。"});
   }
   if(method==="GET"&&path==="/api/outbox"){
     const q=new URL(req.url).searchParams;
