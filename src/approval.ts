@@ -98,10 +98,11 @@ async function etherscanApprovalLogs(env,spender,from,to){
   }
   throw Error("Etherscan backup single block exceeds safe pagination limit");
 }
-async function fetchApprovalLogs(env,spender,from,to,preferBackup){
+async function fetchApprovalLogs(env,spender,from,to,preferBackup,head){
   const params=[{address:USDT,fromBlock:"0x"+from.toString(16),toBlock:"0x"+to.toString(16),
     topics:[APPROVAL_TOPIC,null,toTopic(spender)]}];
   if(preferBackup){
+    if(to>head-12)throw Error("Etherscan indexing buffer: wait for recent blocks");
     try{return {logs:await etherscanApprovalLogs(env,spender,from,to),provider:"etherscan"};}
     catch(backupErr){
       const logs=await rpc(env,"eth_getLogs",params);
@@ -114,7 +115,7 @@ async function fetchApprovalLogs(env,spender,from,to,preferBackup){
     if(!Array.isArray(logs))throw Error("Invalid RPC logs");
     return {logs,provider:"alchemy"};
   }catch(rpcError){
-    if(!env.ETHERSCAN_API_KEY)throw rpcError;
+    if(!env.ETHERSCAN_API_KEY||to>head-12)throw rpcError;
     try{return {logs:await etherscanApprovalLogs(env,spender,from,to),provider:"etherscan"};}
     catch(backupErr){throw Error("Alchemy "+String(rpcError.message||rpcError).slice(0,90)+"; backup "+String(backupErr.message||backupErr).slice(0,125));}
   }
@@ -139,10 +140,12 @@ export async function pollSpenders(env){
     if(!Number.isSafeInteger(window)||window<1||window>256)window=32;
     let attempted=0;
     for(let cycle=0;cycle<8&&cursor<head;cycle++){
-      const from=cursor+1,to=Math.min(head,from+window-1);
+      const from=cursor+1,safeHead=preferBackup?Math.max(0,head-12):head;
+      if(from>safeHead)break;
+      const to=Math.min(safeHead,from+window-1);
       let logs,provider;
       try{
-        ({logs,provider}=await fetchApprovalLogs(env,rule.spender,from,to,preferBackup));
+        ({logs,provider}=await fetchApprovalLogs(env,rule.spender,from,to,preferBackup,head));
       }catch(e){
         const reason=String(e.message||e).slice(0,220);
         if(window>1){
