@@ -40,13 +40,24 @@ export async function provisionRealtimeApprovals(env){
     const existing=(Array.isArray(raw?.data)?raw.data:Array.isArray(raw)?raw:[])
       .filter(x=>x.webhook_url===url&&x.network==="ETH_MAINNET"&&x.webhook_type==="GRAPHQL");
     if(existing.length){
-      await status(env,{state:"needs_key",reason:"Custom webhook already exists; missing signing key",id:existing[0].id});
-      return {status:"needs_existing_signing_key"};
+      const wh=existing[0];
+      if(!wh.signing_key)throw Error("Custom webhook exists but signing key unavailable; configure it manually");
+      await persistSecret(env,"ALCHEMY_APPROVAL_SIGNING_KEY",wh.signing_key);
+      await persistSecret(env,"ALCHEMY_APPROVAL_WEBHOOK_ID",wh.id);
+      env.ALCHEMY_APPROVAL_SIGNING_KEY=wh.signing_key;env.ALCHEMY_APPROVAL_WEBHOOK_ID=wh.id;
+      if(wh.is_active===false){
+        const enable=await fetch("https://dashboard.alchemy.com/api/update-webhook",{method:"PUT",
+          headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
+          body:JSON.stringify({webhook_id:wh.id,is_active:true})});
+        if(!enable.ok)throw Error("Existing custom webhook enable HTTP "+enable.status);
+      }
+      await status(env,{state:"active",id:wh.id,spender_count:spenders.length});
+      return {status:"reused",active:true};
     }
     const res=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
       method:"POST",headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
       body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"GRAPHQL",name:"MS007 USDT Spender Approval Seconds",
-        webhook_url:url,graphql_query:approvalQuery(spenders)})
+        webhook_url:url,graphql_query:{query:approvalQuery(spenders),skip_empty_messages:true}})
     });
     const body=await res.json(),created=body?.data||body;
     if(!res.ok||!created?.id||!created?.signing_key)
@@ -55,9 +66,15 @@ export async function provisionRealtimeApprovals(env){
     await persistSecret(env,"ALCHEMY_APPROVAL_WEBHOOK_ID",created.id);
     env.ALCHEMY_APPROVAL_WEBHOOK_ID=created.id;
     env.ALCHEMY_APPROVAL_SIGNING_KEY=created.signing_key;
-    await status(env,{state:created.is_active===false?"created_inactive":"active",id:created.id,
-      spender_count:spenders.length,active:created.is_active});
-    return {status:"created",active:created.is_active};
+    if(created.is_active===false){
+      const enabled=await fetch("https://dashboard.alchemy.com/api/update-webhook",{
+        method:"PUT",headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
+        body:JSON.stringify({webhook_id:created.id,is_active:true})
+      });
+      if(!enabled.ok)throw Error("Custom webhook created but activation HTTP "+enabled.status);
+    }
+    await status(env,{state:"active",id:created.id,spender_count:spenders.length,active:true});
+    return {status:"created",active:true};
   }catch(e){
     await status(env,{state:"error",reason:String(e.message||e).slice(0,210)});
     await env.DB.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES('approval_realtime_retry_after',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
