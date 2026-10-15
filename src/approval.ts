@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
 import {recordSpenderLiveApproval} from "./spender-history";
+import {renderTemplate} from "./notifications";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
 export async function ownerSpenders(env,owner){
@@ -43,7 +44,7 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   await env.DB.prepare("INSERT INTO query_history(user_id,chat_id,address,result) VALUES(?,?,?,?)")
     .bind(String(user_id),String(chat_id),owner,positives.length?"authorized":"no_effective_allowance").run();
   if(!positives.length){
-    await send(env,chat_id,"🔎 <b>USDT 授权核验完成</b>\n地址：<code>"+owner+"</code>\n未发现当前有效授权，因此未自动启动资金监控。");
+    await send(env,chat_id,await renderTemplate(env,"query_inactive",chat_id,{address:owner}));
     return;
   }
   await env.DB.prepare("INSERT OR IGNORE INTO wallets(address,first_user_id,first_user_name,discovery_source) VALUES(?,?,?,'manual')")
@@ -56,10 +57,13 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id),owner).run();
   const current=await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id),owner).first();
   const groupRemark=current?.remark||first?.first_user_name||display_name;
-  const lines=positives.slice(0,25).map((x,i)=>(i+1)+". <code>"+x.spender+"</code>\n额度："+(BigInt(x.amount)>=(1n<<255n)?"无限":formatUnits(x.amount,6)+" USDT"));
-  await send(env,chat_id,"🛡️ <b>USDT 有效授权</b>\n备注："+esc(groupRemark)+"\n地址：<code>"+owner+"</code>\n"+
-   lines.join("\n")+(positives.length>25?"\n另有 "+(positives.length-25)+" 项有效授权，请在后台查看。":"")+
-   "\n资金监控："+(watched?"✅ ETH / USDT / USDC 已启动":"⚠️ 等待 Alchemy 订阅同步，尚未正式启动"),buttons(owner));
+  const lines=positives.slice(0,25).map((x,i)=>(i+1)+". <code>"+esc(x.spender)+"</code>\n额度："+(BigInt(x.amount)>=(1n<<255n)?"无限":formatUnits(x.amount,6)+" USDT"));
+  const output=await renderTemplate(env,"query_active",chat_id,{
+    remark:groupRemark,address:owner,
+    more_count:positives.length>25?"\n另有 "+(positives.length-25)+" 项有效授权，请在后台查看。":"",
+    watch_status:watched?"✅ ETH / USDT / USDC 已启动":"⚠️ 等待 Alchemy 订阅同步，尚未正式启动"
+  },{approval_list:lines.join("\n")});
+  await send(env,chat_id,output,buttons(owner));
   await increment(env,"wallet_lookups");
 }
 export async function addSpender(env,spender,remark,chat_ids){
