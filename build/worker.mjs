@@ -136,15 +136,15 @@ async function persistSecret(env, keyName, value) {
   await env.DB.prepare("INSERT INTO setup_secrets(key,encrypted_value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET encrypted_value=excluded.encrypted_value,updated_at=CURRENT_TIMESTAMP").bind(keyName, await encrypt(env, value)).run();
 }
 async function status(env) {
-  const configured2 = new Set(((await env.DB.prepare("SELECT key FROM setup_secrets").all()).results || []).map((x) => x.key));
+  const configured = new Set(((await env.DB.prepare("SELECT key FROM setup_secrets").all()).results || []).map((x) => x.key));
   const ready = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value === "1";
-  return { active: ready, keys: Object.fromEntries(SECRET_KEYS.map((k) => [k, configured2.has(k) || !!env[k]])), needs: [
+  return { active: ready, keys: Object.fromEntries(SECRET_KEYS.map((k) => [k, configured.has(k) || !!env[k]])), needs: [
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
     "ALCHEMY_RPC_URL",
     "ALCHEMY_NOTIFY_TOKEN",
     "ETHERSCAN_API_KEY"
-  ].filter((k) => !configured2.has(k)) };
+  ].filter((k) => !configured.has(k)) };
 }
 async function setupApi(req, env, path) {
   if (path === "/api/setup/status" && req.method === "GET") return json(await status(env));
@@ -2185,22 +2185,22 @@ var index_default = {
       if (req.method === "GET" && path === "/admin") return new Response(adminHtml(), { headers: { "content-type": "text/html;charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" } });
       if (path.startsWith("/api/")) return await handleAdmin(req, env, path);
       const active = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value === "1";
-      const configured2 = active ? await configEnv(env) : env;
+      const configured = active ? await configEnv(env) : env;
       if (req.method === "POST" && path === "/webhooks/telegram") {
         if (!active) return json({ error: "Monitor is not enabled" }, 503);
-        if (!configured2.TELEGRAM_WEBHOOK_SECRET || req.headers.get("x-telegram-bot-api-secret-token") !== configured2.TELEGRAM_WEBHOOK_SECRET) return json({ error: "Unauthorized" }, 401);
+        if (!configured.TELEGRAM_WEBHOOK_SECRET || req.headers.get("x-telegram-bot-api-secret-token") !== configured.TELEGRAM_WEBHOOK_SECRET) return json({ error: "Unauthorized" }, 401);
         const upd = await req.json();
         if (!Number.isSafeInteger(upd.update_id)) return json({ error: "Invalid update" }, 400);
         const seen = await env.DB.prepare("SELECT 1 FROM telegram_updates WHERE update_id=?").bind(upd.update_id).first();
         if (seen) return json({ ok: true, duplicate: true });
-        await handleTelegram(configured2, upd);
+        await handleTelegram(configured, upd);
         await env.DB.prepare("INSERT OR IGNORE INTO telegram_updates(update_id) VALUES(?)").bind(upd.update_id).run();
         return json({ ok: true });
       }
       if (req.method === "POST" && path === "/webhooks/alchemy") {
         if (!active) return json({ error: "Monitor is not enabled" }, 503);
         const raw = await req.text();
-        if (!await verifyAlchemy(configured2, raw, req.headers.get("x-alchemy-signature"))) return json({ error: "Invalid webhook signature" }, 401);
+        if (!await verifyAlchemy(configured, raw, req.headers.get("x-alchemy-signature"))) return json({ error: "Invalid webhook signature" }, 401);
         const d = JSON.parse(raw);
         await env.TASKS.send({ kind: "activity", payload: d });
         return json({ ok: true });
@@ -2214,22 +2214,23 @@ var index_default = {
   async queue(batch, env, ctx) {
     for (const message of batch.messages) {
       const item = message.body;
+      let configured = env;
       try {
         const active = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value === "1";
         if (!active) {
           message.retry({ delaySeconds: 120 });
           continue;
         }
-        const configured2 = await configEnv(env);
+        configured = await configEnv(env);
         if (item.kind === "check") {
-          await checkOwner(configured2, item.owner, item.chat_id, item.user_id, item.display_name);
+          await checkOwner(configured, item.owner, item.chat_id, item.user_id, item.display_name);
           try {
-            await finishAddressQueryCleanup(configured2, item);
+            await finishAddressQueryCleanup(configured, item);
           } catch (cleanErr) {
             console.warn("Address query cleanup deferred", String(cleanErr));
           }
-        } else if (item.kind === "activity") await processActivity(configured2, item.payload);
-        else if (item.kind === "verify_admin") await verifyAdminOwner(configured2, item.owner, item.chat_id);
+        } else if (item.kind === "activity") await processActivity(configured, item.payload);
+        else if (item.kind === "verify_admin") await verifyAdminOwner(configured, item.owner, item.chat_id);
         else throw Error("Unknown queue message kind");
         message.ack();
       } catch (e) {
@@ -2252,26 +2253,26 @@ var index_default = {
     }
   },
   async scheduled(event, env, ctx) {
-    const configured2 = await configEnv(env);
+    const configured = await configEnv(env);
     ctx.waitUntil((async () => {
       try {
-        await collectUsage(configured2);
-        await runUsageAlerts(configured2);
-        await flushOutbox(configured2, 10, true);
+        await collectUsage(configured);
+        await runUsageAlerts(configured);
+        await flushOutbox(configured, 10, true);
       } catch (e) {
         console.error("Usage maintenance failed", String(e));
       }
     })());
     ctx.waitUntil((async () => {
       try {
-        await flushMessageCleanup(configured2, 60);
+        await flushMessageCleanup(configured, 60);
       } catch (e) {
         console.warn("Telegram message cleanup maintenance", String(e));
       }
     })());
     ctx.waitUntil((async () => {
       const active = (await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value === "1";
-      if (active) await cron(configured2);
+      if (active) await cron(configured);
     })());
   }
 };
