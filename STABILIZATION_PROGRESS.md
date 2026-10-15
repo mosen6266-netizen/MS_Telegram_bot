@@ -160,3 +160,17 @@
 - `docs/RELEASE_AND_ROLLBACK.md` 已加入新验收门槛、正式 Cloudflare 沙盒/预发布外部联调要求。
 - 当前仅修改 `stabilization/2026-10-15-p0`，**未合并 main，未修改生产 Worker/D1**。本轮文档/工作流最终 CI 需在下次继续前核实。
 - **下一步**：搭建与正式环境隔离的 Cloudflare 预发布 Worker + D1 + Queue，验证真正的 Telegram / Alchemy 接入与 Cron（不得复制生产密钥或混用生产 Webhook）；继续修复剩余列表/按钮的重复渲染、UI 搜索保存性能，以及用量汇总 N+1 查询和正式发布回滚演练。
+
+## 2026-10-15 第十轮：用量性能、采集原子性及预发布资源隔离
+
+- **接续核验**：第九轮末次进度提交 `d76bee3dd3a74f8c0477e0ac9640f7c6e5414dd1` GitHub CI 双份均为成功；`main` 未合并，生产 Worker/D1 未修改。
+- **费用查询消除 N+1 往返**：`src/usage.ts` 的 `usageSnapshot` 将样本/平台错误/GitHub 信息放入一次 `D1.batch`，再将所有指标的账期内历史增量基准放入第二次 `D1.batch`，避免按每个指标连续单独访问数据库。原先的 15 分钟至 24 小时有效观测范围、同账期/同来源匹配、80% 和 7 天预警判断保持不变。
+- `tests/usage-snapshot-batch.test.mjs`：仪器化真实 Miniflare/D1 `batch` 调用次数，9 项有样本时严格为两轮数据库往返；验证 80%/7 天预警、跨账期/来源误基准拒绝、采集失败不报警，样本为空时只读取一次。
+- **采集批量写入**：Cloudflare 账号的 6 项指标和本程序内部计数均改为按采集来源汇总后通过一次 `D1.batch` 写入，避免部分 Cloudflare 指标先更新、剩余更新失败导致的混杂快照，并减少数据库请求；Alchemy 单项样本路径保持兼容。
+- `tests/usage-atomic-collect.test.mjs`：故意对其中一个 Cloudflare 指标添加 D1 中止触发器，验证其他 Cloudflare 指标不会部分提交；解除故障后可重新采集、清除采集错误。原有 `tests/usage.test.mjs` 继续验证预警与通知真实 D1 回归。
+- **首页跳转**：`src/admin-ui.ts` 的 Overview 首屏统计和启动状态改为 `Promise.all` 并行请求，避免两个 HTTP 接口串行等待。
+- **预发布防误操作**：现有 `wrangler.jsonc` 是生产资源配置（含真实 D1 ID、Queue 名、Worker 地址），不得直接用于测试部署。新增 `wrangler.staging.example.jsonc`（非可部署占位符）、`scripts/verify-staging-config.mjs`（安全校验）、`tests/staging-isolation-config.test.mjs`（生产 Worker/D1/Queue/回调复用、明文密钥与 Cron 都必须拒绝）。专属 `wrangler.staging.jsonc` 加入 `.gitignore`。
+- 新增 `docs/ISOLATED_STAGING.md`、更新 `docs/RELEASE_AND_ROLLBACK.md`，明确必须先分别创建全新 Cloudflare Worker/D1/Queue、专用 Telegram Bot 和 Alchemy Webhook，用独立测试账号/凭证运行，再进行**真正云端预发布**。
+- **验证记录**：数据与性能改动提交 `72a6526f92398f679a08b93b872ee933f663d11b` 已双 CI 成功；预发布独立配置验证及手册 `5cc88a73e77f8783bf6fe4e8a6fe1596356cc5fe` 已双 CI 成功。最近几个仅文档/.gitignore 提交的 CI 还在运行，下一轮须确认。
+- **当前严格边界**：只操作 `stabilization/2026-10-15-p0`；未部署生产或预发布 Cloudflare、未创建任何云端新资源、未改生产 D1/Queue、未合并 `main`。
+- **下一步**：在得到独立预发布资源所需权限与用户同意后，按文档创建和验证云端测试环境；在此之前可继续针对剩余页面交互、历史列表查询性能、队列异常和用量长周期测试进行纯开发分支修复。绝不可把 GitHub 绿色 CI 当作生产完整验收。
