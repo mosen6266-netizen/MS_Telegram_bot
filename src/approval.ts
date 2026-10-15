@@ -2,6 +2,7 @@
 import {USDT,APPROVAL_TOPIC,addr,toTopic,fromTopic,allowance,blockNumber,rpc,formatUnits,esc,short,send,buttons,queueNotice,ensureWatch,increment,recordUsage,receiptSuccess,now} from "./core";
 import {recordSpenderLiveApproval} from "./spender-history";
 import {walletRemark} from "./wallet-remarks";
+import {sourceInsert} from "./subscription-sources";
 import {renderTemplate} from "./notifications";
 
 // Etherscan V2 log indexing is essential for discovery. No 'no approval' claim is made on incomplete scans.
@@ -55,6 +56,7 @@ export async function checkOwner(env, owner, chat_id, user_id, display_name){
   const first=await env.DB.prepare("SELECT first_user_name FROM wallets WHERE address=?").bind(owner).first();
   const sharedRemark=await walletRemark(env,owner,first?.first_user_name||display_name);
   await env.DB.prepare("INSERT INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending') ON CONFLICT(chat_id,address) DO UPDATE SET status=CASE WHEN status='removed' THEN 'pending' ELSE status END").bind(String(chat_id),owner,sharedRemark).run();
+  await sourceInsert(env.DB,chat_id,owner,"manual",String(user_id)).run();
   const watched=await ensureWatch(env,owner);
   if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE chat_id=? AND address=? AND status='pending'").bind(String(chat_id),owner).run();
   const current=await env.DB.prepare("SELECT remark FROM subscriptions WHERE chat_id=? AND address=?").bind(String(chat_id),owner).first();
@@ -117,6 +119,7 @@ async function processApproval(env,rule,log){
       if(!exists)continue;
       const remark=await walletRemark(env,owner,"待备注 · "+short(owner));
       await env.DB.prepare("INSERT OR IGNORE INTO subscriptions(chat_id,address,remark,status) VALUES(?,?,?,'pending')").bind(chat,owner,remark).run();
+      await sourceInsert(env.DB,chat,owner,"spender",rule.spender).run();
     }
     const watched=await ensureWatch(env,owner,Number(BigInt(log.blockNumber)));
     if(watched)await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
