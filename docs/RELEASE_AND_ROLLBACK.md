@@ -55,6 +55,15 @@
 - 若 Alchemy 已成功增删监控地址而 D1 回滚到旧快照，应先做远端只读对账，不要自动批量删除监听地址。
 - 立即停用新功能不等于删除对应的钱包与 Telegram 订阅，禁止直接重置生产 D1。
 
+## Telegram 投递不确定性验收（强制）
+
+- [ ] 在隔离 Worker 中模拟 Telegram **HTTP 429 明确拒绝**，只对确定拒绝的请求继续按原限流冷却和最多五次重试。
+- [ ] 模拟 Telegram 网络超时、断连和收发响应丢失：必须将通知标记 `delivery_unknown`，不得自动重发。
+- [ ] 模拟 Telegram 已返回消息 ID，但 D1 写入 sent 失败：必须标记 `delivery_unknown`，不可误判为 pending；中断恢复超过 10 分钟同样进入该状态。
+- [ ] 后台首页和通知队列显示待人工核查数量；仅管理员可以按 ID 明确重新排队或标记 `acknowledged`，两个操作均有审计记录。
+- [ ] 重发前必须由管理员核对目标群聊天记录，理解可能重复发送的风险；`acknowledged` 表示“人工核查完成”，**不能**伪装成 Telegram 已确认送达。
+- [ ] 执行 `tests/telegram-uncertain-delivery.test.mjs`、`tests/outbox-lease.test.mjs`、`tests/failed-outbox-retry.test.mjs` 和完整 Worker 权限回归。生产环境 Telegram 真正的送达结果依然必须人工核实，不能用本地模拟代替。
+
 ## 4. 发布后明确验收条件
 
 - [ ] 生产中既有的所有 Spender、钱包、Telegram 群组、备注、模板和历史交易行数无意外下降。
