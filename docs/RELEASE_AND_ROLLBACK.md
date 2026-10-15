@@ -21,7 +21,10 @@
 - [ ] 使用实际 D1 `PRAGMA table_info`、`PRAGMA foreign_key_check`、`SELECT count(*)` 检查迁移结果。
 - [ ] 运行 `tests/in-place-upgrade-rehearsal.test.mjs`：基于旧架构的非空模拟 D1，升级后比较监控、旧订阅、通知队列、审计和 Spender 断点；验证索引和外键。
 - [ ] 运行 `tests/admin-listing.test.mjs`：验证超过 200 条的钱包、订阅、链上交易和审计记录可分页/搜索，保留旧数据。
-- [ ] **注意**：现有 `.github/workflows/smoke.yml` 只检查生产 Worker 的健康与身份初始化接口，无法证明本次 PR 的新代码在隔离预发布环境能正常运行；不要将其显示为预发布端到端验收通过。
+- [ ] 运行 `tests/full-worker-preflight.test.mjs`：直接启动构建后的完整 Worker（隔离 Miniflare + D1），验证真实请求路由、管理员会话、CSRF、接口分页、统一备注写入、审计记录。**仅使用模拟数据及测试会话，不访问生产服务**。
+- [ ] 运行 `tests/admin-ui-remark-save.test.mjs`：确认备注保存不整页重绘、不丢其他行输入，连续点击、保存异常可恢复。
+- [ ] CI 通过后必须另在独立 Cloudflare 预发布部署验证真实绑定、Queues/Webhook 与外部服务沙盒；不能仅凭本地模拟测试认定已通过实际部署验收。
+- [ ] **注意**：现有 `.github/workflows/smoke.yml`（Production Liveness Check，仅 main 更新或手动触发）只检查生产 Worker 的健康与身份初始化接口，无法证明本次 PR 的新代码在隔离预发布环境能正常运行；不要将其显示为预发布端到端验收通过。
 - [ ] 验证旧 `subscriptions` 被标记为 `legacy` 且未被取消，现有监控/通知不丢失。
 - [ ] 新版 Worker 在**隔离预发布环境**通过健康检查、管理员登录、查询/修改备注、Spender 创建/编辑/删除（含删除期间扫描和相同地址重建）、Alchemy webhook 模拟、Telegram outbox 发送模拟、Cron 恢复和限流测试。
 - [ ] 确定生产部署时间窗口及负责验收的管理员，事先告知现有监控风险。
