@@ -23,7 +23,7 @@ async function cron(env){
   try{await verifyHistoricalAllowances(env,8);}catch(e){console.error("Historical allowance checks",String(e))}
   try{await enrollHistoricalOwners(env,20);}catch(e){console.error("Historical monitoring enrollment",String(e))}
   try{await reconcileAlchemyAddresses(env);}catch(e){console.error("Alchemy address reconciliation",String(e))}
-  try{await scanWalletGaps(env,3);}catch(e){console.error("Transfer recovery",String(e))}
+  try{await scanWalletGaps(env,8);}catch(e){console.error("Transfer recovery",String(e))}
   try{await reconcileRecentReorgs(env);}catch(e){console.error("Reorg checks",String(e))}
   await flushOutbox(env,40);
   await env.DB.prepare("DELETE FROM remark_sessions WHERE expires_at<datetime('now')").run();
