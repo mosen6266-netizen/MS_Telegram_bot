@@ -2014,7 +2014,7 @@ async function handleAdmin(req, env, path) {
     const args = [...status2 === "all" ? [] : [status2], ...search ? ["%" + search + "%", "%" + search + "%"] : []];
     const countQuery = env.DB.prepare("SELECT COUNT(*) n FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where).bind(...args);
     const rowsQuery = env.DB.prepare(
-      "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'\u5F85\u5907\u6CE8') AS remark,(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where + " ORDER BY ww.updated_at DESC LIMIT 50 OFFSET ?"
+      "SELECT ww.address,ww.state,ww.synced_at,ww.updated_at,ww.last_error,w.discovery_source,w.first_user_name,COALESCE(g.remark,(SELECT s.remark FROM subscriptions s WHERE s.address=ww.address ORDER BY s.updated_at DESC LIMIT 1),w.first_user_name,'\u5F85\u5907\u6CE8') AS remark,(SELECT GROUP_CONCAT(DISTINCT COALESCE(c.title,s.chat_id)) FROM subscriptions s LEFT JOIN telegram_chats c ON c.chat_id=s.chat_id WHERE s.address=ww.address AND s.status IN ('active','pending')) AS groups,(SELECT COUNT(*) FROM subscriptions s WHERE s.address=ww.address AND s.status='active') AS active_groups,(SELECT COUNT(*) FROM spender_history_addresses h WHERE h.owner=ww.address) AS history_spenders FROM wallet_watches ww LEFT JOIN wallets w ON w.address=ww.address LEFT JOIN wallet_global_remarks g ON g.address=ww.address WHERE " + where + " ORDER BY ww.updated_at DESC,ww.address ASC LIMIT 50 OFFSET ?"
     ).bind(...args, page * 50);
     const summaryQuery = env.DB.prepare("SELECT state,COUNT(*) n FROM wallet_watches WHERE state IN ('active','pending','removal_pending') GROUP BY state");
     const alchemyQuery = env.DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_address_reconcile_result'");
@@ -2113,7 +2113,7 @@ async function handleAdmin(req, env, path) {
     const countsQuery = env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verify_status='active' THEN 1 ELSE 0 END),0) AS active, COALESCE(SUM(CASE WHEN verify_status='revoked' THEN 1 ELSE 0 END),0) AS revoked, COALESCE(SUM(CASE WHEN verify_status='pending' THEN 1 ELSE 0 END),0) AS pending FROM spender_history_addresses WHERE spender=?").bind(spender);
     const filter = status2 === "all" ? "" : " AND h.verify_status=?";
     const args = status2 === "all" ? [spender, 50, page * 50] : [spender, status2, 50, page * 50];
-    const rowsQuery = env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?" + filter + " ORDER BY h.latest_event_block DESC LIMIT ? OFFSET ?").bind(...args);
+    const rowsQuery = env.DB.prepare("SELECT h.owner,h.first_seen_block,h.latest_event_block,h.latest_tx_hash,h.last_event_amount_raw,h.current_allowance_raw,h.verify_status,h.verified_at,t.approval_at,g.remark,COALESCE(e.state,'waiting') monitor_state FROM spender_history_addresses h LEFT JOIN spender_history_timestamps t ON t.spender=h.spender AND t.owner=h.owner LEFT JOIN wallet_global_remarks g ON g.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?" + filter + " ORDER BY h.latest_event_block DESC,h.owner ASC LIMIT ? OFFSET ?").bind(...args);
     const monitorQuery = env.DB.prepare(
       "SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN ww.state='active' THEN 1 ELSE 0 END),0) watched,COALESCE(SUM(CASE WHEN e.state='active' THEN 1 ELSE 0 END),0) connected,COALESCE(SUM(CASE WHEN e.state='retrying' THEN 1 ELSE 0 END),0) retrying FROM spender_history_addresses h LEFT JOIN wallet_watches ww ON ww.address=h.owner LEFT JOIN spender_history_monitor_enrollments e ON e.spender=h.spender AND e.owner=h.owner WHERE h.spender=?"
     ).bind(spender);
@@ -2209,7 +2209,7 @@ async function handleAdmin(req, env, path) {
         env,
         req,
         "SELECT COUNT(*) n FROM subscriptions",
-        "SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 50 OFFSET ?"
+        "SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC,s.address ASC,s.chat_id ASC LIMIT 50 OFFSET ?"
       );
     return json((await env.DB.prepare("SELECT s.*,c.title FROM subscriptions s LEFT JOIN telegram_chats c USING(chat_id) ORDER BY s.updated_at DESC LIMIT 200").all()).results);
   }
@@ -2272,7 +2272,7 @@ async function handleAdmin(req, env, path) {
         env,
         req,
         "SELECT COUNT(*) n FROM transfer_events",
-        "SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 50 OFFSET ?"
+        "SELECT * FROM transfer_events ORDER BY block_number DESC,event_id DESC LIMIT 50 OFFSET ?"
       );
     return json((await env.DB.prepare("SELECT * FROM transfer_events ORDER BY block_number DESC LIMIT 200").all()).results);
   }
