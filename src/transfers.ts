@@ -1,57 +1,92 @@
 // @ts-nocheck
-import {USDT,USDC,addr,esc,receiptSuccess,queueNotice,increment} from "./core";
-const asNum=x => typeof x==="string" && x.startsWith("0x")?Number(BigInt(x)):Number(x||0);
+import {USDT,USDC,addr,receiptSuccess,queueNotice,increment} from "./core";
+
+// Alchemy can label an ERC-20 transfer as either "erc20" (Transfers API)
+// or "token" (Address Activity webhook). Match contracts, not token symbols.
 function identify(a){
   const category=String(a.category||"").toLowerCase();
-  if(category==="external"||category==="internal")return {asset:"ETH", decimals:18};
-  if(category!=="erc20")return null;
-  const contract=addr(a.rawContract?.address||a.contractAddress||"");
-  if(contract===USDT)return {asset:"USDT",decimals:6};
-  if(contract===USDC)return {asset:"USDC",decimals:6};
+  if(category==="external"||category==="internal")return {asset:"ETH",kind:category,decimals:18};
+  if(category!=="erc20"&&category!=="token")return null;
+  const contract=addr(a.rawContract?.address||a.contractAddress||a.log?.address||"");
+  if(contract===USDT)return {asset:"USDT",kind:"erc20",decimals:6};
+  if(contract===USDC)return {asset:"USDC",kind:"erc20",decimals:6};
   return null;
 }
-function displayAmount(a,asset){
-  // Alchemy activity.value is a provider-supplied token-denominated decimal.
-  // Never convert token amounts through JS floating point for arithmetic.
-  if(a.value!==undefined && a.value!==null) return String(a.value);
-  const raw=a.rawContract?.rawValue;
-  if(raw!==undefined && raw!==null){
-    let n=BigInt(raw),d=asset==="ETH"?18:6,txt=n.toString().padStart(d+1,"0");
-    return txt.slice(0,-d)+(txt.slice(-d).replace(/0+$/,"")?"."+txt.slice(-d).replace(/0+$/,""):"");
+function amount(a,decimals){
+  // Prefer raw integer precision. Alchemy 'value' can be a JS number and
+  // loses precision for large balances or transfers.
+  const raw=a.rawContract?.rawValue??a.rawContract?.value;
+  if(raw!==null&&raw!==undefined){
+    const digits=BigInt(raw).toString().padStart(decimals+1,"0");
+    const fraction=digits.slice(-decimals).replace(/0+$/,"");
+    return digits.slice(0,-decimals)+(fraction?"."+fraction:"");
   }
+  if(a.value!==null&&a.value!==undefined)return String(a.value);
   return "未知";
 }
+function indexValue(value){
+  if(value===undefined||value===null||value==="")return null;
+  try{
+    const n=BigInt(value);
+    return n>=0n?n.toString():null;
+  }catch{return null;}
+}
+function transferKey(a,kind,hash,asset,from,to){
+  // The same ERC-20 log arrives as "token" in Webhooks and "erc20" in
+  // historical Transfers API. Both must produce the same outbox dedup key.
+  if(kind==="erc20"){
+    const unique=String(a.uniqueId||"");
+    const suffix=unique.startsWith(hash+":")?unique.slice(hash.length+1):null;
+    const logIndex=indexValue(a.log?.logIndex??a.logIndex??suffix);
+    if(logIndex!==null)return "tx:"+hash+":erc20:"+asset+":"+logIndex;
+    // If the provider omitted log index, retain its unique ID, otherwise
+    // derive a best-effort key without collapsing all same-hash transfers.
+    return "tx:"+hash+":erc20:"+asset+":"+(unique||from+":"+to+":"+String(a.rawContract?.rawValue??a.rawContract?.value??a.value));
+  }
+  if(kind==="external")return "tx:"+hash+":external:ETH";
+  return "tx:"+hash+":internal:ETH:"+(a.typeTraceAddress||a.uniqueId||from+":"+to+":"+String(a.rawContract?.rawValue??a.value));
+}
+
 export async function processActivity(env,payload){
   const event=payload.event||{};
   if(event.network && event.network!=="ETH_MAINNET")throw Error("Not Ethereum mainnet activity");
   if(payload.network && payload.network!=="ETH_MAINNET")throw Error("Invalid source network");
   const activities=event.activity||[];
+  if(!Array.isArray(activities))throw Error("Invalid Alchemy activity list");
   for(const a of activities){
-    const asset=identify(a); if(!asset)continue;
-    const from=addr(a.fromAddress),to=addr(a.toAddress);
+    const asset=identify(a);if(!asset)continue;
+    const from=addr(a.fromAddress||a.from),to=addr(a.toAddress||a.to);
     if(!from||!to)continue;
-    const hash=a.hash||a.transactionHash;
-    if(!/^0x[a-fA-F0-9]{64}$/.test(hash||""))continue;
+    const hash=String(a.hash||a.transactionHash||"").toLowerCase();
+    if(!/^0x[a-f0-9]{64}$/.test(hash))continue;
+    if(a.log?.removed===true)continue;
     const success=await receiptSuccess(env,hash);
-    if(success!==true)continue;
-    const baseId="tx:"+hash+":"+(a.uniqueId||a.logIndex||a.category+":"+from+":"+to+":"+a.rawContract?.rawValue);
-    const block=asNum(a.blockNum||a.blockNumber);
-    const val=displayAmount(a,asset.asset);
-    // Self transfers are recorded once, not twice.
+    // An unindexed receipt is transient: retry the *entire* webhook payload.
+    // Previously we acknowledged and permanently lost these transactions.
+    if(success===null)throw Error("Transaction receipt not indexed yet; retry this activity payload");
+    if(success===false)continue;
+    const baseId=transferKey(a,asset.kind,hash,asset.asset,from,to);
+    const rawBlock=a.blockNum??a.blockNumber??a.log?.blockNumber;
+    const block=typeof rawBlock==="string"&&rawBlock.startsWith("0x")?Number(BigInt(rawBlock)):Number(rawBlock);
+    if(!Number.isSafeInteger(block)||block<0)throw Error("Transaction block number missing or invalid");
+    const value=amount(a,asset.decimals);
+    // A transfer between two watched wallets records each wallet's direction.
+    // A self transfer has a single unique record and notification.
     const owners=from===to?[{address:from,direction:"自转"}]:[{address:from,direction:"转出"},{address:to,direction:"转入"}];
     for(const o of owners){
       const watch=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=? AND state='active'").bind(o.address).first();
       if(!watch)continue;
       const eventId=baseId+":"+o.address+":"+o.direction;
       const inserted=await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .bind(eventId,o.address,asset.asset,o.direction,val,from,to,hash,block,a.blockHash||null).run();
-      if(!inserted.meta?.changes)continue;
+        .bind(eventId,o.address,asset.asset,o.direction,value,from,to,hash,block,a.blockHash||a.log?.blockHash||null).run();
+      // Even if the event already exists, an earlier queueNotice() may have
+      // failed after the insert. INSERT OR IGNORE into outbox repairs it safely.
       const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
       for(const s of subs||[])await queueNotice(env,{
         dedup:eventId+":"+s.chat_id,chat_id:s.chat_id,address:o.address,template:"transfer",
-        payload:{asset:asset.asset,direction:o.direction,amount:val,from_address:from,to_address:to,tx_hash:hash,block_number:block}
+        payload:{asset:asset.asset,direction:o.direction,amount:value,from_address:from,to_address:to,tx_hash:hash,block_number:block}
       });
-      await increment(env,"transfer_events");
+      if(inserted.meta?.changes)await increment(env,"transfer_events");
     }
   }
 }
