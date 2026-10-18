@@ -52,7 +52,7 @@ export class SignalGateway extends DurableObject {
       await this.ensureStarted();
       const installed=await this.ctx.storage.get("installed");
       if(!installed){
-        const script=["set -eu","mkdir -p /opt/signal /var/lib/signal-cli","curl -fLSs --retry 3 --connect-timeout 20 "+JSON.stringify(ARCHIVE)+" -o /tmp/signal-cli.tgz","echo '"+SHA+"  /tmp/signal-cli.tgz' | sha256sum -c -","tar -xzvf /tmp/signal-cli.tgz -C /opt/signal >/tmp/extract.log","npm install --prefix /opt/qr --omit=dev --silent qrcode@1.5.4","find /opt/signal -type f -name signal-cli | head -1"].join("; ");
+        const script=["set -eu","mkdir -p /opt/signal /var/lib/signal-cli","command -v curl >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq curl ca-certificates)","curl -fLSs --retry 3 --connect-timeout 20 "+JSON.stringify(ARCHIVE)+" -o /tmp/signal-cli.tgz","echo '"+SHA+"  /tmp/signal-cli.tgz' | sha256sum -c -","tar -xzvf /tmp/signal-cli.tgz -C /opt/signal >/tmp/extract.log","npm install --prefix /opt/qr --omit=dev --silent qrcode@1.5.4","find /opt/signal -type f -name signal-cli | head -1"].join("; ");
         const result=await this.command(["sh","-c",script]);
         if(result.code!==0)return json({error:"installation_failed",details:result.stderr,output:result.stdout},503);
         const path=result.stdout.trim().split("\n").pop();if(!path)throw Error("signal-cli binary not found");
@@ -111,6 +111,17 @@ export class SignalGateway extends DurableObject {
   }
 }
 export default {
+ async scheduled(event,env,ctx){
+  const gateway=env.SIGNAL_GATEWAY.getByName("primary");
+  ctx.waitUntil((async()=>{
+   const status=await gateway.fetch("https://internal/state");
+   const state=await status.json();
+   if(!state.installed||(state.linkedAccount&&!state.running)){
+    const r=await gateway.fetch("https://internal/setup",{method:"POST"});
+    if(!r.ok)console.error("Signal runtime bootstrap",r.status,(await r.text()).slice(0,200));
+   }
+  })().catch(e=>console.error("Signal runtime scheduled bootstrap",String(e))));
+ },
  async fetch(req,env){
   const p=new URL(req.url).pathname;
   if(p==="/health")return json({service:"ethereum-signal-runtime",network:"Ethereum Mainnet",telegramIsolated:true});
