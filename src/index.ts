@@ -60,9 +60,9 @@ export default {
       if(path.startsWith("/api/signal/")){
         if(!await isAdmin(req,env))return json({error:"管理员验证失败"},401);
         const sub=path.slice("/api/signal".length);
-        if(!["/state","/setup","/link","/groups","/rpc"].includes(sub))return json({error:"Not found"},404);
+        if(!["/state","/setup","/link","/groups","/groups-selection","/rpc"].includes(sub))return json({error:"Not found"},404);
         if((sub==="/setup"||sub==="/link"||sub==="/rpc")&&req.method!=="POST")return json({error:"Method not allowed"},405);
-        if((sub==="/state"||sub==="/groups")&&req.method!=="GET")return json({error:"Method not allowed"},405);
+        if((sub==="/state"||sub==="/groups"||(sub==="/groups-selection"&&req.method==="GET"))&&req.method!=="GET")return json({error:"Method not allowed"},405);
         if(!env.SIGNAL_RUNTIME)return json({error:"Signal 网关尚未接通"},503);
         const remote=new Request("https://signal-internal"+sub,{method:req.method,
           headers:{"content-type":"application/json"},body:req.method==="POST"?await req.text():undefined});
