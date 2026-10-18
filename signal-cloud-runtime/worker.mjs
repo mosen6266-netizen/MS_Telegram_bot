@@ -7,7 +7,13 @@ const SHA="a8fab78b5e8053abf3db5725272957ad11d1745b9a16848ddb2ace4743dfa5d5";
 const json=(v,s=200)=>Response.json(v,{status:s,headers:{"cache-control":"no-store"}});
 function bearer(req,k){const s=req.headers.get("authorization")||"",v=s.startsWith("Bearer ")?s.slice(7):"";if(!k||v.length!==k.length)return false;let d=0;for(let i=0;i<k.length;i++)d|=v.charCodeAt(i)^k.charCodeAt(i);return d===0;}
 export class SignalGateway extends DurableObject {
-  constructor(ctx,env){super(ctx,env);this.busy=null;this.linkState="idle";this.linkError="";if(ctx.container?.running)void ctx.blockConcurrencyWhile(()=>ctx.container.setInactivityTimeout(21600000));}
+  constructor(ctx,env){super(ctx,env);this.busy=null;this.linkState="idle";this.linkError="";
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS signal_gateway_health (id INTEGER PRIMARY KEY, running INTEGER NOT NULL DEFAULT 0, installed INTEGER NOT NULL DEFAULT 0, daemon_ok INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    if(ctx.container?.running)void ctx.blockConcurrencyWhile(()=>ctx.container.setInactivityTimeout(21600000));}
+  recordHealth(running,installed,daemonOk,error=""){
+    try{this.ctx.storage.sql.exec("INSERT INTO signal_gateway_health(id,running,installed,daemon_ok,last_error,checked_at) VALUES(1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET running=excluded.running, installed=excluded.installed, daemon_ok=excluded.daemon_ok, last_error=excluded.last_error, checked_at=CURRENT_TIMESTAMP",running?1:0,installed?1:0,daemonOk?1:0,String(error).slice(0,180));}
+    catch(e){console.error("Gateway diagnostics write failed",String(e))}
+  }
   async ensureStarted(){
     if(this.busy)return this.busy;
     this.busy=this.startInternal().finally(()=>{this.busy=null});
@@ -44,8 +50,12 @@ export class SignalGateway extends DurableObject {
   async fetch(req){
     const u=new URL(req.url);
     if(u.pathname==="/state"){
-      return json({running:!!this.ctx.container?.running,linkedAccount:await this.ctx.storage.get("linkedAccount")||null,
-        installed:!!await this.ctx.storage.get("installed"),lastSnapshotAt:await this.ctx.storage.get("snapshotAt")||null,
+      const running=!!this.ctx.container?.running,installed=!!await this.ctx.storage.get("installed");
+      let daemonOk=false;
+      if(running&&installed){try{await this.rpc("listAccounts",{},3500);daemonOk=true}catch(e){}}
+      this.recordHealth(running,installed,daemonOk);
+      return json({running,installed,daemonHealthy:daemonOk,linkedAccount:await this.ctx.storage.get("linkedAccount")||null,
+        lastSnapshotAt:await this.ctx.storage.get("snapshotAt")||null,
         linkState:this.linkState,linkError:this.linkError});
     }
     if(u.pathname==="/setup"&&req.method==="POST"){
@@ -54,7 +64,7 @@ export class SignalGateway extends DurableObject {
       if(!installed){
         const script=["set -eu","mkdir -p /opt/signal /var/lib/signal-cli","command -v curl >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq curl ca-certificates)","curl -fLSs --retry 3 --connect-timeout 20 "+JSON.stringify(ARCHIVE)+" -o /tmp/signal-cli.tgz","echo '"+SHA+"  /tmp/signal-cli.tgz' | sha256sum -c -","tar -xzvf /tmp/signal-cli.tgz -C /opt/signal >/tmp/extract.log","npm install --prefix /opt/qr --omit=dev --silent qrcode@1.5.4","find /opt/signal -type f -name signal-cli | head -1"].join("; ");
         const result=await this.command(["sh","-c",script]);
-        if(result.code!==0)return json({error:"installation_failed",details:result.stderr,output:result.stdout},503);
+        if(result.code!==0){this.recordHealth(true,false,false,result.stderr||result.stdout);return json({error:"installation_failed",details:result.stderr,output:result.stdout},503);}
         const path=result.stdout.trim().split("\n").pop();if(!path)throw Error("signal-cli binary not found");
         await this.ctx.storage.put("binary",path);
         await this.ctx.storage.put("installed",true);
@@ -65,7 +75,9 @@ export class SignalGateway extends DurableObject {
       const run=ready?{code:0,stderr:""}:await this.command(["sh","-c","nohup "+bin+" --data-dir /var/lib/signal-cli daemon --http 0.0.0.0:8080 >/tmp/signal.log 2>&1 </dev/null & sleep 3"]);
       if(run.code!==0)return json({error:"daemon_start_failed",details:run.stderr},503);
       await this.snapshot();
-      return json({ok:true,daemon:"started"});
+      let daemonOk=false;try{await this.rpc("listAccounts",{},5000);daemonOk=true}catch(e){}
+      this.recordHealth(true,true,daemonOk,daemonOk?"":"Daemon not responding after setup");
+      return json({ok:daemonOk,daemon:daemonOk?"started":"not_responding"},daemonOk?200:503);
     }
     if(u.pathname==="/link"&&req.method==="POST"){
       await this.ensureStarted();
