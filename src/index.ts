@@ -54,7 +54,7 @@ export default {
       // but do not need to decrypt RPC, Alchemy or Telegram secrets on every
       // navigation, filter or search request. Decrypt only for live webhooks.
       if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-admin-fastpath-v1",database_configured:!!env.DB});
-      if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
+      if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
       // Signal is an isolated Worker invoked only after the existing administrator session check.
       // No Telegram monitoring, D1 writes, Queue consumer, schedule or notification code changes.
       if(path.startsWith("/api/signal/")){
