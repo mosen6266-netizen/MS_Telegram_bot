@@ -54,7 +54,20 @@ export default {
       // but do not need to decrypt RPC, Alchemy or Telegram secrets on every
       // navigation, filter or search request. Decrypt only for live webhooks.
       if(req.method==="GET"&&path==="/health")return json({service:"ethereum-usdt-monitor",network:"Ethereum Mainnet",status:"service_available",build:"2026-10-15-admin-fastpath-v1",database_configured:!!env.DB});
-      if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
+      if(req.method==="GET"&&path==="/admin")return new Response(adminHtml(),{headers:{"content-type":"text/html;charset=utf-8","cache-control":"no-store","x-frame-options":"DENY","content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
+      // Signal is an isolated Worker invoked only after the existing administrator session check.
+      // No Telegram monitoring, D1 writes, Queue consumer, schedule or notification code changes.
+      if(path.startsWith("/api/signal/")){
+        if(!await isAdmin(req,env))return json({error:"管理员验证失败"},401);
+        const sub=path.slice("/api/signal".length);
+        if(!["/state","/setup","/link","/groups","/groups-selection","/rpc"].includes(sub))return json({error:"Not found"},404);
+        if((sub==="/setup"||sub==="/link"||sub==="/rpc")&&req.method!=="POST")return json({error:"Method not allowed"},405);
+        if((sub==="/state"||sub==="/groups"||(sub==="/groups-selection"&&req.method==="GET"))&&req.method!=="GET")return json({error:"Method not allowed"},405);
+        if(!env.SIGNAL_RUNTIME)return json({error:"Signal 网关尚未接通"},503);
+        const remote=new Request("https://signal-internal"+sub,{method:req.method,
+          headers:{"content-type":"application/json"},body:req.method==="POST"?await req.text():undefined});
+        return await env.SIGNAL_RUNTIME.fetch(remote);
+      }
       if(path.startsWith("/api/"))return await handleAdmin(req,env,path);
       const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
       const configured=active?await configEnv(env):env;
