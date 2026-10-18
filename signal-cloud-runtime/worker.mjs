@@ -101,7 +101,8 @@ export default {
  async fetch(req,env){
   const p=new URL(req.url).pathname;
   if(p==="/health")return json({service:"ethereum-signal-runtime",network:"Ethereum Mainnet",telegramIsolated:true});
-  if(!bearer(req,env.SIGNAL_CONTROL_SECRET))return json({error:"unauthorized"},401);
+  // This Worker has no workers.dev or public route; only an admin-authenticated service binding calls it.
+  if(env.SIGNAL_CONTROL_SECRET&&!bearer(req,env.SIGNAL_CONTROL_SECRET))return json({error:"unauthorized"},401);
   if(!["/state","/setup","/link","/groups","/rpc"].includes(p))return json({error:"not_found"},404);
   const stub=env.SIGNAL_GATEWAY.getByName("primary");
   return stub.fetch(new Request("https://runtime.internal"+p,{method:req.method,body:req.body,headers:{"content-type":req.headers.get("content-type")||"application/json"}}));
