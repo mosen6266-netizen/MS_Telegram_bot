@@ -60,3 +60,9 @@ If an empty approvals list is not marked exhaustive=true, the bridge refuses to 
 - Rollback consists solely of stopping Signal bridge. Telegram production does not need a rollback because it has not been changed.
 
 Do NOT run wrangler deploy, apply production migrations, update production webhooks, or auto-merge this branch.
+
+## Browser account sign-in (new)
+
+A dedicated Signal web console is now implemented at http://127.0.0.1:8789/admin **on the machine running the Signal bridge**. It is not part of the Telegram Worker admin panel and will not appear on the production Telegram site. Configure SIGNAL_ADMIN_TOKEN (unique, 32+ characters), SIGNAL_CLI_RPC_URL, and launch the separate Node sidecar. Run the signal-cli daemon in **multi-account mode**, without a fixed -a account, on its isolated account directory. The admin page lets the operator enter the management secret in volatile page memory, generate a locally encoded QR, link an account via the upstream startLink/finishLink RPC pair, inspect link/daemon status, and select allowlisted Signal groups. The QR is generated locally on the bridge and is never sent to external QR services. No Telegram API credentials are used.
+
+SIGNAL_ENABLED=false and SIGNAL_DRY_RUN=true are still the safe default: signing in does **not** turn on event dispatch. To enable live Signal alerts in the future, the separate event producer must be built and tested first. Signal linked-device provisioning needs an existing Signal primary mobile app; on the phone go to Settings → Linked Devices → Link New Device and scan the QR displayed by the console. Do not scan the QR in any third-party website.
