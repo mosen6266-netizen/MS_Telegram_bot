@@ -1,0 +1,38 @@
+name: Signal isolated bridge verification
+on:
+  push:
+    branches: [feature/signal-isolated-bridge]
+    paths:
+      - "signal-bridge/**"
+      - ".github/workflows/signal-bridge.yml"
+  pull_request:
+    paths:
+      - "signal-bridge/**"
+      - ".github/workflows/signal-bridge.yml"
+permissions:
+  contents: read
+jobs:
+  verify-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Confirm production files and workflows are not modified
+        run: |
+          git fetch origin main --no-tags
+          FILES="$(git diff --name-only origin/main...HEAD)"
+          echo "$FILES"
+          if printf "%s\n" "$FILES" | grep -v -E '^(signal-bridge/|\.github/workflows/signal-bridge\.yml$)' | grep -q .; then
+            echo "ERROR: non-Signal production paths were modified."
+            exit 1
+          fi
+      - name: Install isolated Signal dependencies
+        working-directory: signal-bridge
+        run: npm install --no-audit --no-fund
+      - name: Syntax and isolated behavior checks
+        working-directory: signal-bridge
+        run: npm run check
