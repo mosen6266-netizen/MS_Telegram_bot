@@ -60,7 +60,9 @@ export class SignalGateway extends DurableObject {
         await this.ctx.storage.put("installed",true);
       }
       const bin=await this.ctx.storage.get("binary");
-      const run=await this.command(["sh","-c","pgrep -f 'signal-cli.*daemon' >/dev/null || ("+bin+" --data-dir /var/lib/signal-cli daemon --http 0.0.0.0:8080 >/tmp/signal.log 2>&1 </dev/null &); sleep 2"]);
+      let ready=false;
+      try{await this.rpc("listAccounts",{},5000);ready=true}catch{}
+      const run=ready?{code:0,stderr:""}:await this.command(["sh","-c","nohup "+bin+" --data-dir /var/lib/signal-cli daemon --http 0.0.0.0:8080 >/tmp/signal.log 2>&1 </dev/null & sleep 3"]);
       if(run.code!==0)return json({error:"daemon_start_failed",details:run.stderr},503);
       await this.snapshot();
       return json({ok:true,daemon:"started"});
@@ -87,11 +89,22 @@ export class SignalGateway extends DurableObject {
       const acct=await this.ctx.storage.get("linkedAccount");if(!acct)return json({error:"not_linked"},409);
       return json({groups:await this.rpc("listGroups",{account:acct})});
     }
+    if(u.pathname==="/groups-selection"&&req.method==="GET")return json({selected:await this.ctx.storage.get("signalGroups")||[]});
+    if(u.pathname==="/groups-selection"&&req.method==="POST"){
+      const data=await req.json();if(!Array.isArray(data?.ids)||data.ids.length>60||data.ids.some(x=>typeof x!=="string"))return json({error:"invalid_group_list"},400);
+      const acct=await this.ctx.storage.get("linkedAccount");if(!acct)return json({error:"not_linked"},409);
+      const available=new Set((await this.rpc("listGroups",{account:acct})).map(g=>g.id));
+      if(data.ids.some(id=>!available.has(id)))return json({error:"unknown_group_id"},400);
+      await this.ctx.storage.put("signalGroups",data.ids);return json({saved:data.ids.length});
+    }
     if(u.pathname==="/rpc"&&req.method==="POST"){
       await this.ensureStarted(); const input=await req.json();
       const methods=new Set(["send","listGroups","listAccounts"]);
       if(!methods.has(input.method))return json({error:"method_restricted"},403);
-      if(input.method==="send"&&(!input.params?.groupId||input.params?.account!==(await this.ctx.storage.get("linkedAccount"))))return json({error:"invalid_target"},400);
+      if(input.method==="send"){
+        const allowed=new Set(await this.ctx.storage.get("signalGroups")||[]);
+        if(!allowed.has(input.params?.groupId)||input.params?.account!==(await this.ctx.storage.get("linkedAccount")))return json({error:"invalid_target"},400);
+      }
       return json({result:await this.rpc(input.method,input.params||{})});
     }
     return json({error:"not_found"},404);
@@ -103,7 +116,7 @@ export default {
   if(p==="/health")return json({service:"ethereum-signal-runtime",network:"Ethereum Mainnet",telegramIsolated:true});
   // This Worker has no workers.dev or public route; only an admin-authenticated service binding calls it.
   if(env.SIGNAL_CONTROL_SECRET&&!bearer(req,env.SIGNAL_CONTROL_SECRET))return json({error:"unauthorized"},401);
-  if(!["/state","/setup","/link","/groups","/rpc"].includes(p))return json({error:"not_found"},404);
+  if(!["/state","/setup","/link","/groups","/groups-selection","/rpc"].includes(p))return json({error:"not_found"},404);
   const stub=env.SIGNAL_GATEWAY.getByName("primary");
   return stub.fetch(new Request("https://runtime.internal"+p,{method:req.method,body:req.body,headers:{"content-type":req.headers.get("content-type")||"application/json"}}));
  }
