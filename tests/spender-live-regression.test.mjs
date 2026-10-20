@@ -111,7 +111,8 @@ test("backend exposes realtime authorization polling failures",async()=>{
  const admin=readFileSync("src/admin.ts","utf8");
  const notification=readFileSync("src/notifications.ts","utf8");
  assert.match(admin,/spender_poll_status:/);
- assert.match(notification,/approvalAlert&&sub\.status==="pending"/);
+ assert.match(notification,/approvalAlert\|\|backedUpTransfer/);
+ assert.match(notification,/sub.status==="pending"/);
 });
 
 test("Etherscan fallback rescues Alchemy HTTP 400 and preserves scanning progress",async()=>{
