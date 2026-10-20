@@ -2,7 +2,7 @@
 import {rpc,blockNumber,USDT,USDC,now,queueNotice} from "./core";
 import {processActivity} from "./transfers";
 // Periodic, bounded transaction recovery. Fast alerts are still delivered by Alchemy Webhook.
-async function getOneDirection(env,address,direction,from,to){
+async function getOneDirection(env,address,direction,from,to,pendingRecoveryAddress=null){
   let cursor=null,loops=0,transactions=0;
   do{
     if(++loops>20)throw Error("Transfer backlog exceeds 20 pages; abort without advancing checkpoint");
@@ -20,7 +20,7 @@ async function getOneDirection(env,address,direction,from,to){
       blockNum:x.blockNum,value:x.value,category:x.category,typeTraceAddress:x.typeTraceAddress,
       rawContract:{address:x.rawContract?.address,rawValue:x.rawContract?.value}
     }));
-    await processActivity(env,{network:"ETH_MAINNET",event:{network:"ETH_MAINNET",activity:normalized}});
+    await processActivity(env,{network:"ETH_MAINNET",event:{network:"ETH_MAINNET",activity:normalized}},pendingRecoveryAddress?{pendingRecoveryAddress}:{});
     transactions+=normalized.length;cursor=page.pageKey||null;
   }while(cursor);
   return transactions;
@@ -64,4 +64,48 @@ export async function reconcileRecentReorgs(env){
       }
     }catch(e){console.warn("reorg reconciliation error",String(e));}
   }
+}
+
+// RPC fallback for addresses pending Alchemy webhook enrollment. Do not mark
+// these as active subscribers: periodic polling is not a realtime webhook.
+const PENDING_RPC_PREFIX="pending_rpc_backup:";
+export async function scanPendingRpcFallback(env,maxWallets=2){
+  const db=env.DB;
+  const {results:pending}=await db.prepare(
+    "SELECT w.address FROM wallet_watches w WHERE w.state='pending' "+
+    "AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status IN ('active','pending')) "+
+    "AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) "+
+    "AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) "+
+    "ORDER BY w.updated_at ASC LIMIT ?"
+  ).bind(Math.max(1,Math.min(2,maxWallets))).all();
+  if(!pending?.length)return {scanned:0};
+  const head=await blockNumber(env);
+  let succeeded=0,failed=0;
+  for(const {address} of pending){
+    const key=PENDING_RPC_PREFIX+address;
+    const last=await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(key).first();
+    let prior={};
+    try{prior=JSON.parse(last?.value||"{}")}catch{}
+    const cursor=Number(prior.last_block);
+    // First scan covers about 50 minutes; later scans overlap five blocks.
+    // This checkpoint is separate from the realtime webhook recovery cursor.
+    const from=Number.isSafeInteger(cursor)&&cursor>=0
+      ?Math.max(0,Math.min(head,cursor)-5):Math.max(0,head-250);
+    const to=Math.min(head,from+300);
+    try{
+      const outbound=await getOneDirection(env,address,"out",from,to,address);
+      const inbound=await getOneDirection(env,address,"in",from,to,address);
+      const report={status:"ok",last_block:to,checked_at:now(),seen:outbound+inbound,mode:"rpc_minute_backup"};
+      await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+        .bind(key,JSON.stringify(report)).run();
+      succeeded++;
+    }catch(e){
+      const report={status:"error",last_block:Number.isSafeInteger(cursor)?cursor:null,checked_at:now(),reason:String(e?.message||e).slice(0,180)};
+      await db.prepare("INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP")
+        .bind(key,JSON.stringify(report)).run();
+      failed++;
+      console.warn("Pending-wallet RPC backup retry",address,report.reason);
+    }
+  }
+  return {scanned:pending.length,succeeded,failed};
 }

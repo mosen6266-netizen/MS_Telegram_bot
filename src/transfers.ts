@@ -47,7 +47,7 @@ function transferKey(a,kind,hash,asset,from,to){
   return "tx:"+hash+":internal:ETH:"+(a.typeTraceAddress||a.uniqueId||from+":"+to+":"+String(a.rawContract?.rawValue??a.value));
 }
 
-export async function processActivity(env,payload){
+export async function processActivity(env,payload,options={}){
   const event=payload.event||{};
   if(event.network && event.network!=="ETH_MAINNET")throw Error("Not Ethereum mainnet activity");
   if(payload.network && payload.network!=="ETH_MAINNET")throw Error("Invalid source network");
@@ -74,7 +74,8 @@ export async function processActivity(env,payload){
     // A self transfer has a single unique record and notification.
     const owners=from===to?[{address:from,direction:"自转"}]:[{address:from,direction:"转出"},{address:to,direction:"转入"}];
     for(const o of owners){
-      const watch=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=? AND state='active'").bind(o.address).first();
+      const pendingRecovery=options.pendingRecoveryAddress===o.address;
+      const watch=await env.DB.prepare("SELECT state FROM wallet_watches WHERE address=? AND (state='active' OR (state='pending' AND ?=1))").bind(o.address,pendingRecovery?1:0).first();
       if(!watch)continue;
       const eventId=baseId+":"+o.address+":"+o.direction;
       const inserted=await env.DB.prepare("INSERT OR IGNORE INTO transfer_events(event_id,address,asset,direction,raw_amount,from_address,to_address,tx_hash,block_number,block_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -82,7 +83,7 @@ export async function processActivity(env,payload){
       if(inserted.meta?.changes)await increment(env,"transfer_events");
       // Even if the event already exists, an earlier queueNotice() may have
       // failed after the insert. INSERT OR IGNORE into outbox repairs it safely.
-      const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status='active'").bind(o.address).all();
+      const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status "+(watch.state==="pending"&&pendingRecovery?"IN ('active','pending')":"='active'")).bind(o.address).all();
       for(const s of subs||[])await queueNotice(env,{
         dedup:eventId+":"+s.chat_id,chat_id:s.chat_id,address:o.address,template:"transfer",
         payload:{asset:asset.asset,direction:o.direction,amount:value,from_address:from,to_address:to,tx_hash:hash,block_number:block}

@@ -8,7 +8,7 @@ import {reconcileAlchemyAddresses} from "./alchemy-reconcile";
 import {processActivity} from "./transfers";
 import {provisionRealtimeApprovals,processRealtimeApprovalWebhook,storeFailedRealtimeApproval,retryFailedRealtimeApprovals} from "./approval-realtime";
 import {retainFailedActivity,replayFailedActivities} from "./activity-replay";
-import {scanWalletGaps,reconcileRecentReorgs} from "./recovery";
+import {scanWalletGaps,reconcileRecentReorgs,scanPendingRpcFallback} from "./recovery";
 import {flushOutbox,recoverStuck,renderTemplate} from "./notifications";
 import {collectUsage,runUsageAlerts} from "./usage";
 import {handleAdmin,adminHtml} from "./admin";
@@ -136,11 +136,12 @@ export default {
               await env.DB.prepare("UPDATE subscriptions SET status='active' WHERE address=? AND status='pending'").bind(owner).run();
           }
         }
+        else if(item.kind==="scan_pending")await scanPendingRpcFallback(configured,2);
         else if(item.kind==="verify_admin")await verifyAdminOwner(configured,item.owner,item.chat_id);
         else throw Error("Unknown queue message kind");
         // The queue should send Telegram notices immediately after ingest,
         // without waiting for the two-minute scheduled maintenance task.
-        if(item.kind==="activity"||item.kind==="approval_webhook"){
+        if(item.kind==="activity"||item.kind==="approval_webhook"||item.kind==="scan_pending"){
           try{await flushOutbox(configured,20)}catch(e){console.error("Immediate Telegram dispatch",String(e))}
         }
         message.ack();
@@ -174,12 +175,19 @@ export default {
   async scheduled(event,env,ctx){
     const configured=await configEnv(env);
     ctx.waitUntil((async()=>{
+      if(new Date(event.scheduledTime||Date.now()).getUTCMinutes()%2!==0)return;
       try{await collectUsage(configured);await runUsageAlerts(configured);await flushOutbox(configured,10,true);}
       catch(e){console.error("Usage maintenance failed",String(e));}
     })());
     // Always expire abandoned remark prompts, even when finance monitoring is paused.
     ctx.waitUntil((async()=>{try{await flushMessageCleanup(configured,60);}
       catch(e){console.warn("Telegram message cleanup maintenance",String(e));}})());
-    ctx.waitUntil((async()=>{const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";if(active)await cron(configured);})());
+    ctx.waitUntil((async()=>{
+      const active=(await env.DB.prepare("SELECT value FROM runtime_state WHERE key='is_active'").first())?.value==="1";
+      if(!active)return;
+      try{await scanPendingRpcFallback(configured,2);await flushOutbox(configured,20);}
+      catch(e){console.error("Pending-wallet RPC backup tick",String(e))}
+      if(new Date(event.scheduledTime||Date.now()).getUTCMinutes()%2===0)await cron(configured);
+    })());
   }
 };
