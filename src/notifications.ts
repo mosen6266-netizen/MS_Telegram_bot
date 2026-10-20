@@ -262,7 +262,19 @@ export async function flushOutbox(env,max=30,onlyUsage=false){
         // the Alchemy address enrollment is still pending. The alert explicitly
         // labels this state. Explicitly paused/removed subscriptions stay muted.
         const approvalAlert=row.template_key==="new_approval"||row.template_key==="approval_change";
-        if(!sub || (sub.status!=="active"&&!(approvalAlert&&sub.status==="pending"))){
+        // Only confirmed transfers obtained by our internal pending-wallet RPC
+        // scanner may pass while Alchemy webhook enrollment remains blocked.
+        // A public webhook or ordinary queue event can never mark this flag.
+        let backedUpTransfer=false;
+        if(sub?.status==="pending"&&row.template_key==="transfer"&&payload.rpc_fallback===true){
+          const eligible=await env.DB.prepare(
+            "SELECT 1 FROM wallet_watches w WHERE w.address=? AND w.state='pending' "+
+            "AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) "+
+            "AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL)"
+          ).bind(row.address).first();
+          backedUpTransfer=!!eligible;
+        }
+        if(!sub || (sub.status!=="active"&&!((approvalAlert||backedUpTransfer)&&sub.status==="pending"))){
           await env.DB.prepare("UPDATE outbox SET state='skipped',last_error='Subscription no longer active' WHERE id=?").bind(row.id).run();
           continue;
         }

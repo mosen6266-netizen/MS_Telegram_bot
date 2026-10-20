@@ -86,7 +86,8 @@ export async function processActivity(env,payload,options={}){
       const {results:subs}=await env.DB.prepare("SELECT chat_id FROM subscriptions WHERE address=? AND status "+(watch.state==="pending"&&pendingRecovery?"IN ('active','pending')":"='active'")).bind(o.address).all();
       for(const s of subs||[])await queueNotice(env,{
         dedup:eventId+":"+s.chat_id,chat_id:s.chat_id,address:o.address,template:"transfer",
-        payload:{asset:asset.asset,direction:o.direction,amount:value,from_address:from,to_address:to,tx_hash:hash,block_number:block}
+        payload:{asset:asset.asset,direction:o.direction,amount:value,from_address:from,to_address:to,tx_hash:hash,block_number:block,
+          rpc_fallback:watch.state==="pending"&&pendingRecovery}
       });
     }
   }
