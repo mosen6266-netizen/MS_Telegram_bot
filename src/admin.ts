@@ -55,11 +55,15 @@ export async function handleAdmin(req,env,path){
     ).bind(...args,page*50);
     const summaryQuery=env.DB.prepare("SELECT state,COUNT(*) n FROM wallet_watches WHERE state IN ('active','pending','removal_pending') GROUP BY state");
     const alchemyQuery=env.DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_address_reconcile_result'");
-    const [countResult,rowsResult,summaryResult,alchemyResult]=await env.DB.batch([countQuery,rowsQuery,summaryQuery,alchemyQuery]);
+    const fallbackQuery=env.DB.prepare("SELECT key,value FROM runtime_state WHERE key LIKE 'pending_rpc_backup:%' LIMIT 20");
+    const [countResult,rowsResult,summaryResult,alchemyResult,fallbackResult]=await env.DB.batch([countQuery,rowsQuery,summaryQuery,alchemyQuery,fallbackQuery]);
     const total=countResult.results?.[0]?.n||0,rows=rowsResult.results||[],summary=summaryResult.results||[];
     let alchemy=null;
     try{alchemy=JSON.parse(alchemyResult.results?.[0]?.value||"null")}catch{}
-    return json({rows,total,page,total_pages:Math.ceil(total/50),summary,alchemy_reconciliation:alchemy});
+    const pending_rpc_backup=(fallbackResult.results||[]).map(item=>{
+      try{return {address:item.key.slice("pending_rpc_backup:".length),...JSON.parse(item.value)}}catch{return null}
+    }).filter(Boolean);
+    return json({rows,total,page,total_pages:Math.ceil(total/50),summary,alchemy_reconciliation:alchemy,pending_rpc_backup});
   }
   if(method==="POST"&&path==="/api/monitoring/remark"){
     const d=await body(req),address=addr(d.address);
