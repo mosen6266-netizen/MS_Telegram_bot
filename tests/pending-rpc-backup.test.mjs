@@ -53,3 +53,13 @@ test("pending pipeline is opt-in and real-time paths keep their existing priorit
  assert.match(w,/await processRealtimeApprovalWebhook\(configured,item.payload\)/);
  assert.match(w,/await flushOutbox\(configured,20\)/);
 });
+
+test("backup transfer delivery requires RPC provenance and excludes removed wallets",()=>{
+ const notification=readFileSync("src/notifications.ts","utf8");
+ const transfer=readFileSync("src/transfers.ts","utf8");
+ assert.match(transfer,/rpc_fallback:watch.state==="pending"&&pendingRecovery/);
+ assert.match(notification,/row.template_key==="transfer"&&payload.rpc_fallback===true/);
+ assert.match(notification,/w.state='pending'/);
+ assert.match(notification,/wallet_exclusions/);
+ assert.match(notification,/approvalAlert\|\|backedUpTransfer/);
+});
