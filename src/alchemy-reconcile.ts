@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Keep local "active" watches in sync with the authoritative Alchemy webhook.
 // Never replace the external address list or remove addresses we do not own.
+import {alchemyManagementFetch} from "./alchemy-management";
 const PREFIX="alchemy_address_reconcile_";
 const LOCK=PREFIX+"lock";
 const NEXT=PREFIX+"next_at";
@@ -16,7 +17,7 @@ async function save(db,key,value){
 }
 
 async function verifyWebhookConfiguration(env){
-  const res=await fetch("https://dashboard.alchemy.com/api/team-webhooks",{
+  const res=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/team-webhooks",{
     headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Accept":"application/json"}
   });
   if(!res.ok)throw Error("Alchemy webhook metadata HTTP "+res.status);
@@ -39,7 +40,7 @@ async function actualAddresses(env){
   for(let page=0;page<100;page++){
     const params=new URLSearchParams({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,limit:"100"});
     if(cursor)params.set("after",cursor);
-    const response=await fetch("https://dashboard.alchemy.com/api/webhook-addresses?"+params,{
+    const response=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/webhook-addresses?"+params,{
       headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Accept":"application/json"}
     });
     if(!response.ok)throw Error("Alchemy address list HTTP "+response.status);
@@ -92,7 +93,7 @@ export async function reconcileAlchemyAddresses(env){
       // external subscriptions that do not belong to this bot.
       for(let i=0;i<missing.length;i+=50){
         const addresses=missing.slice(i,i+50);
-        const res=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
+        const res=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/update-webhook-addresses",{
           method:"PATCH",
           headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
           body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:addresses,addresses_to_remove:[]})

@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {persistSecret} from './setup';
+import {alchemyManagementFetch} from './alchemy-management';
 export const USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7";
 export const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 export const APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
@@ -90,7 +91,7 @@ export async function syncWatch(env,address,remove=false) {
       throw Error("Alchemy webhook creation is already running; retry shortly");
     }
     try{
-      const r=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
+      const r=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/create-webhook",{
         method:"POST",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
         body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"ADDRESS_ACTIVITY",
           webhook_url:env.PUBLIC_BASE_URL+"/webhooks/alchemy",name:"Ethereum USDT Owner Monitor",addresses:[address]})
@@ -109,7 +110,7 @@ export async function syncWatch(env,address,remove=false) {
     }
   }
   if(!env.ALCHEMY_ACTIVITY_WEBHOOK_ID)throw Error("Alchemy activity webhook missing");
-  const r=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
+  const r=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/update-webhook-addresses",{
     method:"PATCH",headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
     body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:remove?[]:[address],addresses_to_remove:remove?[address]:[]})
   });
