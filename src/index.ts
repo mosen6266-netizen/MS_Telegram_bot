@@ -19,7 +19,7 @@ async function cron(env){
   // outage must not starve Telegram delivery or other addresses.
   try{await recoverStuck(env)}catch(e){console.error("Outbox stuck-task recovery",String(e))}
   try{
-    const {results:pending}=await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status IN ('active','pending')) AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 8").all();
+    const {results:pending}=await env.DB.prepare("SELECT w.address FROM wallet_watches w WHERE w.state='pending' AND NOT EXISTS (SELECT 1 FROM wallet_exclusions x WHERE x.address=w.address) AND NOT EXISTS (SELECT 1 FROM wallets v WHERE v.address=w.address AND v.deleted_at IS NOT NULL) AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.address=w.address AND s.status IN ('active','pending')) AND NOT EXISTS (SELECT 1 FROM spender_history_monitor_enrollments e WHERE e.owner=w.address AND e.state IN ('pending','running','retrying')) LIMIT 2").all();
     for(const p of pending||[]){
       try{
         if(await ensureWatch(env,p.address))

@@ -2,6 +2,7 @@
 import {USDT,APPROVAL_TOPIC,addr,fromTopic,toTopic,now} from "./core";
 import {persistSecret} from "./setup";
 import {processRealtimeApproval} from "./approval";
+import {alchemyManagementFetch} from "./alchemy-management";
 const STATE="approval_realtime_status",LOCK="approval_realtime_provision_lock";
 export function approvalQuery(spenders){
   const topics=spenders.map(toTopic);
@@ -34,7 +35,7 @@ export async function provisionRealtimeApprovals(env){
   }
   try{
     const url=String(env.PUBLIC_BASE_URL).replace(/\/$/,"")+"/webhooks/alchemy-approvals";
-    const list=await fetch("https://dashboard.alchemy.com/api/team-webhooks",{headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN}});
+    const list=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/team-webhooks",{headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN}});
     if(!list.ok)throw Error("List Alchemy webhooks HTTP "+list.status);
     const raw=await list.json();
     const existing=(Array.isArray(raw?.data)?raw.data:Array.isArray(raw)?raw:[])
@@ -46,7 +47,7 @@ export async function provisionRealtimeApprovals(env){
       await persistSecret(env,"ALCHEMY_APPROVAL_WEBHOOK_ID",wh.id);
       env.ALCHEMY_APPROVAL_SIGNING_KEY=wh.signing_key;env.ALCHEMY_APPROVAL_WEBHOOK_ID=wh.id;
       if(wh.is_active===false){
-        const enable=await fetch("https://dashboard.alchemy.com/api/update-webhook",{method:"PUT",
+        const enable=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/update-webhook",{method:"PUT",
           headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
           body:JSON.stringify({webhook_id:wh.id,is_active:true})});
         if(!enable.ok)throw Error("Existing custom webhook enable HTTP "+enable.status);
@@ -54,7 +55,7 @@ export async function provisionRealtimeApprovals(env){
       await status(env,{state:"active",id:wh.id,spender_count:spenders.length});
       return {status:"reused",active:true};
     }
-    const res=await fetch("https://dashboard.alchemy.com/api/create-webhook",{
+    const res=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/create-webhook",{
       method:"POST",headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
       body:JSON.stringify({network:"ETH_MAINNET",webhook_type:"GRAPHQL",name:"MS007 USDT Spender Approval Seconds",
         webhook_url:url,graphql_query:{query:approvalQuery(spenders),skip_empty_messages:true}})
@@ -67,7 +68,7 @@ export async function provisionRealtimeApprovals(env){
     env.ALCHEMY_APPROVAL_WEBHOOK_ID=created.id;
     env.ALCHEMY_APPROVAL_SIGNING_KEY=created.signing_key;
     if(created.is_active===false){
-      const enabled=await fetch("https://dashboard.alchemy.com/api/update-webhook",{
+      const enabled=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/update-webhook",{
         method:"PUT",headers:{"X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN,"Content-Type":"application/json"},
         body:JSON.stringify({webhook_id:created.id,is_active:true})
       });

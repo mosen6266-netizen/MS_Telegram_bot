@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {ensureWatch,short,now,blockNumber} from "./core";
 import {walletRemark} from "./wallet-remarks";
+import {alchemyManagementFetch} from "./alchemy-management";
 
 // Bulk enroll historical USDT Approval owners; this is distinct from discovering
 // the addresses. Alchemy can rate-limit dashboard API calls (HTTP 429 / 1015).
@@ -114,7 +115,7 @@ export async function enrollHistoricalOwners(env,limit=ENROLL_BATCH){
         setup.push(db.prepare("INSERT OR IGNORE INTO wallet_checkpoints(address,last_block) VALUES(?,?)").bind(owner,Math.max(0,latest-1)));
       }
       await db.batch(setup);
-      const res=await fetch("https://dashboard.alchemy.com/api/update-webhook-addresses",{
+      const res=await alchemyManagementFetch(env,"https://dashboard.alchemy.com/api/update-webhook-addresses",{
         method:"PATCH",
         headers:{"content-type":"application/json","X-Alchemy-Token":env.ALCHEMY_NOTIFY_TOKEN},
         body:JSON.stringify({webhook_id:env.ALCHEMY_ACTIVITY_WEBHOOK_ID,addresses_to_add:unique,addresses_to_remove:[]})
