@@ -38,6 +38,7 @@ class Db {
           if(!["active","pending"].includes(db.status))return {meta:{changes:0}};
           db.remark=args[0];return {meta:{changes:1}};
         }
+        if(sql.startsWith("INSERT INTO telegram_users") || sql.startsWith("INSERT INTO telegram_chats"))return {meta:{changes:1}};
         if(sql.startsWith("INSERT INTO remark_edits"))return {meta:{changes:1}};
         throw Error("Unexpected write: "+sql);
       }
