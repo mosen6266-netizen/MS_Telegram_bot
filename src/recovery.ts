@@ -86,7 +86,7 @@ export async function scanPendingRpcFallback(env,maxWallets=2){
     const last=await db.prepare("SELECT value FROM runtime_state WHERE key=?").bind(key).first();
     let prior={};
     try{prior=JSON.parse(last?.value||"{}")}catch{}
-    const cursor=Number(prior.last_block);
+    const cursor=prior.last_block===undefined||prior.last_block===null?NaN:Number(prior.last_block);
     // First scan covers about 50 minutes; later scans overlap five blocks.
     // This checkpoint is separate from the realtime webhook recovery cursor.
     const from=Number.isSafeInteger(cursor)&&cursor>=0
