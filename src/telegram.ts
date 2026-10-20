@@ -13,13 +13,19 @@ async function memberAllowed(env,chatId,userId){
 export async function handleTelegram(env,upd){
   if(upd.callback_query){
     const c=upd.callback_query, data=String(c.data||"");
-    await telegram(env,"answerCallbackQuery",{callback_query_id:c.id});
-    if(!data.startsWith("remark:"))return;
+    const answer=(message="",show_alert=false)=>telegram(env,"answerCallbackQuery",{callback_query_id:c.id,...(message?{text:message,show_alert}:{})});
+    if(!data.startsWith("remark:")){await answer();return;}
     const address=addr(data.slice(7)),chat=c.message?.chat;
-    if(!address||!chat||chat.type==="private")return;
-    if(!await memberAllowed(env,chat.id,c.from.id))return;
-    const sub=await env.DB.prepare("SELECT 1 FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(String(chat.id),address).first();
-    if(!sub)return;
+    if(!address||!chat||chat.type==="private"){await answer("此消息无法编辑地址备注",true);return;}
+    if(!await memberAllowed(env,chat.id,c.from.id)){
+      await answer("无法验证群组成员身份，请将新机器人设为群管理员后重试",true);
+      return;
+    }
+    // A newly discovered wallet can have valid USDT approval but still await
+    // Alchemy enrollment. That must not prevent editing its group/global remark.
+    const sub=await env.DB.prepare("SELECT 1 FROM subscriptions WHERE chat_id=? AND address=? AND status IN ('active','pending')").bind(String(chat.id),address).first();
+    if(!sub){await answer("此地址尚未登记在本群或已被移除",true);return;}
+    await answer("请回复下面的备注输入提示");
     const prompt=await send(env,chat.id,await renderTemplate(env,"remark_prompt",String(chat.id),{user_name:c.from.first_name,address}),{force_reply:true,selective:true});
     await env.DB.prepare("INSERT OR REPLACE INTO remark_sessions(chat_id,user_id,prompt_message_id,address,expires_at) VALUES(?,?,?,?,datetime('now','+10 minutes'))")
       .bind(String(chat.id),String(c.from.id),prompt.message_id,address).run();
@@ -45,14 +51,14 @@ export async function handleTelegram(env,upd){
         return;
       }
       if(!await memberAllowed(env,m.chat.id,m.from.id))return;
-      const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status='active'").bind(chatId,session.address).first();
+      const old=await env.DB.prepare("SELECT remark,remark_version FROM subscriptions WHERE chat_id=? AND address=? AND status IN ('active','pending')").bind(chatId,session.address).first();
       if(!old){
         await send(env,chatId,await renderTemplate(env,"remark_unwatched",chatId));
         await env.DB.prepare("DELETE FROM remark_sessions WHERE chat_id=? AND user_id=? AND prompt_message_id=?").bind(chatId,userId,m.reply_to_message.message_id).run();
         try{await finishRemarkCleanup(env,chatId,m.reply_to_message.message_id,m.message_id);}catch(e){console.warn("Remark cancellation cleanup",String(e));}
         return;
       }
-      const result=await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=? AND remark_version=?")
+      const result=await env.DB.prepare("UPDATE subscriptions SET remark=?,remark_version=remark_version+1,updated_at=? WHERE chat_id=? AND address=? AND status IN ('active','pending') AND remark_version=?")
         .bind(remark,now(),chatId,session.address,old.remark_version).run();
       if(!result.meta?.changes){
         await send(env,chatId,await renderTemplate(env,"remark_conflict",chatId));
