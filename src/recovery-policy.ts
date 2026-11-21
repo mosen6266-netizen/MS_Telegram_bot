@@ -8,7 +8,7 @@ export const NORMAL_RECOVERY_BATCH = 5;
 export const RECOVERY_BACKLOG_THRESHOLD_BLOCKS = 900;
 export const RECOVERY_SPAN_BLOCKS = 1200;
 
-export function recoveryScanSize(maxWallets, chainHead, oldestBlock) {
+export function recoveryScanSize(maxWallets: number, chainHead: number, oldestBlock: number) {
   const limit = Math.max(0, Math.floor(Number(maxWallets) || 0));
   const lag = Number(chainHead) - Number(oldestBlock);
   return Number.isFinite(lag) && lag >= RECOVERY_BACKLOG_THRESHOLD_BLOCKS
@@ -16,6 +16,6 @@ export function recoveryScanSize(maxWallets, chainHead, oldestBlock) {
     : Math.min(limit, NORMAL_RECOVERY_BATCH);
 }
 
-export function recoveryEndBlock(lastBlock, chainHead) {
+export function recoveryEndBlock(lastBlock: number, chainHead: number) {
   return Math.min(chainHead, lastBlock + RECOVERY_SPAN_BLOCKS);
 }
