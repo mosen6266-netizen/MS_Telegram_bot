@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  recoveryScanSize, recoveryEndBlock,
+  recoveryScanSize, recoveryEndBlock, recentlyVerifiedWebhook,
   NORMAL_RECOVERY_BATCH,
   RECOVERY_BACKLOG_THRESHOLD_BLOCKS
 } from "../src/recovery-policy.ts";
@@ -17,6 +17,14 @@ test("backlog immediately restores pre-optimization recovery throughput", () => 
   assert.equal(RECOVERY_BACKLOG_THRESHOLD_BLOCKS, 900);
   assert.equal(recoveryScanSize(8, 26464000, 26463100), 8);
   assert.equal(recoveryScanSize(8, 26464000, 26463101), 5);
+});
+
+test("unhealthy or stale webhook preserves original eight-wallet scan", () => {
+  assert.equal(recoveryScanSize(8, 26464000, 26463990, false), 8);
+  const now=Date.parse("2026-11-21T22:15:00Z");
+  assert.equal(recentlyVerifiedWebhook({status:"verified",checked_at:"2026-11-21T21:45:00Z"},now),true);
+  assert.equal(recentlyVerifiedWebhook({status:"error",checked_at:"2026-11-21T21:45:00Z"},now),false);
+  assert.equal(recentlyVerifiedWebhook({status:"verified",checked_at:"2026-11-21T18:45:00Z"},now),false);
 });
 
 test("recovery spans cover the normal full-sweep gap and retain catchup", () => {
