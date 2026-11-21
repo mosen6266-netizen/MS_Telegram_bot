@@ -1,7 +1,7 @@
 // @ts-nocheck
 import {rpc,blockNumber,USDT,USDC,now,queueNotice} from "./core";
 import {processActivity} from "./transfers";
-import {recoveryScanSize,recoveryEndBlock} from "./recovery-policy";
+import {recoveryScanSize,recoveryEndBlock,recentlyVerifiedWebhook} from "./recovery-policy";
 // Periodic, bounded transaction recovery. Fast alerts are still delivered by Alchemy Webhook.
 async function getOneDirection(env,address,direction,from,to,pendingRecoveryAddress=null){
   let cursor=null,loops=0,transactions=0;
@@ -34,7 +34,12 @@ export async function scanWalletGaps(env,maxWallets=8){
   // Backfill 5 wallets/tick while healthy; restore the original 8 when
   // the oldest eligible wallet is 900+ blocks behind. Webhooks remain realtime.
   const eligible=wallets||[];
-  const budget=recoveryScanSize(maxWallets,head,eligible[0]?.last_block??head);
+  // Keep the original full-speed backfill while Webhook is disabled, stale,
+  // or unverifiable. This does not change the realtime notification path.
+  const liveStatus=await env.DB.prepare("SELECT value FROM runtime_state WHERE key='alchemy_address_reconcile_result'").first();
+  let webhookHealthy=false;
+  try{webhookHealthy=recentlyVerifiedWebhook(JSON.parse(liveStatus?.value||"{}"),Date.now());}catch{}
+  const budget=recoveryScanSize(maxWallets,head,eligible[0]?.last_block??head,webhookHealthy);
   for(const w of eligible.slice(0,budget)){
     const from=Math.max(0,w.last_block-5),to=recoveryEndBlock(w.last_block,head);
     try {
